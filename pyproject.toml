@@ -1,0 +1,35 @@
+[project]
+name = "tensormet"        # project name
+version = "0.1.6"
+description = """
+Project utilities for tensor repo.
+"""
+requires-python = ">=3.9"
+dependencies = [
+    "cupy",
+    "matplotlib",
+    "numpy",
+    "nvidia-ml-py",
+    "pyTensorlab",
+    "requests",
+    "sparse",
+    "tensorflow",
+    "tensorly",
+    "torch",
+    "tqdm",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# We only expose standalone modules here, NOT packages,
+# to avoid accidentally packaging `semsimlib_local` etc.
+#py-modules = ["utils", "tucker_tensor", "sparse_ops", "similarity", "distance", "config", "routing"]
+#packages = []
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tensormet*"]
