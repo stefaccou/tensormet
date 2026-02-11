@@ -1,0 +1,8 @@
+#ignore everything
+*
+
+#except these files
+!8_languages
+!9_hpc/
+!src/
+!pyproject.toml
