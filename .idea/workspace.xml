@@ -5,14 +5,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="e1acdb46-018c-456b-be8e-59c12bec6664" name="Changes" comment="Updated repo">
-      <change beforePath="$PROJECT_DIR$/.idea/CCL.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/CCL.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/2_decomposition/Checkpoint.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/2_decomposition/Checkpoint.ipynb" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/3_representation/Vector addition-multiplication.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/3_representation/Vector addition-multiplication.ipynb" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/5_analysis/error_analysis.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/5_analysis/error_analysis.ipynb" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/8_languages/3_english/3_tensor_decomposition.py" beforeDir="false" afterPath="$PROJECT_DIR$/8_languages/3_english/3_tensor_decomposition.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/9_hpc/3_tensor_decomposition.py" beforeDir="false" afterPath="$PROJECT_DIR$/9_hpc/3_tensor_decomposition.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/9_hpc/job_script_decomp_tier1.sh" beforeDir="false" afterPath="$PROJECT_DIR$/9_hpc/job_script_decomp_tier1.sh" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -251,7 +244,7 @@
       <workItem from="1770826735354" duration="696000" />
       <workItem from="1770900688976" duration="4669000" />
       <workItem from="1770908114910" duration="2611000" />
-      <workItem from="1770971939454" duration="580000" />
+      <workItem from="1770971939454" duration="788000" />
     </task>
     <task id="LOCAL-00001" summary="Updated repo">
       <option name="closed" value="true" />
@@ -269,7 +262,15 @@
       <option name="project" value="LOCAL" />
       <updated>1770825680767</updated>
     </task>
-    <option name="localTasksCounter" value="3" />
+    <task id="LOCAL-00003" summary="Updated repo">
+      <option name="closed" value="true" />
+      <created>1770972553294</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1770972553294</updated>
+    </task>
+    <option name="localTasksCounter" value="4" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">

@@ -1,8 +1,18 @@
-#ignore everything
+# Ignore everything
 *
 
-#except these files
-!8_languages
+# But keep this file
+!.gitignore
+
+# Keep pyproject
+!pyproject.toml
+
+# Allow these directories
+!8_languages/
 !9_hpc/
 !src/
-!pyproject.toml
+
+# Allow everything inside those directories
+!8_languages/**
+!9_hpc/**
+!src/**
