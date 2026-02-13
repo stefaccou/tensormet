@@ -303,6 +303,8 @@ sentence_sample = load_eval_sentences_cached(vector_path=path_to_vectors,
 print("loaded in sample")
 remove_OOV = False
 
+
+
 for dim in dims:
     for divergence in divergences:
         for rank in ranks:
@@ -358,10 +360,10 @@ for dim in dims:
                     if isinstance(p, Path):
                         p.parent.mkdir(parents=True, exist_ok=True)
 
-                # If model already exists, skip (optional but recommended)
-                if paths["model"].exists():
-                    print(f"Decomposition already exists at {paths['model']}, skipping...")
-                    continue
+
+                # if paths["model"].exists():
+                #     print(f"Decomposition already exists at {paths['model']}, skipping...")
+                #     continue
 
                 # Save config snapshot (single JSON)
                 write_json(paths["config"],
@@ -387,11 +389,28 @@ for dim in dims:
                 #     vocab=vocab,
                 #     sample_sentences=clean_sample,
                 # )
+
+                try:
+                    checkpoint_tucker = TuckerDecomposition.load_from_disk(
+                        dataset=dataset,
+                        method=method,
+                        divergence=divergence,
+                        dims=dim,
+                        rank=150,
+                        name=name,
+                        iterations=iters
+                        )
+                    print("continuing decomposition from checkpoint")
+                except:
+                    print("starting decomposition from scratch")
+                    checkpoint_tucker = None
+
                 tucker_decomp_info = sparse_tensor.non_negative_tucker_with_similarity(
                     cfg=cfg,
                     thread_budget=thread_budget,
                     vocab=vocab,
                     sample_sentences=clean_sample,
+                    checkpoint_tensor=checkpoint_tucker,
                 )
 
                 end_time = time.time()

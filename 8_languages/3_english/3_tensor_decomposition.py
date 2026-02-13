@@ -140,6 +140,7 @@ for dim in dims:
                     dims=dim,
                     map_location="cpu",
                 )
+
                 sparse_tensor.tensor_to_sparse("cupy")
 
                 tucker_decomp_info = sparse_tensor.non_negative_tucker_with_similarity(

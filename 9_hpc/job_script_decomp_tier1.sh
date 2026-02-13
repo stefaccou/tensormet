@@ -4,7 +4,7 @@
 #PBS -e $PROJ/logs/$PBS_JOBNAME_$PBS_JOBID.err
 #PBS -A starting_2026_010
 #PBS -l nodes=1:gpus=1
-#PBS -l walltime=01:00:00
+#PBS -l walltime=02:30:00
 
 
 echo "Hello from $(hostname)"
