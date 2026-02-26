@@ -40,12 +40,12 @@ class UpdateRouting:
 #
 #     raise ValueError(f"Unknown divergence: {divergence!r}. Expected 'kl' or 'fr'.")
 
-def get_update_routing_step(divergence: Divergence, dim: int, log_step:bool) -> UpdateRouting:
+def get_update_routing_step(divergence: Divergence, dim: int, log_step:bool, largedim=False) -> UpdateRouting:
     """Return the correct update functions for the step if logging is active."""
     if divergence == "kl":
-        factor_fn = kl_factor_update_largedim if dim >= 4000 else kl_factor_update
-        core_fn = kl_core_update_largedim if dim >= 3000 else kl_core_update
-        error_fn = kl_compute_errors_largedim if dim >= 3000 else kl_compute_errors
+        factor_fn = kl_factor_update_largedim if (dim >= 4000 or largedim) else kl_factor_update
+        core_fn = kl_core_update_largedim if (dim >= 3000 or largedim) else kl_core_update
+        error_fn = kl_compute_errors_largedim if (dim >= 3000 or largedim) else kl_compute_errors
         return UpdateRouting(
             factor_update=factor_fn,
             core_update=core_fn,
@@ -54,7 +54,7 @@ def get_update_routing_step(divergence: Divergence, dim: int, log_step:bool) -> 
         )
 
     if divergence == "fr":
-        if dim <= 4000:
+        if dim <= 4000 and not largedim:
             return UpdateRouting(
                     factor_update=fr_factor_update,
                     core_update=fr_combined_core_errors if log_step else fr_core_update,  # returns (core, rel_error)

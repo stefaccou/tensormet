@@ -10,7 +10,7 @@ import pickle
 import ast
 from typing import List, Tuple
 from tqdm import tqdm
-
+import pyarrow.dataset as ds
 
 def get_eval_num_threads(fraction: float = 0.75, min_threads: int = 1) -> int:
     """Return n_threads ≈ fraction * available CPUs (at least min_threads)."""
@@ -140,12 +140,10 @@ def evaluate_sample(tensor,
     # scores["harmonic_mean"] = 2 / (scores["absolute_rank_score"] + scores["absolute_prob_score"])
     print(f"Average expected role vector rank score over {n_samples} samples: {scores['average_rank_score']}, "
           f"Average prob score: {scores['average_prob_score']}")
-    print(f"Without {OOV} OOV: rank {scores['absolute_rank_score']}, prob {scores['absolute_prob_score']}")
+    print(f"\tWithout {OOV} OOV: rank {scores['absolute_rank_score']}, prob {scores['absolute_prob_score']}")
     # print(f"Harmonic mean between absolutes: {scores['harmonic_mean']}")
     # print(f"Average mean {mean / (n_samples-OOV)}, std {std / (n_samples-OOV)}")
-    if return_type == "all":
-        return scores
-    elif return_type in scores.keys():
+    if return_type in scores.keys():
         return scores[return_type]
     else:
         raise NotImplementedError(f"Choose one of {scores.keys()}")
@@ -217,6 +215,86 @@ def load_eval_sentences_cached(
     tmp.replace(cache_file)
 
     return sampled_sentences
+
+# parquet-based pipeline
+def load_eval_sentences_cached_parquet(
+    vector_path: str | os.PathLike,
+    *,
+    dataset: str,
+    cache_dir: str | os.PathLike = DATA_DIR / "vectors" / "cache",
+    n_samples: int = 100,
+    seed: int = 42,
+) -> List[Tuple[str, str, str]]:
+    """
+    Read unique (root, nsubj, obj) triples from a Parquet file or Parquet directory,
+    sample deterministically (like evaluate_sample), and cache the sampled list.
+
+    Supports:
+      - a single .parquet file
+      - a directory containing many parquet parts (recommended)
+    """
+    vector_path = Path(vector_path)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build a cache key that invalidates when the parquet changes
+    # - For a directory, use the newest mtime and total size across files.
+    if vector_path.is_dir():
+        files = sorted(vector_path.rglob("*.parquet"))
+        if not files:
+            raise FileNotFoundError(f"No parquet files found under {vector_path}")
+        newest_mtime_ns = max(p.stat().st_mtime_ns for p in files)
+        total_bytes = sum(p.stat().st_size for p in files)
+        fingerprint = f"dir_mtime_ns={newest_mtime_ns}__bytes={total_bytes}__nfiles={len(files)}"
+    else:
+        st = vector_path.stat()
+        fingerprint = f"file_mtime_ns={st.st_mtime_ns}__bytes={st.st_size}"
+
+    cache_name = (
+        f"eval_sentences__dataset={dataset}"
+        f"__n={n_samples}"
+        f"__seed={seed}"
+        f"__{fingerprint}"
+        f".pkl"
+    )
+    cache_file = cache_dir / cache_name
+
+    # Fast path
+    if cache_file.exists():
+        with cache_file.open("rb") as f:
+            return pickle.load(f)
+
+    # Slow path: scan parquet
+    dataset_obj = ds.dataset(str(vector_path), format="parquet")
+
+    # Pull only the 3 columns we care about; this is the big win vs CSV
+
+    # to_table() will materialize these 3 columns. If the parquet is huge and you
+    # expect very high cardinality, see the streaming option below.
+    table = dataset_obj.to_table(columns=["root", "nsubj", "obj"])
+
+    table = table.drop_null()
+
+    triples = list(zip(table["root"].to_pylist(),
+                       table["nsubj"].to_pylist(),
+                       table["obj"].to_pylist()))
+
+    if n_samples > len(triples):
+        raise ValueError(
+            f"n_samples={n_samples} > number of unique triples={len(triples)} "
+            f"parsed from {vector_path}"
+        )
+
+    rng = random.Random(seed)
+    sampled = rng.sample(triples, n_samples)
+
+    tmp = cache_file.with_suffix(".tmp")
+    with tmp.open("wb") as f:
+        pickle.dump(sampled, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(cache_file)
+
+    return sampled
+
 
 voc_dict = {0:"v", 1:"s", 2:"o"}
 def ensure_vocab(vocab, sample):

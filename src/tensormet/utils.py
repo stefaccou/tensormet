@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from threadpoolctl import threadpool_limits
 import json
-from typing import Any, Dict
+import sys
+from typing import Any, Dict, Optional, Union, IO
 from datetime import datetime, UTC
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
@@ -178,3 +179,79 @@ def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
 def utc_now_iso() -> str:
     """Returns the current UTC time in ISO 8601 format."""
     return datetime.now(UTC).isoformat()
+
+
+class _TeeStream:
+    """
+    A file-like stream that duplicates writes to multiple streams.
+    Works well for capturing print() + tqdm (stderr) into a log file.
+    """
+    def __init__(self, *streams: IO[str]) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        # Be tolerant: some libraries write None or empty strings
+        if not data:
+            return 0
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                # Don't crash the training loop because the logger stream failed
+                pass
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        # Helps tqdm behave as if it still has a TTY when running in a terminal
+        return any(getattr(s, "isatty", lambda: False)() for s in self._streams)
+
+
+@contextmanager
+def tee_output(
+    log_file: Optional[Union[str, Path]],
+    *,
+    mode: str = "a",
+    encoding: str = "utf-8",
+):
+    """
+    Tee *all* stdout and stderr output to `log_file` (and still show it in the console).
+
+    Usage:
+        with tee_output("run.log"):
+            print("captured")
+            tqdm(...)
+
+    If log_file is None, this is a no-op.
+    """
+    if log_file is None:
+        yield
+        return
+
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    f = open(log_path, mode=mode, encoding=encoding, buffering=1)  # line-buffered
+    old_out, old_err = sys.stdout, sys.stderr
+
+    try:
+        sys.stdout = _TeeStream(old_out, f)
+        sys.stderr = _TeeStream(old_err, f)
+        yield
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        sys.stdout, sys.stderr = old_out, old_err
+        try:
+            f.close()
+        except Exception:
+            pass

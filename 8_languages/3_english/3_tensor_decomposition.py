@@ -20,18 +20,14 @@ from tensormet.utils import (DATA_DIR, select_gpu,
                    ThreadBudget,
                    write_json,
                    append_jsonl,
-                   utc_now_iso
+                   utc_now_iso,
+                   tee_output
                    )
 from tensormet.tucker_tensor import SparseTupleTensor
-from tensormet.similarity import load_eval_sentences_cached, ensure_vocab
+from tensormet.similarity import load_eval_sentences_cached, ensure_vocab, load_eval_sentences_cached_parquet
 from tensorly.tucker_tensor import TuckerTensor
 
 
-# --- The actual magic ---
-
-
-
-# -- Example run --
 print("Preparing environment for cupy sparse non-negative tucker decomposition with similarity checks.")
 device = select_gpu()
 tl.set_backend("cupy")
@@ -39,37 +35,39 @@ tl.set_backend("cupy")
 # we perform the non negative tucker
 print("\nStarting non-negative Tucker decomposition on cupy sparse tensor")
 
-dataset = "fineweb-en"
+dataset = "finewebHQ-en"
 divergences = ["fr"]
-name = "quicktest"
+name = "HQ"
 methods = ["siiSoftPlus"]
-dims = [1000]
-ranks = [(100, 100, 100)]
-iters = 500
+dims = [1000, 2000, 4000, 6000, 10000, 15000, 20000]
+ranks = [(150, 150, 150)]
+iters = 150
+
+largedim=True
 
 tol = 1e-5
 random_state = 1
 
-patience = 5
+patience = 3
 rec_check_every = 1
 rec_log_every = 1
-sem_check_every = 10
+sem_check_every = 5
 # choose one of: "{absolute|average}_{rank|prob}_score"
 sem_error_type = "absolute_prob_score"
 max_cpu_frac = 0.85
 thread_budget = ThreadBudget(n_threads=compute_num_threads(max_cpu_frac))
 
 # we load the sample sentences only once
-vector_path = os.path.join(DATA_DIR, "vectors", "fineweb_english_vectors.csv")
-sentence_sample = load_eval_sentences_cached(vector_path=vector_path,
+vector_path = os.path.join(DATA_DIR, "vectors", "fineweb_english_1B_copy.parquet")
+sentence_sample = load_eval_sentences_cached_parquet(vector_path=vector_path,
                                              dataset=dataset,
                                              seed=random_state,
                                              n_samples=10_000,
                                              )
 remove_OOV = False
 
-for dim in dims:
-    for divergence in divergences:
+for divergence in divergences:
+    for dim in dims:
         for rank in ranks:
             vocab_path = os.path.join(DATA_DIR, "tensors", dataset, f"vocabularies/{dim}.pkl")
             with open(vocab_path, "rb") as f:
@@ -105,6 +103,7 @@ for dim in dims:
                         normalize_factors=False,
                         verbose=True,
                         return_errors="full",
+                        largedim=largedim,
                     ),
                     eval=EvalConfig(
                         rec_log_every=rec_log_every,
@@ -121,6 +120,7 @@ for dim in dims:
                 for p in paths.values():
                     if isinstance(p, Path):
                         p.parent.mkdir(parents=True, exist_ok=True)
+
 
                 # If model already exists, skip (optional but recommended)
                 if paths["model"].exists():
@@ -143,12 +143,13 @@ for dim in dims:
 
                 sparse_tensor.tensor_to_sparse("cupy")
 
-                tucker_decomp_info = sparse_tensor.non_negative_tucker_with_similarity(
-                    cfg=cfg,
-                    thread_budget=thread_budget,
-                    vocab=vocab,
-                    sample_sentences=clean_sample,
-                )
+                with tee_output(paths["log"]):
+                    tucker_decomp_info = sparse_tensor.non_negative_tucker_with_similarity(
+                        cfg=cfg,
+                        thread_budget=thread_budget,
+                        vocab=vocab,
+                        sample_sentences=clean_sample,
+                    )
 
                 end_time = time.time()
 

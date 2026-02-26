@@ -5,7 +5,7 @@ from datasets import load_dataset
 import spacy
 from tqdm import tqdm
 import torch
-from tensormet.utils import DATA_DIR, select_gpu
+from tensormet.utils import DATA_DIR, select_gpu, tee_output
 
 # ---- helpers to stream just the text field ----
 
@@ -176,15 +176,29 @@ def pos_tag(target_vectors=10000,
 
 if __name__ == "__main__":
     device = select_gpu()
-    pos_tag(target_vectors=10_000_000,
-            output_path=DATA_DIR / "vectors/fineweb_english_vectors.csv",
-            dataset_path="HuggingFaceFW/fineweb",
-            dataset_config="CC-MAIN-2025-26",
-            dataset_column_name="text",
-            spacy_model="en_core_web_md"
-            )
-    # pos_tag(target_vectors=1_000_000,
-    #         dataset_path="sentence-transformers/parallel-sentences-opensubtitles", dataset_config="en-nl",
-    #         dataset_column_name="non_english",
-    #         output_path=DATA_DIR/"opensubtitles_nl_vectors_ids.csv"
+    # pos_tag(target_vectors=1_000_000_000,
+    #         output_path=DATA_DIR / "vectors/fineweb_english_1B.csv",
+    #         dataset_path="epfml/FineWeb-HQ",
+    #         dataset_config=None,
+    #         dataset_column_name="text",
+    #         spacy_model="en_core_web_md"
     #         )
+
+    # Original:
+    # pos_tag(target_vectors=10_000_000,
+    #         output_path=DATA_DIR / "vectors/fineweb_english_vectors.csv",
+    #         dataset_path="HuggingFaceFW/fineweb",
+    #         dataset_config="CC-MAIN-2025-26",
+    #         dataset_column_name="text",
+    #         spacy_model="en_core_web_md"
+    #         )
+
+    with tee_output(DATA_DIR/"vectors"/"fineweb_vectors_10M_log.txt"):
+        pos_tag(target_vectors=100_000_000,
+                output_path=DATA_DIR / "vectors/fineweb_english_10M.csv",
+                dataset_path="HuggingFaceFW/fineweb",
+                dataset_config="CC-MAIN-2025-26",
+                dataset_column_name="text",
+                spacy_model="en_core_web_md"
+                )
+

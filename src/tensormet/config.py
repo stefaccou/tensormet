@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, Union
 import hashlib
 import json
 
@@ -17,10 +17,12 @@ class TrainingConfig:
     patience: int = 5
     verbose: bool = True
     return_errors: str = "full"
+    largedim: bool = False
+    checkpoint_saving_steps: int = 0 # defaults to 0 -> Falsy
 
 @dataclass(frozen=True)
 class EvalConfig:
-    rec_check_every: int = 0
+    rec_check_every: int = 20
     rec_log_every: int = rec_check_every # if not passed, we log at any rec_check step
     sem_check_every: int = 20
     sem_error_type: str = "average_rank_score"
@@ -30,18 +32,21 @@ class EvalConfig:
     remove_OOV: bool = False # whether to set OOV in test set to OOV token (false ignores the sentences)
     time_iteration: bool = True # whether to print the time taken by an iteration
     save_intermediate: bool = False # whether to save the current best model (safety for interrupted code)
+    log_file: Optional[Union[str, Path]] = None
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    dataset: str
-    method: str
-    divergence: str
-    dim: int
-    rank: Tuple[int, ...]
-    name: str
+    dataset: str = "fineweb-en"
+    method: str = "siiSoftPlus"
+    divergence: str = "fr"
+    dim: int = 1000
+    rank: Tuple[int, ...] = (100, 100, 100)
+    name: str = None
     random_state: int = 1
     max_cpu_frac: float = 0.5
+    tier1: bool = False
+    overwrite: bool = False
 
     # paths
     data_dir: Path = Path(".")
@@ -90,11 +95,14 @@ class RunConfig:
 
     def artifact_paths(self) -> Dict[str, Path]:
         model = self.model_path()
+        # build a proper directory Path for checkpoints (don't include a trailing slash)
+        checkpoint_dir = model.parent / f"{model.stem}_checkpoints"
         return {
             "model": model,
             "errors": model.with_name(model.stem + "_errors.npy"),
             "fitness": model.with_name(model.stem + "_fitness.npy"),
-            "config":model.with_name(model.stem + "_config.json"),
+            "config": model.with_name(model.stem + "_config.json"),
             "runs_jsonl": self.output_dir() / "runs.jsonl",
-
+            "log": model.with_name(model.stem + "_log.txt"),
+            "checkpoint_dir": checkpoint_dir,
         }

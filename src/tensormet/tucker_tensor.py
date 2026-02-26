@@ -1410,6 +1410,24 @@ class SparseTupleTensor:
             memory_size = self.tensor.nbytes
         print(f"approx. memory size: {memory_size / (1024**2):.2f} MB")
 
+    def estimate_training_time(self,
+                               divergence="fr",
+                               rank=100,
+                               ):
+
+        dim = self.shape[0]
+        nnz = self.tensor._nnz()
+        if divergence == "fr" and dim <= 4000:
+            print("fast GPU algorithm, estimated time:", dim/1000)
+        elif divergence == "kl" and dim < 4000:
+            print("fast GPU algorithm, estimated time:", dim/200)
+        else:
+            factor_time = (rank**1.76) * (dim**0.16) * (nnz**0.78) * 1e-9
+            print(factor_time, "estimated time per factor update")
+            core_time = (rank**2.6) * nnz * 1e-10
+            print(core_time, "estimated time per core update")
+            print("total:", factor_time + core_time)
+
     def non_negative_tucker_with_similarity(
             self,
             cfg: RunConfig,
@@ -1433,6 +1451,8 @@ class SparseTupleTensor:
             normalize_factors = cfg.train.normalize_factors
             patience = cfg.train.patience
             warmup_steps = cfg.train.warmup_steps
+            largedim = cfg.train.largedim
+            checkpoint_saving = cfg.train.checkpoint_saving_steps
             rec_check_every = cfg.eval.rec_check_every
             sem_check_every = cfg.eval.sem_check_every
             sem_error_type = cfg.eval.sem_error_type
@@ -1441,6 +1461,7 @@ class SparseTupleTensor:
             time_iteration = cfg.eval.time_iteration
             # saving
             save_intermediate = cfg.eval.save_intermediate
+
         except:
             raise ValueError("Check config structure.")
 
@@ -1448,6 +1469,12 @@ class SparseTupleTensor:
             raise TypeError("sparse_tensor must be a SparseTupleTensor instance.")
         if not self.sparsity_type == "cupy":
             raise ValueError("sparse_tensor must have sparsity_type 'cupy'.")
+
+        paths = cfg.artifact_paths()
+
+        if checkpoint_saving:
+            os.makedirs(paths["checkpoint_dir"], exist_ok=True)
+
 
         shape = tuple(self.shape)
         rank = validate_tucker_rank(shape, rank=rank)
@@ -1471,7 +1498,7 @@ class SparseTupleTensor:
             if time_iteration:
                 start_time = time.time()
             log_step = get_log_step(iteration, rec_log_every, rec_check_every)
-            routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step)
+            routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step, largedim=largedim)
             # --- factors ---
             for mode in modes:
                 factors[mode] = routing.factor_update(
@@ -1578,7 +1605,7 @@ class SparseTupleTensor:
                 core_cpu = tl.tensor(cp.asnumpy(core))
                 factors_cpu = [tl.tensor(cp.asnumpy(f)) for f in factors]
                 tucker_decomp = TuckerDecomposition(core=core_cpu, factors=factors_cpu, vocab=vocab)
-
+                print(iteration)
                 fitness_score = evaluate_sample(
                     tucker_decomp,
                     sample_sentences,
@@ -1601,7 +1628,6 @@ class SparseTupleTensor:
                         print("New best semantic score; saving current best core and factors.")
                     if save_intermediate:
                         temp_tensor = TuckerTensor((best_core, best_factors))
-                        paths = cfg.artifact_paths()
                         torch.save(temp_tensor, paths["model"])
                         print("saving temp model to", paths["model"])
                         np.save(paths["errors"], np.array([cp.asnumpy(e) for e in rec_errors]))
@@ -1625,6 +1651,27 @@ class SparseTupleTensor:
                     if verbose and sem_no_rec_improve_steps:
                         print(f"\tSemantic improvement (Δ={diff:.3e}); resetting patience counter.")
                     sem_no_rec_improve_steps = 0
+
+            if checkpoint_saving: # only trigger if this is not 0 -> True
+                if (iteration + 1) % cfg.train.checkpoint_saving_steps == 0:
+                    print(f"saving model at iteration {iteration}")
+                    checkpoint_tensor = TuckerTensor((core, factors))
+                    paths = cfg.artifact_paths()
+                    torch.save(checkpoint_tensor, paths["checkpoint_dir"] / f"{iteration + 1}.pt")
+
+                    # we collect reconstruction and fitness scores if they exist and dump
+                    if fitness_scores is not None:
+                        fitness_score = fitness_scores[-1]
+                    else:
+                        fitness_score = None
+                    if rec_errors is not None:
+                        rec_error = rec_errors[-1]
+                    else:
+                        rec_error = None
+                    # we append this to the checkpoint file:
+                    with open(paths["checkpoint_dir"]/"log.txt", "a") as f:
+                        f.write(f"Iteration {iteration + 1}\tRec_error: {rec_error}\tFitness_score: {fitness_score}\n")
+
 
         if best_sem_iteration:
             tensor = TuckerTensor((best_core, best_factors))
