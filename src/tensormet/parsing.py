@@ -26,6 +26,10 @@ from tensormet.config import (
     TrainingConfig,
     EvalConfig,
     RunConfig,
+    VectorExperimentConfig,
+    VectorRunConfig,
+    HFStreamConfig,
+    _default_hf_config_for_dataset #todo Fix this import
 )
 
 
@@ -84,6 +88,8 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--name", type=str, default=None)
     parser.add_argument("--random-state", type=int, dest="random_state", default=None)
     parser.add_argument("--max-cpu-frac", type=float, default=None)
+    parser.add_argument("--tier1", type=bool, default=None)
+    parser.add_argument("--overwrite", type=bool, default=None)
     parser.add_argument("--data-dir", type=Path, dest="data_dir", default=None)
 
     # Training-level args
@@ -121,7 +127,8 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
 
     # Build new ExperimentConfig from defaults, overriding only provided values
     exp_kwargs = {}
-    for field in ("dataset", "method", "divergence", "dim", "name", "random_state", "max_cpu_frac", "data_dir"):
+    for field in ("dataset", "method", "divergence", "dim", "name",
+                  "random_state", "max_cpu_frac", "data_dir", "overwrite", "tier1"):
         v = parsed_dict.get(field, None)
         if v is not None:
             exp_kwargs[field] = v
@@ -178,8 +185,100 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     return RunConfig(exp=new_exp, train=new_train, eval=new_eval)
 
 
-if __name__ == "__main__":
-    # When executed directly, parse sys.argv and print resulting config as JSON
-    cfg = parse_run_config()
-    print(json.dumps(asdict(cfg), default=str, indent=2))
+def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig:
+    """
+    Parse CLI args and return a VectorRunConfig built from defaults with overrides.
 
+    Rules:
+    - VectorExperimentConfig defaults come from config.py
+    - HFStreamConfig is derived from --dataset (via _default_hf_config_for_dataset)
+      unless overridden by --hf-path/--hf-config/--hf-split/--hf-text-column.
+
+    Args:
+        argv: optional list of arguments (like sys.argv[1:]). If None, argparse
+              will read from the actual command line.
+    Returns:
+        VectorRunConfig with overrides applied only for flags provided by the user.
+    """
+    default_exp = VectorExperimentConfig()
+
+    parser = argparse.ArgumentParser(
+        description="Build a VectorRunConfig from defaults and CLI overrides"
+    )
+
+    # High-level selection: dataset label used for HF mapping + output grouping
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Dataset label (used for HF mapping + output grouping). "
+             "Example: fineweb-en or a HF path or path:config",
+    )
+
+    # VectorExperimentConfig overrides
+    parser.add_argument("--output-dir", type=Path, dest="output_dir", default=None)
+    parser.add_argument("--rows-per-flush", type=int, dest="rows_per_flush", default=None)
+    parser.add_argument("--rows-per-part", type=int, dest="rows_per_part", default=None)
+
+    parser.add_argument("--target-vectors", type=int, dest="target_vectors", default=None)
+    parser.add_argument("--max-text-length", type=int, dest="max_text_length", default=None)
+
+    parser.add_argument("--spacy-model", type=str, dest="spacy_model", default=None)
+    parser.add_argument("--batch-size", type=int, dest="batch_size", default=None)
+    parser.add_argument("--cpu-frac", type=float, dest="cpu_frac", default=None)
+
+    parser.add_argument("--log-every-s", type=float, dest="log_every_s", default=None)
+
+    # HFStreamConfig overrides (optional)
+    parser.add_argument("--hf-path", type=str, dest="hf_path", default=None)
+    parser.add_argument("--hf-config", type=str, dest="hf_config", default=None)
+    parser.add_argument("--hf-split", type=str, dest="hf_split", default=None)
+    parser.add_argument("--hf-text-column", type=str, dest="hf_text_column", default=None)
+
+    parsed = parser.parse_args(args=argv)
+    d = vars(parsed)
+
+    # ---- exp overrides ----
+    exp_kwargs = {}
+    exp_fields = (
+        "output_dir",
+        "rows_per_flush",
+        "rows_per_part",
+        "target_vectors",
+        "max_text_length",
+        "spacy_model",
+        "batch_size",
+        "cpu_frac",
+        "log_every_s",
+    )
+    for f in exp_fields:
+        if d.get(f) is not None:
+            exp_kwargs[f] = d[f]
+    new_exp = replace(default_exp, **exp_kwargs) if exp_kwargs else default_exp
+
+    # ---- hf config: derive from dataset unless overridden ----
+    dataset = d.get("dataset") or "fineweb-en"
+    hf_default = _default_hf_config_for_dataset(dataset)
+
+    hf_path = d.get("hf_path")
+    hf_config = d.get("hf_config")
+    hf_split = d.get("hf_split")
+    hf_text_column = d.get("hf_text_column")
+
+    # If user provides hf-path, it wins and we treat dataset as just a label.
+    # If user does NOT provide hf-path, we use the derived default from dataset.
+    hf = HFStreamConfig(
+        path=hf_path if hf_path is not None else hf_default.path,
+        config=hf_config if hf_config is not None else hf_default.config,
+        split=hf_split if hf_split is not None else hf_default.split,
+        text_column=hf_text_column if hf_text_column is not None else hf_default.text_column,
+    )
+
+    return VectorRunConfig(exp=new_exp, hf=hf)
+
+
+if __name__ == "__main__":
+    # Keep your existing behavior for parse_run_config() when run directly
+    # cfg = parse_run_config()
+    cfg = parse_vector_run_config()
+    print(json.dumps(asdict(cfg), default=str, indent=2))

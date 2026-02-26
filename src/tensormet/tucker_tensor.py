@@ -1605,7 +1605,7 @@ class SparseTupleTensor:
                 core_cpu = tl.tensor(cp.asnumpy(core))
                 factors_cpu = [tl.tensor(cp.asnumpy(f)) for f in factors]
                 tucker_decomp = TuckerDecomposition(core=core_cpu, factors=factors_cpu, vocab=vocab)
-                print(iteration)
+                print(iteration, end=":\t")
                 fitness_score = evaluate_sample(
                     tucker_decomp,
                     sample_sentences,

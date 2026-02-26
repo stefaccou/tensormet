@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, Union
 import hashlib
 import json
-
+from tensormet.utils import DATA_DIR
 
 @dataclass(frozen=True)
 class TrainingConfig:
@@ -31,7 +31,7 @@ class EvalConfig:
     n_sentence_cache: Optional[int] = None  # if we later want to cap loaded sentences
     remove_OOV: bool = False # whether to set OOV in test set to OOV token (false ignores the sentences)
     time_iteration: bool = True # whether to print the time taken by an iteration
-    save_intermediate: bool = False # whether to save the current best model (safety for interrupted code)
+    save_intermediate: bool = True # whether to save the current best model (safety for interrupted code)
     log_file: Optional[Union[str, Path]] = None
 
 
@@ -47,9 +47,8 @@ class ExperimentConfig:
     max_cpu_frac: float = 0.5
     tier1: bool = False
     overwrite: bool = False
-
     # paths
-    data_dir: Path = Path(".")
+    data_dir: Path = DATA_DIR
 
     def run_id(self) -> str:
         """Stable-ish identifier based on config content (not timestamp)."""
@@ -106,3 +105,63 @@ class RunConfig:
             "log": model.with_name(model.stem + "_log.txt"),
             "checkpoint_dir": checkpoint_dir,
         }
+
+@dataclass(frozen=True)
+class VectorExperimentConfig:
+    # Output + resume
+    output_dir: Path = DATA_DIR / "vectors"
+    rows_per_flush: int = 100_000
+    rows_per_part: int = 5_000_000
+
+    # Stream controls
+    target_vectors: int = 10_000_000
+    max_text_length: int = 50_000
+
+    # spaCy controls
+    spacy_model: str = "en_core_web_md"
+    batch_size: int = 256
+    cpu_frac: float = 0.66
+
+    # logging
+    log_every_s: float = 30.0
+
+@dataclass(frozen=True)
+class HFStreamConfig:
+    """How to stream texts from a HF dataset."""
+    path: str
+    config: Optional[str]
+    split: str = "train"
+    text_column: str = "text"
+
+def _default_hf_config_for_dataset(dataset: str) -> HFStreamConfig:
+    """
+    Map your ExperimentConfig.dataset to a HF streaming spec.
+    Keep this small + explicit so downstream code stays consistent.
+    """
+    # Your current default in ExperimentConfig is "fineweb-en".
+    if dataset in {"fineweb-en", "fineweb_en", "fineweb-english"}:
+        return HFStreamConfig(
+            path="HuggingFaceFW/fineweb",
+            config="CC-MAIN-2025-26",
+            split="train",
+            text_column="text",
+        )
+
+    # Fallback: allow passing a HF dataset path directly in cfg.exp.dataset
+    # Optionally support "path:config" form.
+    if ":" in dataset:
+        path, cfg = dataset.split(":", 1)
+        cfg = cfg.strip() or None
+        return HFStreamConfig(path=path.strip(), config=cfg)
+
+    return HFStreamConfig(path=dataset, config=None)
+
+@dataclass(frozen=True)
+class VectorRunConfig:
+    exp: VectorExperimentConfig
+    hf: HFStreamConfig
+
+    def output_dir(self) -> Path:
+        dataset = self.hf.path.replace("/", "-").strip()
+        config = (self.hf.config or "").replace("/", "-").strip()
+        return self.exp.output_dir / f"{dataset}_{config}_{self.exp.target_vectors}v"
