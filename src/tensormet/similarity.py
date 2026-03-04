@@ -65,8 +65,10 @@ def evaluate_sample(tensor,
     rank_score = 0
     prob_score = 0
     OOV = 0
+    tildes = 0
     mean = 0
     std = 0
+    excluded_tilde = 0
     if not sampled:
         random.seed(seed)
         sentences = random.sample(sentences, n_samples)
@@ -78,6 +80,8 @@ def evaluate_sample(tensor,
     else:
         ctx = limiter
 
+    factors_are_torch = hasattr(tensor.factors[0], "cpu")
+
     with (ctx):
         for tup in sentences:
             if not tensor.check_vocab(tup):
@@ -85,14 +89,15 @@ def evaluate_sample(tensor,
                 continue
             score = 0
             sim_score = 0
-
+            tilde_ex_score = 0
+            non_tilde_count = 0
             for i, element in enumerate(tup):
                 role = ["verb", "subject", "object"][i]
                 r2i = {"verb": "v2i", "subject": "s2i", "object": "o2i"}[role]
                 G_excluded = tensor.excluded_role_vector(tup, role=role)
 
                 # update to avoid division by 0
-                F = tensor.factors[i].cpu().numpy()  # (N,R)
+                F = tensor.factors[i].cpu().numpy() if factors_are_torch else tensor.factors[i]
 
                 # --- defensive norm computation ---
                 F_norm = np.linalg.norm(F, axis=1)
@@ -122,9 +127,15 @@ def evaluate_sample(tensor,
                 probs = softmax(similarities, temperature=softmax_temperature)
                 p_i = probs[idx]
                 sim_score += p_i
+                if not element == "~":
+                    tilde_ex_score += probs[idx]
+                    non_tilde_count += 1
+                else:
+                    tildes += 1
 
             rank_score += score/len(tup)
             prob_score += sim_score/len(tup)
+            excluded_tilde += tilde_ex_score/non_tilde_count
 
 
 
@@ -136,17 +147,29 @@ def evaluate_sample(tensor,
     scores["absolute_prob_score"] = prob_score / (n_samples-OOV)
     scores["OOV"] = OOV
     scores["OOV_rate"] = OOV/n_samples
+    scores["tilde_ex_prob_score"] = excluded_tilde/(n_samples-OOV)
     # todo: implement a scale-aware harmonic mean
     # scores["harmonic_mean"] = 2 / (scores["absolute_rank_score"] + scores["absolute_prob_score"])
     print(f"Average expected role vector rank score over {n_samples} samples: {scores['average_rank_score']}, "
           f"Average prob score: {scores['average_prob_score']}")
-    print(f"\tWithout {OOV} OOV: rank {scores['absolute_rank_score']}, prob {scores['absolute_prob_score']}")
-    # print(f"Harmonic mean between absolutes: {scores['harmonic_mean']}")
-    # print(f"Average mean {mean / (n_samples-OOV)}, std {std / (n_samples-OOV)}")
-    if return_type in scores.keys():
-        return scores[return_type]
-    else:
-        raise NotImplementedError(f"Choose one of {scores.keys()}")
+    print(f"\tWithout {OOV} OOV: rank {scores['absolute_rank_score']}, prob {scores['absolute_prob_score']} "
+          f"- without {tildes}'~': {scores['tilde_ex_prob_score']}")
+
+    if return_type == "all":
+        return scores
+
+    if isinstance(return_type, (list, tuple)):
+        missing = [k for k in return_type if k not in scores]
+        if missing:
+            raise NotImplementedError(f"Unknown score keys: {missing}. Choose from {list(scores.keys())}")
+        return {k: scores[k] for k in return_type}
+
+    if isinstance(return_type, str):
+        if return_type in scores:
+            return scores[return_type]
+        raise NotImplementedError(f"Choose one of {list(scores.keys())} or pass a list/tuple or 'all'.")
+
+    raise TypeError("return_type must be a string key, a list/tuple of keys, or 'all'.")
 
 def load_eval_sentences_cached(
     vector_path: str | os.PathLike,

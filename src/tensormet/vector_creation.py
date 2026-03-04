@@ -16,6 +16,7 @@ from datasets import load_dataset
 from tensormet.utils import DATA_DIR, compute_num_threads
 from tensormet.config import VectorRunConfig
 
+import gc
 
 SCHEMA = pa.schema([
     ("sent_id", pa.int64()),
@@ -210,9 +211,11 @@ def create_vectors_parquet_sharded(
     last_log_time = start_time
 
     writer = _open_part_writer(output_dir, part_id)
+    docs = None
 
     try:
-        for doc in nlp.pipe(gen_texts(), batch_size=cfg.exp.batch_size, n_process=n_process):
+        docs = nlp.pipe(gen_texts(), batch_size=cfg.exp.batch_size, n_process=n_process)
+        for doc in docs:
             rows, count, global_sent_id = extract_vectors(
                 doc,
                 global_sent_id,
@@ -269,6 +272,8 @@ def create_vectors_parquet_sharded(
 
         writer.close()
         save_meta()
+        docs = None
+        gc.collect()
 
     print(f"Vectors written: {vector_count} (dir: {output_dir})")
     print(f"Checkpoint saved: {meta_path}")

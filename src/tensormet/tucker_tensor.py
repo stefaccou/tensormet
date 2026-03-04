@@ -461,7 +461,6 @@ class TuckerDecomposition:
         If a single word is passed, the default factor matrix entry is used.
         Parameters
         ----------
-        tensor
         element
         role
 
@@ -480,7 +479,8 @@ class TuckerDecomposition:
             raise ValueError("Must be tuple or str")
 
         i = _role_index(role)
-        F = self.factors[i].cpu().numpy()  # (N,R)
+        F = self.factors[i].cpu().numpy() if hasattr(self.factors[0], "cpu") else self.factors[i]
+
 
         # --- defensive norm computation ---
         F_norm = np.linalg.norm(F, axis=1)
@@ -1246,20 +1246,22 @@ def torch_sparse_to_cupy(
 class SparseTupleTensor:
     """Encapsulating the Sparse TupleTensor (built from vectors extracted from corpus) and the vocabulary,
     providing methods for decomposition, refactoring, etc.."""
-    def __init__(self, tensor, device="cpu", sparsity_type=None):
+    def __init__(self, tensor, device="cpu", sparsity_type=None, shared_factors=None):
         self.tensor = tensor
         self.sparsity_type = sparsity_type
         self.shape = tensor.shape
         self.device = device
+        self.shared_factors = shared_factors
 
     # --- Construction and loading ---
     @classmethod
     def load_from_disk(cls,
-                       dataset: str="karrewiet_sparse",
-                       method: str="counting",
+                       dataset: str="fineweb-en",
+                       method: str="siiSoftPlus",
                        dims: int=1000,
                        map_location: str="cpu",
                        tier1: bool=False,
+                       shared_factors: set|None=None,
                           ) -> "SparseTupleTensor":
 
         """Loads a precomputed tucker decomposition from disk.
@@ -1282,9 +1284,13 @@ class SparseTupleTensor:
             raise ValueError("method must be one of {'counting','sc','sii'}")
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
+        is_shared = bool(shared_factors)
+        if is_shared:
+            print("loading in shared population:", shared_factors)
+        suffix = "_shared12" if is_shared else ""
 
         # vocab_path = os.path.join(base, f"vocabularies/{dims}.pkl")
-        populated_path = os.path.join(base,"populated", f"{method}_{dims}.pt")
+        populated_path = os.path.join(base,"populated", f"{method}_{dims}{suffix}.pt")
         # if not os.path.exists(vocab_path):
         #     raise FileNotFoundError(f"Missing vocab file: {vocab_path}")
         if not os.path.exists(populated_path):
@@ -1295,7 +1301,7 @@ class SparseTupleTensor:
         #     vocab = pickle.load(f)
         tensor = torch_or_pickle_load(populated_path, map_location=map_location)
 
-        return cls(tensor, device=map_location, sparsity_type="torch")
+        return cls(tensor, device=map_location, sparsity_type="torch", shared_factors=shared_factors)
 
 
 
@@ -1438,14 +1444,17 @@ class SparseTupleTensor:
     ):
         # unpacking the config
         try:
+            # experiment config
             rank = list(cfg.exp.rank)
             divergence = cfg.exp.divergence
             dim = cfg.exp.dim
+            random_state = cfg.exp.random_state
+
+            # training config
             n_iter_max = cfg.train.n_iter_max
             init = cfg.train.init
             tol = cfg.train.tol
             epsilon = cfg.train.epsilon
-            random_state = cfg.exp.random_state
             verbose = cfg.train.verbose
             return_errors = cfg.train.return_errors
             normalize_factors = cfg.train.normalize_factors
@@ -1453,6 +1462,7 @@ class SparseTupleTensor:
             warmup_steps = cfg.train.warmup_steps
             largedim = cfg.train.largedim
             checkpoint_saving = cfg.train.checkpoint_saving_steps
+
             rec_check_every = cfg.eval.rec_check_every
             sem_check_every = cfg.eval.sem_check_every
             sem_error_type = cfg.eval.sem_error_type
@@ -1461,6 +1471,7 @@ class SparseTupleTensor:
             time_iteration = cfg.eval.time_iteration
             # saving
             save_intermediate = cfg.eval.save_intermediate
+
 
         except:
             raise ValueError("Check config structure.")
@@ -1485,6 +1496,13 @@ class SparseTupleTensor:
         else:
             core, factors = initialize_nonnegative_tucker(self.tensor, shape, rank, modes, init, random_state)
 
+        linked_factors = defaultdict(set)
+        if self.shared_factors:
+            for a, b in self.shared_factors:
+                linked_factors[a].add(b)
+                linked_factors[b].add(a)
+
+
         rec_errors = []
         fitness_scores = []
         no_rec_improve_steps = 0
@@ -1494,12 +1512,23 @@ class SparseTupleTensor:
         best_sem_score = 0
         best_sem_iteration = None
 
+        # Decide once which semantic metric drives patience/diff
+        if sem_error_type == "all":
+            sem_primary_key = "average_rank_score"  # stable default (your dict always includes this)
+        elif isinstance(sem_error_type, (list, tuple)):
+            if len(sem_error_type) == 0:
+                raise ValueError("sem_error_type list/tuple must contain at least one key.")
+            sem_primary_key = sem_error_type[0]
+        else:
+            sem_primary_key = sem_error_type
+
         for iteration in range(n_iter_max):
             if time_iteration:
                 start_time = time.time()
             log_step = get_log_step(iteration, rec_log_every, rec_check_every)
             routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step, largedim=largedim)
             # --- factors ---
+
             for mode in modes:
                 factors[mode] = routing.factor_update(
                     vec_tensor=self.tensor,
@@ -1510,6 +1539,12 @@ class SparseTupleTensor:
                     thread_budget=thread_budget,
                     epsilon=epsilon,
                 )
+
+                # new: factor linking
+                if mode in linked_factors:
+                    for other in linked_factors[mode]:
+                        factors[other] = factors[mode]
+
 
             # --- core + error ---
             if routing.core_returns_error:
@@ -1605,36 +1640,56 @@ class SparseTupleTensor:
                 core_cpu = tl.tensor(cp.asnumpy(core))
                 factors_cpu = [tl.tensor(cp.asnumpy(f)) for f in factors]
                 tucker_decomp = TuckerDecomposition(core=core_cpu, factors=factors_cpu, vocab=vocab)
+
                 print(iteration, end=":\t")
-                fitness_score = evaluate_sample(
+                sem_out = evaluate_sample(
                     tucker_decomp,
                     sample_sentences,
                     sampled=True,
                     seed=random_state,
                     thread_budget=thread_budget,
-                    return_type=sem_error_type
+                    return_type=sem_error_type,
                 )
-                fitness_scores.append(fitness_score)
+                fitness_scores.append(sem_out)
+
+                # Primary value used for early stopping / diff
+                if isinstance(sem_out, dict):
+                    if sem_primary_key not in sem_out:
+                        raise KeyError(f"Primary semantic key '{sem_primary_key}' missing from returned scores.")
+                    sem_value = float(sem_out[sem_primary_key])
+                else:
+                    sem_value = float(sem_out)
+
                 tl.set_backend("cupy")
 
-                # track best semantic model
-                diff = float(fitness_score - best_sem_score)
+                # track best semantic model (based on primary key)
+                diff = sem_value - float(best_sem_score)
                 if diff > 0:
-                    best_sem_score = fitness_score
+                    best_sem_score = sem_value
                     best_core = core.copy()
                     best_factors = factors.copy()
                     best_sem_iteration = iteration
                     if verbose:
                         print("New best semantic score; saving current best core and factors.")
                     if save_intermediate:
+                        import json
+
                         temp_tensor = TuckerTensor((best_core, best_factors))
                         torch.save(temp_tensor, paths["model"])
                         print("saving temp model to", paths["model"])
+
                         np.save(paths["errors"], np.array([cp.asnumpy(e) for e in rec_errors]))
-                        np.save(paths["fitness"], np.array([cp.asnumpy(f) for f in fitness_scores]))
 
+                        # Save semantic scores more robustly
+                        if isinstance(sem_out, dict):
+                            # save as JSON alongside the provided fitness path
+                            fitness_json_path = str(paths["fitness"]) + ".json"
+                            with open(fitness_json_path, "w") as f:
+                                json.dump(fitness_scores, f, indent=2)
+                        else:
+                            np.save(paths["fitness"], np.array(fitness_scores, dtype=float))
 
-                # semantic patience (uses the same tol/patience)
+                # semantic patience (uses primary key only)
                 if diff < tol:
                     sem_no_rec_improve_steps += 1
                     if verbose:
@@ -1660,17 +1715,27 @@ class SparseTupleTensor:
                     torch.save(checkpoint_tensor, paths["checkpoint_dir"] / f"{iteration + 1}.pt")
 
                     # we collect reconstruction and fitness scores if they exist and dump
-                    if fitness_scores is not None:
-                        fitness_score = fitness_scores[-1]
+                    if fitness_scores:
+                        last_sem = fitness_scores[-1]
+                        if isinstance(last_sem, dict):
+                            fitness_primary = last_sem.get(sem_primary_key, None)
+                            fitness_dump = json.dumps(last_sem)
+                        else:
+                            fitness_primary = last_sem
+                            fitness_dump = str(last_sem)
                     else:
-                        fitness_score = None
-                    if rec_errors is not None:
-                        rec_error = rec_errors[-1]
-                    else:
-                        rec_error = None
-                    # we append this to the checkpoint file:
-                    with open(paths["checkpoint_dir"]/"log.txt", "a") as f:
-                        f.write(f"Iteration {iteration + 1}\tRec_error: {rec_error}\tFitness_score: {fitness_score}\n")
+                        fitness_primary = None
+                        fitness_dump = None
+
+                    rec_error = rec_errors[-1] if rec_errors else None
+
+                    with open(paths["checkpoint_dir"] / "log.txt", "a") as f:
+                        f.write(
+                            f"Iteration {iteration + 1}\t"
+                            f"Rec_error: {rec_error}\t"
+                            f"Sem({sem_primary_key}): {fitness_primary}\t"
+                            f"Sem_all: {fitness_dump}\n"
+                        )
 
 
         if best_sem_iteration:
@@ -1681,8 +1746,14 @@ class SparseTupleTensor:
         if return_errors == "simple":
             return tensor, rec_errors
         elif return_errors == "full":
-            return {"tensor": tensor, "errors": rec_errors, "fitness_scores": fitness_scores,
-                    "iterations": iteration + 1, "final_error": rec_errors[-1] if len(rec_errors) > 0 else None}
+            return {
+                "tensor": tensor,
+                "errors": rec_errors,
+                "fitness_scores": fitness_scores,
+                "sem_primary_key": sem_primary_key,
+                "iterations": iteration + 1,
+                "final_error": rec_errors[-1] if len(rec_errors) > 0 else None,
+            }
         else:
             return tensor
 

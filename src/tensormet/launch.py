@@ -23,6 +23,7 @@ import cupy as cp
 import time
 from dataclasses import asdict
 
+
 def launch_vector_creation(cfg, *, overwrite: bool | None = None):
     """
     Run vector creation with the same "launcher" conventions:
@@ -104,7 +105,10 @@ def launch_nnt_decomposition(cfg):
                                                          n_samples=cfg.eval.sem_fitness_target,
                                                          )
 
-    vocab_path = os.path.join(DATA_DIR, "tensors", cfg.exp.dataset, f"vocabularies/{cfg.exp.dim}.pkl")
+    is_shared = bool(cfg.train.shared_factors)
+    print("shared factors:", is_shared)
+    suffix = "_shared12" if is_shared else ""
+    vocab_path = os.path.join(DATA_DIR, "tensors", cfg.exp.dataset, f"vocabularies/{cfg.exp.dim}{suffix}.pkl")
     with open(vocab_path, "rb") as f:
         vocab = pickle.load(f)
 
@@ -138,6 +142,7 @@ def launch_nnt_decomposition(cfg):
         method=cfg.exp.method,
         dims=cfg.exp.dim,
         tier1=cfg.exp.tier1,
+        shared_factors=cfg.train.shared_factors,
     )
 
     with tee_output(paths["log"]):

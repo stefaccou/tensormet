@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Tuple, Optional, Dict, Union
+from typing import Tuple, Optional, Dict, Union, Set
 import hashlib
 import json
 from tensormet.utils import DATA_DIR
@@ -13,6 +13,7 @@ class TrainingConfig:
     epsilon: float = 1e-12
     init: str = "random"
     normalize_factors: bool = False
+    shared_factors: Optional[Set[Tuple[int, int]]] = None
     warmup_steps: int = 1
     patience: int = 5
     verbose: bool = True

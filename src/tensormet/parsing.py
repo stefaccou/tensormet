@@ -56,6 +56,54 @@ def _parse_rank(s: str, n_modes=3) -> Tuple[int, ...]:
     except ValueError:
         raise argparse.ArgumentTypeError(f"Invalid rank specification: {s}")
 
+def _parse_shared_factors(s: str):
+    """
+    Parse shared factor links.
+
+    Accepts:
+      --shared-factors none
+      --shared-factors 1-2
+      --shared-factors 1-2,2-0
+      --shared-factors 1:2,2:0
+
+    Returns:
+      None  (if 'none'/'null'/'')
+      set({(a,b), ...})
+    """
+    if s is None:
+        return None
+    s2 = str(s).strip().lower()
+    if s2 in ("", "none", "null", "no"):
+        return None
+
+    pairs = set()
+    for token in s.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            a, b = token.split("-", 1)
+        elif ":" in token:
+            a, b = token.split(":", 1)
+        else:
+            raise argparse.ArgumentTypeError(
+                f"Invalid --shared-factors token '{token}'. Use like '1-2,2-0' or 'none'."
+            )
+        try:
+            ai = int(a.strip())
+            bi = int(b.strip())
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"Invalid --shared-factors token '{token}': indices must be ints."
+            )
+        if ai == bi:
+            raise argparse.ArgumentTypeError(
+                f"Invalid --shared-factors token '{token}': cannot link a mode to itself."
+            )
+        pairs.add((ai, bi))
+
+    return pairs if pairs else None
+
 
 def _none_if_missing(value, sentinel=None):
     # Helper: treat argparse's default sentinel as missing -> return None
@@ -102,6 +150,13 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--init", type=str, default=None)
     parser.add_argument("--normalize-factors", type=_parse_bool, default=None,
                         help="true/false")
+    # new: factor sharing
+    parser.add_argument(
+        "--shared-factors",
+        type=_parse_shared_factors,
+        default=None,
+        help="Factor linking, e.g. --shared-factors 1-2,2-0 . Use 'none' to disable.",
+    )
     parser.add_argument("--warmup-steps", type=int, dest="warmup_steps", default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--verbose", type=_parse_bool, default=None)
@@ -147,6 +202,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "epsilon",
         "init",
         "normalize_factors",
+        "shared_factors",
         "warmup_steps",
         "patience",
         "verbose",
