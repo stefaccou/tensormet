@@ -29,7 +29,7 @@ mkdir -p "$MPLCONFIGDIR" "$PIP_CACHE_DIR" "$NUMBA_CACHE_DIR"
 python3 -m pip install setuptools pip --upgrade
 python3 -m pip install cupy-cuda12x
 python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-python3 -m pip install --no-cache-dir nvidia-ml-py tensorflow sparse tensorly pyTensorlab tqdm
+python3 -m pip install --no-cache-dir pynvml nvidia-ml-py tensorflow sparse tensorly pyTensorlab tqdm pyarrow spacy
 
 cd metaphor
 python3 -m pip install -e . --no-deps

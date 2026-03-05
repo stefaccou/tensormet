@@ -25,7 +25,8 @@ echo "created and activated environment"
 python3 -m pip install setuptools pip --upgrade
 python3 -m pip install cupy-cuda12x
 python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-python3 -m pip install --no-cache-dir tensorflow sparse tensorly pyTensorlab tqdm
+python3 -m pip install --no-cache-dir tensorflow sparse tensorly pyTensorlab tqdm pyarrow spacy
+
 
 cd metaphor
 python3 -m pip install -e . --no-deps

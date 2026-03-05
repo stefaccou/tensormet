@@ -8,9 +8,6 @@ from tensormet.utils import (select_gpu,
                              tee_output,
                              notify_discord
                              )
-from tensormet.tucker_tensor import SparseTupleTensor
-from tensormet.similarity import load_eval_sentences_cached_parquet, ensure_vocab
-from tensormet.vector_creation import create_vectors_parquet_sharded
 import os
 import sys
 import pickle
@@ -18,8 +15,6 @@ import tensorly as tl
 from tensorly.tucker_tensor import TuckerTensor
 from pathlib import Path
 import numpy as np
-import torch
-import cupy as cp
 import time
 from dataclasses import asdict
 
@@ -33,6 +28,8 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
     - optionally notifies discord
     """
     # cfg is expected to be VectorRunConfig (cfg.exp is VectorExperimentConfig)
+    from tensormet.vector_creation import create_vectors_parquet_sharded
+
     output_dir = cfg.output_dir()
     print("output_dir: ", output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -92,9 +89,15 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
 
     return summary
 
-def launch_nnt_decomposition(cfg):
-    device = select_gpu()
+def launch_nnt_decomposition(cfg, gpu_id=None):
     thread_budget = ThreadBudget(n_threads=compute_num_threads(cfg.exp.max_cpu_frac))
+
+    # load in GPU sensitive modules only AFTER device has been set!
+    import torch
+    import cupy as cp
+    from tensormet.tucker_tensor import SparseTupleTensor
+    from tensormet.similarity import load_eval_sentences_cached_parquet, ensure_vocab
+
     tl.set_backend("cupy")
 
     # we load the sample sentences only once

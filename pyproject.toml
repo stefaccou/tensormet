@@ -1,6 +1,6 @@
 [project]
 name = "tensormet"        # project name
-version = "0.1.7"
+version = "0.1.8"
 description = """
 Project utilities for tensor repo.
 """
@@ -17,6 +17,8 @@ dependencies = [
     "tensorly",
     "torch",
     "tqdm",
+    "pyarrow",
+    "spacy" # for vector creation
 ]
 
 [build-system]

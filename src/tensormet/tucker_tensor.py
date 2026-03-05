@@ -1605,7 +1605,7 @@ class SparseTupleTensor:
                     if rel_err is None:
                         raise ValueError("error should always be available on error checking steps")
 
-                    if not last_err:
+                    if last_err is None:
                         last_err = rel_err
                     elif iteration >= warmup_steps:
                         imp_val = abs(float(last_err - rel_err))
@@ -1683,8 +1683,7 @@ class SparseTupleTensor:
                         # Save semantic scores more robustly
                         if isinstance(sem_out, dict):
                             # save as JSON alongside the provided fitness path
-                            fitness_json_path = str(paths["fitness"]) + ".json"
-                            with open(fitness_json_path, "w") as f:
+                            with open(paths["fitness_json"], "w") as f:
                                 json.dump(fitness_scores, f, indent=2)
                         else:
                             np.save(paths["fitness"], np.array(fitness_scores, dtype=float))
@@ -1738,7 +1737,7 @@ class SparseTupleTensor:
                         )
 
 
-        if best_sem_iteration:
+        if best_sem_iteration is not None:
             tensor = TuckerTensor((best_core, best_factors))
             iteration = best_sem_iteration
         else:

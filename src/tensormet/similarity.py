@@ -62,6 +62,7 @@ def evaluate_sample(tensor,
                     return_type="average_rank_score",
                     softmax_temperature=0.1
                     ):
+    roles = ["verb", "subject", "object"]
     rank_score = 0
     prob_score = 0
     OOV = 0
@@ -92,7 +93,7 @@ def evaluate_sample(tensor,
             tilde_ex_score = 0
             non_tilde_count = 0
             for i, element in enumerate(tup):
-                role = ["verb", "subject", "object"][i]
+                role = roles[i]
                 r2i = {"verb": "v2i", "subject": "s2i", "object": "o2i"}[role]
                 G_excluded = tensor.excluded_role_vector(tup, role=role)
 
@@ -147,13 +148,18 @@ def evaluate_sample(tensor,
     scores["absolute_prob_score"] = prob_score / (n_samples-OOV)
     scores["OOV"] = OOV
     scores["OOV_rate"] = OOV/n_samples
-    scores["tilde_ex_prob_score"] = excluded_tilde/(n_samples-OOV)
+    scores["tilde_excluded_prob_score"] = excluded_tilde/(n_samples-OOV)
+    scores["tilde_rate"] = tildes / ((n_samples-OOV)*(len(roles)-1)) # verb never has ~ elements
     # todo: implement a scale-aware harmonic mean
     # scores["harmonic_mean"] = 2 / (scores["absolute_rank_score"] + scores["absolute_prob_score"])
     print(f"Average expected role vector rank score over {n_samples} samples: {scores['average_rank_score']}, "
           f"Average prob score: {scores['average_prob_score']}")
     print(f"\tWithout {OOV} OOV: rank {scores['absolute_rank_score']}, prob {scores['absolute_prob_score']} "
-          f"- without {tildes}'~': {scores['tilde_ex_prob_score']}")
+          f"- without {tildes}'~': {scores['tilde_excluded_prob_score']}")
+    # make scores JSON-safe (numpy scalars -> python scalars)
+    for k, v in list(scores.items()):
+        if isinstance(v, np.generic):  # np.float32, np.int64, ...
+            scores[k] = v.item()  # -> python float/int
 
     if return_type == "all":
         return scores

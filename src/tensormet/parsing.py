@@ -136,8 +136,8 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--name", type=str, default=None)
     parser.add_argument("--random-state", type=int, dest="random_state", default=None)
     parser.add_argument("--max-cpu-frac", type=float, default=None)
-    parser.add_argument("--tier1", type=bool, default=None)
-    parser.add_argument("--overwrite", type=bool, default=None)
+    parser.add_argument("--tier1", type=_parse_bool, default=None)
+    parser.add_argument("--overwrite", type=_parse_bool, default=None)
     parser.add_argument("--data-dir", type=Path, dest="data_dir", default=None)
 
     # Training-level args
