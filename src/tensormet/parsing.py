@@ -46,17 +46,20 @@ def _parse_bool(s: str) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {s}")
 
 
-def _parse_rank(s: str, n_modes=3) -> Tuple[int, ...]:
-    # Accept comma-separated integers like "100,100,100" or a single int
+def _parse_rank(s: str, n_modes: Optional[int] = None) -> Tuple[int, ...]:
+    # Accept comma-separated integers like "100,100,100,100" or a single int
     if not s:
         return tuple()
     parts = [p.strip() for p in s.split(",") if p.strip()]
-    if len(parts) < n_modes:
-        parts = [parts[0]]*n_modes
     try:
-        return tuple(int(p) for p in parts)
+        vals = tuple(int(p) for p in parts)
     except ValueError:
         raise argparse.ArgumentTypeError(f"Invalid rank specification: {s}")
+
+    if n_modes is not None and len(vals) == 1:
+        vals = vals * n_modes
+    return vals
+
 
 def _parse_shared_factors(s: str):
     """
@@ -70,7 +73,7 @@ def _parse_shared_factors(s: str):
 
     Returns:
       None  (if 'none'/'null'/'')
-      set({(a,b), ...})
+      tuple(((a,b), ...))
     """
     if s is None:
         return None
@@ -102,10 +105,17 @@ def _parse_shared_factors(s: str):
             raise argparse.ArgumentTypeError(
                 f"Invalid --shared-factors token '{token}': cannot link a mode to itself."
             )
-        pairs.add((ai, bi))
+        pairs.add(tuple(sorted((ai, bi))))
 
-    return pairs if pairs else None
+    return tuple(sorted(pairs)) if pairs else None
 
+def _parse_cols_to_build(s: str) -> Tuple[str, ...]:
+    if not s:
+        return tuple()
+    cols = tuple(part.strip() for part in s.split(",") if part.strip())
+    if not cols:
+        raise argparse.ArgumentTypeError("Invalid cols_to_build specification.")
+    return cols
 
 def _none_if_missing(value, sentinel=None):
     # Helper: treat argparse's default sentinel as missing -> return None
@@ -363,9 +373,22 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
 
     parser.add_argument("--dataset", type=str, default=None, help="Dataset folder name inside vectors/ and tensors/")
     parser.add_argument("--top-ks", type=_parse_top_ks, default=None, help="Comma-separated ints, e.g. --top-ks 1000,2000,5000")
-    parser.add_argument("--v-col", type=str, dest="v_col", default=None)
-    parser.add_argument("--s-col", type=str, dest="s_col", default=None)
-    parser.add_argument("--o-col", type=str, dest="o_col", default=None)
+    # parser.add_argument("--v-col", type=str, dest="v_col", default=None)
+    # parser.add_argument("--s-col", type=str, dest="s_col", default=None)
+    # parser.add_argument("--o-col", type=str, dest="o_col", default=None)
+    parser.add_argument(
+        "--cols-to-build",
+        type=_parse_cols_to_build,
+        dest="cols_to_build",
+        default=None,
+        help='Comma-separated column names, e.g. --cols-to-build root,nsubj,obj or frame_name,target,arg1,arg2',
+    )
+    parser.add_argument(
+        "--shared-factors",
+        type=_parse_shared_factors,
+        default=None,
+        help="Factor linking for population, e.g. --shared-factors 2-3 or 1-2,2-3 . Use 'none' to disable.",
+    )
     parser.add_argument("--batch-rows", type=int, dest="batch_rows", default=None)
     parser.add_argument("--batch-readahead", type=int, dest="batch_readahead", default=None)
     parser.add_argument("--fragment-readahead", type=int, dest="fragment_readahead", default=None)
@@ -375,7 +398,16 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
     d = vars(parsed)
 
     exp_kwargs = {}
-    for f in ("dataset", "top_ks", "v_col", "s_col", "o_col", "batch_rows", "batch_readahead", "fragment_readahead", "data_dir"):
+    for f in (
+            "dataset",
+            "top_ks",
+            "cols_to_build",
+            "shared_factors",
+            "batch_rows",
+            "batch_readahead",
+            "fragment_readahead",
+            "data_dir",
+    ):
         if d.get(f) is not None:
             exp_kwargs[f] = d[f]
 

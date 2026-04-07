@@ -96,6 +96,14 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
 
     return summary
 
+
+def _shared_suffix(shared_factors):
+    if not shared_factors:
+        return ""
+    parts = ["shared" + "".join(map(str, pair)) for pair in shared_factors]
+    return "_" + "_".join(sorted(parts))
+
+
 def launch_nnt_decomposition(cfg, gpu_id=None):
     thread_budget = ThreadBudget(n_threads=compute_num_threads(cfg.exp.max_cpu_frac))
 
@@ -117,8 +125,13 @@ def launch_nnt_decomposition(cfg, gpu_id=None):
 
     is_shared = bool(cfg.train.shared_factors)
     print("shared factors:", is_shared)
-    suffix = "_shared12" if is_shared else ""
-    vocab_path = os.path.join(DATA_DIR, "tensors", cfg.exp.dataset, f"vocabularies/{cfg.exp.dim}{suffix}.pkl")
+    suffix = _shared_suffix(cfg.train.shared_factors)
+    vocab_path = os.path.join(
+        DATA_DIR,
+        "tensors",
+        cfg.exp.dataset,
+        f"vocabularies/{cfg.exp.dim}{suffix}.pkl"
+    )
     with open(vocab_path, "rb") as f:
         vocab = pickle.load(f)
 
@@ -265,9 +278,7 @@ def launch_tensor_population(cfg):
             top_ks=list(cfg.exp.top_ks),
             save=True,
             path_to_tensors=output_dir,
-            v_col=cfg.exp.v_col,
-            s_col=cfg.exp.s_col,
-            o_col=cfg.exp.o_col,
+            cols_to_build=list(cfg.exp.cols_to_build),
             batch_rows=cfg.exp.batch_rows,
             batch_readahead=cfg.exp.batch_readahead,
             fragment_readahead=cfg.exp.fragment_readahead,

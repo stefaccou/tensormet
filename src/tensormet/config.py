@@ -13,7 +13,7 @@ class TrainingConfig:
     epsilon: float = 1e-12
     init: str = "random"
     normalize_factors: bool = False
-    shared_factors: Optional[Set[Tuple[int, int]]] = None
+    shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None
     warmup_steps: int = 1
     patience: int = 5
     verbose: bool = True
@@ -139,6 +139,11 @@ class RunConfig:
         best_candidate_paths = paths
         latest_iter = -1
 
+        def _canonical_shared_factors(x):
+            if x is None:
+                return None
+            return tuple(sorted(tuple(sorted(pair)) for pair in x))
+
         # 2. Iterate through found configs and verify structural compatibility
         for config_path in candidate_configs:
             print("investigating", config_path)
@@ -160,8 +165,8 @@ class RunConfig:
                     old_exp.get("dim") == self.exp.dim and
                     tuple(old_exp.get("rank", [])) == tuple(self.exp.rank) and
                     old_train.get("init") == self.train.init and
-                    # Cast both to string to safely compare parsed JSON strings with Python sets
-                    str(old_train.get("shared_factors")) == str(self.train.shared_factors)
+                    _canonical_shared_factors(old_train.get("shared_factors")) ==
+                    _canonical_shared_factors(self.train.shared_factors)
             )
             print(old_exp.get("dataset"), self.exp.dataset, "\n",
             old_exp.get("method"),self.exp.method, "\n",
@@ -170,7 +175,8 @@ class RunConfig:
             tuple(old_exp.get("rank", [])), tuple(self.exp.rank), "\n",
             old_train.get("init"), self.train.init, "\n",
             # Cast both to string to safely compare parsed JSON strings with Python sets
-            str(old_train.get("shared_factors")),str(self.train.shared_factors))
+            _canonical_shared_factors(old_train.get("shared_factors")),
+            _canonical_shared_factors(self.train.shared_factors))
 
 
             if is_compatible:
@@ -330,9 +336,11 @@ class VectorRunConfig:
 class PopulationExperimentConfig:
     dataset: str = "fineweb-en"
     top_ks: Tuple[int, ...] = (1000, 2000, 4000, 6000)
-    v_col: str = "root"
-    s_col: str = "nsubj"
-    o_col: str = "obj"
+    cols_to_build: Tuple[str, ...] = ("root", "nsubj", "obj")
+    shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None
+    # v_col: str = "root"
+    # s_col: str = "nsubj"
+    # o_col: str = "obj"
     batch_rows: int = 256_000
     batch_readahead: int = 32
     fragment_readahead: int = 8
