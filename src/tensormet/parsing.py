@@ -29,7 +29,9 @@ from tensormet.config import (
     VectorExperimentConfig,
     VectorRunConfig,
     HFStreamConfig,
-    _default_hf_config_for_dataset #todo Fix this import
+    _default_hf_config_for_dataset, #todo Fix this import
+    PopulationExperimentConfig,
+    PopulationRunConfig,
 )
 
 
@@ -110,6 +112,16 @@ def _none_if_missing(value, sentinel=None):
     return None if value is sentinel else value
 
 
+def _parse_top_ks(s: str) -> Tuple[int, ...]:
+    if not s:
+        return tuple()
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid top-ks specification: {s}")
+
+
 def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     """Parse CLI args and return a RunConfig built from defaults with overrides.
 
@@ -163,7 +175,9 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--return-errors", type=str, dest="return_errors", default=None)
     parser.add_argument("--largedim", type=_parse_bool, default=None)
     parser.add_argument("--checkpoint-saving-steps", type=int, dest="checkpoint_saving_steps", default=None)
-
+    # NEW: Checkpoint resumption flag
+    parser.add_argument("--resume", type=_parse_bool, default=None,
+                        help="Resume training from the latest available checkpoint for this configuration.")
     # Eval-level args
     parser.add_argument("--rec-check-every", type=int, dest="rec_check_every", default=None)
     parser.add_argument("--rec-log-every", type=int, dest="rec_log_every", default=None)
@@ -209,6 +223,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "return_errors",
         "largedim",
         "checkpoint_saving_steps",
+        "resume",
     )
     # argparse used dashes -> underscores mapping; check each
     for f in train_fields:
@@ -262,6 +277,11 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
         description="Build a VectorRunConfig from defaults and CLI overrides"
     )
 
+    parser.add_argument("--type",
+                        type=str,
+                        default=None,
+                        help="Frames or syntactic vector creation")
+
     # High-level selection: dataset label used for HF mapping + output grouping
     parser.add_argument(
         "--dataset",
@@ -297,6 +317,7 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
     # ---- exp overrides ----
     exp_kwargs = {}
     exp_fields = (
+        "type",
         "output_dir",
         "rows_per_flush",
         "rows_per_part",
@@ -333,8 +354,37 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
     return VectorRunConfig(exp=new_exp, hf=hf)
 
 
+
+def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationRunConfig:
+    """Parse CLI args and return a PopulationRunConfig built from defaults with overrides."""
+    default_exp = PopulationExperimentConfig()
+
+    parser = argparse.ArgumentParser(description="Build a PopulationRunConfig from defaults and CLI overrides")
+
+    parser.add_argument("--dataset", type=str, default=None, help="Dataset folder name inside vectors/ and tensors/")
+    parser.add_argument("--top-ks", type=_parse_top_ks, default=None, help="Comma-separated ints, e.g. --top-ks 1000,2000,5000")
+    parser.add_argument("--v-col", type=str, dest="v_col", default=None)
+    parser.add_argument("--s-col", type=str, dest="s_col", default=None)
+    parser.add_argument("--o-col", type=str, dest="o_col", default=None)
+    parser.add_argument("--batch-rows", type=int, dest="batch_rows", default=None)
+    parser.add_argument("--batch-readahead", type=int, dest="batch_readahead", default=None)
+    parser.add_argument("--fragment-readahead", type=int, dest="fragment_readahead", default=None)
+    parser.add_argument("--data-dir", type=Path, dest="data_dir", default=None)
+
+    parsed = parser.parse_args(args=argv)
+    d = vars(parsed)
+
+    exp_kwargs = {}
+    for f in ("dataset", "top_ks", "v_col", "s_col", "o_col", "batch_rows", "batch_readahead", "fragment_readahead", "data_dir"):
+        if d.get(f) is not None:
+            exp_kwargs[f] = d[f]
+
+    new_exp = replace(default_exp, **exp_kwargs) if exp_kwargs else default_exp
+    return PopulationRunConfig(exp=new_exp)
+
+
 if __name__ == "__main__":
     # Keep your existing behavior for parse_run_config() when run directly
     # cfg = parse_run_config()
-    cfg = parse_vector_run_config()
+    cfg = parse_population_run_config()
     print(json.dumps(asdict(cfg), default=str, indent=2))

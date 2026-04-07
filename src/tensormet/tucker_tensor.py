@@ -64,20 +64,23 @@ def np_sim(a: np.ndarray, b: np.ndarray) -> float:
 class TuckerDecomposition:
     """Encapsulating the tucker decomposition (core and factors) and the vocabulary,
     providing methods for scoring, slicing, visualisation, etc."""
-    def __init__(self, core, factors: List[torch.Tensor], vocab: dict):
+    def __init__(self, core, factors: List[torch.Tensor],
+                 vocab: dict, shared_factors: set | None = None):
         self.core = core
         self.factors = factors
         self.vocab = vocab
+        self.shared_factors = shared_factors or set()
 
     # --- Construction and loading ---
     @classmethod
     def load_from_disk(cls,
-                       dataset: str="karrewiet_vectors_ids",
-                       method: str="counting",
-                       divergence: str="fr",
-                       dims: int=750,
+                       dataset: str="fineweb-en",
+                       method: str="siiSoftPlus",
+                       divergence: str="kl",
+                       dims: int=4000,
                        rank: int=100,
-                       iterations: int=1000,
+                       iterations: int|None=None,
+                       factor_sharing: bool|set=False,
                        map_location: str="cpu",
                        name: Optional[str]=None,
                        tier1: bool=False,
@@ -105,9 +108,49 @@ class TuckerDecomposition:
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
 
-        vocab_path = os.path.join(base, f"vocabularies/{dims}.pkl")
-        tensor_name = f"{name+'_' if name else ''}{divergence}_{method}_{dims}d_{rank}r_{iterations}i.pt"
-        decomp_path = os.path.join(base,"decomposition", tensor_name)
+        suffix = ""
+
+        parsed_shared = None
+        suffix = ""
+
+        if factor_sharing is True:
+            parsed_shared = {(1, 2)}
+            suffix = "_shared12"
+        elif isinstance(factor_sharing, set) and factor_sharing:
+            for item in factor_sharing:
+                if not (isinstance(item, tuple) and len(item) == 2):
+                    raise TypeError(
+                        f"factor_sharing must be a set of 2-tuples, got item {item!r}"
+                    )
+            parsed_shared = factor_sharing
+            suffix = "_shared" + "_".join(f"{a}{b}" for a, b in sorted(parsed_shared))
+
+        vocab_path = os.path.join(base, f"vocabularies/{dims}{suffix}.pkl")
+        decomp_path = os.path.join(base, "decomposition")
+        # Construct the prefix of the tensor file name
+        name_prefix = f"{name + '_' if name else ''}"
+        file_prefix = f"{name_prefix}{divergence}_{method}_{dims}d_{rank}r_"
+
+        # Look for the highest iteration option if not specified
+        if not iterations:
+            highest_iter = -1
+            if os.path.exists(decomp_path):
+                for filename in os.listdir(decomp_path):
+                    # Check if the file matches our prefix and the expected suffix "i.pt"
+                    if filename.startswith(file_prefix) and filename.endswith("i.pt"):
+                        # Extract the iteration number string from the filename
+                        iter_str = filename[len(file_prefix):-len("i.pt")]
+                        if iter_str.isdigit():
+                            highest_iter = max(highest_iter, int(iter_str))
+
+            if highest_iter == -1:
+                raise FileNotFoundError(
+                    f"Could not find any decomposition files matching prefix '{file_prefix}' in {decomp_path}")
+
+            iterations = highest_iter
+
+        tensor_name = f"{file_prefix}{iterations}i.pt"
+        decomp_path = os.path.join(decomp_path, tensor_name)
         if not os.path.exists(vocab_path):
             raise FileNotFoundError(f"Missing vocab file: {vocab_path}")
         if not os.path.exists(decomp_path):
@@ -119,7 +162,7 @@ class TuckerDecomposition:
         (core, factors) = torch_or_pickle_load(decomp_path, map_location=map_location)
 
         # if there is a "runs.jsonl" file in the decomposition folder, we print the content relevant to the loaded tensor
-        runs_path = os.path.join(base, "decomposition", "runs.jsonl")
+        runs_path = os.path.join(decomp_path, "runs.jsonl")
         if os.path.exists(runs_path):
             with open(runs_path, "r") as f:
                 for line in f:
@@ -134,16 +177,18 @@ class TuckerDecomposition:
         else:
             print("Warning: file creation predates logging of runs; no run info available.")
 
-        return cls(core, factors, vocab)
+        return cls(core, factors, vocab, shared_factors=parsed_shared)
 
 
 
 
-    def check_vocab(self, triple: Tuple[str, str, str]) -> bool:
+    def check_vocab(self, triple: Tuple[str, str, str], return_type=bool) -> bool|tuple:
         """Checks if the given (verb, subject, object) triple is in the vocabulary."""
         v_in = triple[0] in self.vocab["v2i"]
         s_in = triple[1] in self.vocab["s2i"]
         o_in = triple[2] in self.vocab["o2i"]
+        if return_type == tuple:
+            return (v_in, s_in, o_in)
         return v_in and s_in and o_in
 
 
@@ -286,12 +331,7 @@ class TuckerDecomposition:
 
     def get_role_slice(self, role: str, normalize: bool=False) -> np.ndarray:
         G = self._core_np()
-        # if role == "verb":
-        #     slc = np.einsum('ip, pqr -> iqr', _to_np(self.factors[0]), G)
-        # elif role == "subject":
-        #     slc = np.einsum('jp, pqr -> ipr', _to_np(self.factors[1]), G)
-        # elif role == "object":
-        #     slc = np.einsum('kp, pqr -> ipq', _to_np(self.factors[2]), G)
+
         if role == "verb":
             # (num_verbs, R) × (R, R, R) -> (num_verbs, R, R)
             slc = np.einsum('ip,pqr->i q r', _to_np(self.factors[0]), G)
@@ -380,7 +420,7 @@ class TuckerDecomposition:
                                      role: str,
                                      method: str="slice",
                                      top_k: int=10):
-        target_word = triple[{"verb":0, "subject":1, "object":2}[role]]
+        target_word = triple[_role_index(role)]
         slc = self.get_slice(triple=triple, role=role, method=method)
         if method == "slice":
             word_id = self.vocab[f"{role[0]}2i"][target_word]
@@ -415,6 +455,19 @@ class TuckerDecomposition:
         ]
         return top_words
 
+    def get_top_dimensions_for_word(self,
+                                    word:str,
+                                    role: str,
+                                    top_k: int = 10
+                                    ):
+        latent = self.fetch_single_latent(word, role)
+        latent = torch.tensor(latent)
+        scores, dims = torch.topk(latent, top_k)
+        top_scores = [
+            (int(dim), float(score)) for dim, score in zip(dims, scores)
+        ]
+        return top_scores
+
     # todo: no safeguard against division by 0
 
     def get_expected_element(self, target_tuple, role, verbose=True):
@@ -422,7 +475,7 @@ class TuckerDecomposition:
         r2i = _voc_index(role)
         latents = self.fetch_latents(target_tuple)
         G_item = self.excluded_role_vector(target_tuple, role=role)
-        factor = self.factors[index].cpu().numpy()
+        factor = self.factors[index].cpu().numpy() if hasattr(self.factors[0], "cpu") else self.factors[index]
         similarities = factor @ G_item / (np.linalg.norm(factor, axis=1) * np.linalg.norm(G_item))
         # we get the top 5 most similar verbs
         k = 5
@@ -432,7 +485,7 @@ class TuckerDecomposition:
         for idx in top_k_indices:
             role_str = next(k for k, v in self.vocab[r2i].items() if v == idx)
 
-            role_act = self.factors[index][idx, :].cpu().numpy()
+            role_act = self.factors[index][idx, :].cpu().numpy() if hasattr(self.factors[0], "cpu") else self.factors[index][idx, :]
             cos_sim = np_sim(role_act, latents[index])
 
             results.append({"token": role_str,
@@ -504,8 +557,9 @@ class TuckerDecomposition:
 
 
 class ExtendedTucker(TuckerDecomposition):
-    def __init__(self, core, factors: List[torch.Tensor], vocab: dict):
-        super().__init__(core, factors, vocab)
+    def __init__(self, core, factors: List[torch.Tensor],
+                 vocab: dict, shared_factors: set | None = None):
+        super().__init__(core, factors, vocab, shared_factors=shared_factors)
         self.is_extended: bool = False
         self.extended_roles: set[str] = set()
 
@@ -539,7 +593,7 @@ class ExtendedTucker(TuckerDecomposition):
         Create an ExtendedTucker that shares core/factors/vocab references with `t`.
         (No copying; changes to dense tensors in-place will reflect in both.)
         """
-        return cls(t.core, t.factors, t.vocab)
+        return cls(t.core, t.factors, t.vocab, shared_factors=t.shared_factors)
 
     @classmethod
     def extend_tucker(
@@ -565,7 +619,6 @@ class ExtendedTucker(TuckerDecomposition):
 
         ext = cls.from_tucker(t)
         for role in roles:
-
             ext.extend_role(
                 role=role,
                 sample=dataset,
@@ -619,7 +672,6 @@ class ExtendedTucker(TuckerDecomposition):
             sample,  # iterable of (v,s,o) triples
             normalize: bool =True,
             normalize_mode: Literal["l2", "minmax"] = "l2",
-
             n_threads: int | None = None,
             thread_budget: ThreadBudget | None = None,
             fraction_threads: float = 0.75,
@@ -876,6 +928,40 @@ class ExtendedTucker(TuckerDecomposition):
         - if a role has < top_k extended tokens: raise
         """
         roles = ["verb", "subject", "object"]
+
+        # UPDATED: new versions that have the "shared_factors" flag should use it and keep the link
+        if hasattr(self, "shared_factors") and self.shared_factors:
+            # factors are shared, but the extensions are role-specific. The link would be lost here.
+            for a, b in self.shared_factors:
+                role_a, role_b = roles[a], roles[b]
+
+                # Combine unique tokens from both roles
+                combined_toks = set(self.extensions[role_a].keys()) | set(self.extensions[role_b].keys())
+
+                for tok in combined_toks:
+                    vecs = []
+                    counts = 0
+
+                    if tok in self.extensions[role_a]:
+                        vecs.append(self.extensions[role_a][tok] * self.extension_counts[role_a][tok])
+                        counts += self.extension_counts[role_a][tok]
+
+                    if tok in self.extensions[role_b]:
+                        vecs.append(self.extensions[role_b][tok] * self.extension_counts[role_b][tok])
+                        counts += self.extension_counts[role_b][tok]
+
+                    # Calculate the weighted average vector
+                    avg_vec = sum(vecs) / counts
+
+                    # Assign identical unified data back to both roles
+                    self.extensions[role_a][tok] = self.extensions[role_b][tok] = avg_vec
+                    self.extended_tokens[role_a].add(tok)
+                    self.extended_tokens[role_b].add(tok)
+                    self.extension_counts[role_a][tok] = self.extension_counts[role_b][tok] = counts
+
+                # Sync lengths
+                self.extension_lengths[role_a] = len(self.extensions[role_a])
+                self.extension_lengths[role_b] = len(self.extensions[role_b])
         top_ks = {}
         # sanity
         if top_k:
@@ -943,7 +1029,7 @@ class ExtendedTucker(TuckerDecomposition):
         # new_vocab["is_extended"] = True
         # new_vocab["extension_top_k"] = int(top_k)
 
-        return TuckerDecomposition(self.core, new_factors, new_vocab)
+        return TuckerDecomposition(self.core, new_factors, new_vocab, shared_factors=self.shared_factors)
 
     # -- Saving and loading --
 
@@ -1440,7 +1526,6 @@ class SparseTupleTensor:
             thread_budget: ThreadBudget,
             vocab=None,
             sample_sentences=None,
-            checkpoint_tensor: TuckerDecomposition=None,
     ):
         # unpacking the config
         try:
@@ -1473,8 +1558,8 @@ class SparseTupleTensor:
             save_intermediate = cfg.eval.save_intermediate
 
 
-        except:
-            raise ValueError("Check config structure.")
+        except Exception as e:
+            raise ValueError(f"Check config structure: {e}")
 
         if not isinstance(self, SparseTupleTensor):
             raise TypeError("sparse_tensor must be a SparseTupleTensor instance.")
@@ -1486,15 +1571,30 @@ class SparseTupleTensor:
         if checkpoint_saving:
             os.makedirs(paths["checkpoint_dir"], exist_ok=True)
 
+        # --- RESUME STATE FETCHING ---
+        resume_state = cfg.get_resume_state()
+        start_iteration = resume_state.get("start_iteration", 0)
+        best_sem_score = resume_state.get("best_sem_score", 0.0)
+        rec_errors = resume_state.get("rec_errors", [])
+        fitness_scores = resume_state.get("fitness_scores", [])
+        checkpoint_tensor = resume_state.get("checkpoint_tensor", None)
 
         shape = tuple(self.shape)
         rank = validate_tucker_rank(shape, rank=rank)
         modes = list(range(len(rank)))
-        if checkpoint_tensor:
-            core = cp.asarray(checkpoint_tensor.core)
-            factors = [cp.asarray(factor) for factor in checkpoint_tensor.factors]
+        if checkpoint_tensor is not None:
+            if isinstance(checkpoint_tensor, tuple):
+                # if TensorLy TuckerTensor
+                ckpt_core, ckpt_factors = checkpoint_tensor
+            else:
+                # if our TuckerDecomposition class
+                ckpt_core, ckpt_factors = checkpoint_tensor.core, checkpoint_tensor.factors
+
+            core = cp.asarray(ckpt_core)
+            factors = [cp.asarray(factor) for factor in ckpt_factors]
         else:
             core, factors = initialize_nonnegative_tucker(self.tensor, shape, rank, modes, init, random_state)
+
 
         linked_factors = defaultdict(set)
         if self.shared_factors:
@@ -1502,15 +1602,16 @@ class SparseTupleTensor:
                 linked_factors[a].add(b)
                 linked_factors[b].add(a)
 
-
-        rec_errors = []
-        fitness_scores = []
         no_rec_improve_steps = 0
-        last_err = None
+        # If we resumed, grab the last known error to calculate early stopping diff accurately
+        last_err = rec_errors[-1] if rec_errors else None
 
         sem_no_rec_improve_steps = 0
-        best_sem_score = 0
-        best_sem_iteration = None
+
+        # Ensure 'best' variables are initialized safely so returning them at the end doesn't fail
+        best_core = core.copy()
+        best_factors = [f.copy() for f in factors]
+        best_sem_iteration = start_iteration if start_iteration > 0 else None
 
         # Decide once which semantic metric drives patience/diff
         if sem_error_type == "all":
@@ -1522,7 +1623,7 @@ class SparseTupleTensor:
         else:
             sem_primary_key = sem_error_type
 
-        for iteration in range(n_iter_max):
+        for iteration in range(start_iteration, n_iter_max):
             if time_iteration:
                 start_time = time.time()
             log_step = get_log_step(iteration, rec_log_every, rec_check_every)
@@ -1667,12 +1768,11 @@ class SparseTupleTensor:
                 if diff > 0:
                     best_sem_score = sem_value
                     best_core = core.copy()
-                    best_factors = factors.copy()
+                    best_factors = [factor.copy() for factor in factors]
                     best_sem_iteration = iteration
                     if verbose:
                         print("New best semantic score; saving current best core and factors.")
                     if save_intermediate:
-                        import json
 
                         temp_tensor = TuckerTensor((best_core, best_factors))
                         torch.save(temp_tensor, paths["model"])
@@ -1709,7 +1809,7 @@ class SparseTupleTensor:
             if checkpoint_saving: # only trigger if this is not 0 -> True
                 if (iteration + 1) % cfg.train.checkpoint_saving_steps == 0:
                     print(f"saving model at iteration {iteration}")
-                    checkpoint_tensor = TuckerTensor((core, factors))
+                    checkpoint_tensor = TuckerTensor((cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors]))
                     paths = cfg.artifact_paths()
                     torch.save(checkpoint_tensor, paths["checkpoint_dir"] / f"{iteration + 1}.pt")
 

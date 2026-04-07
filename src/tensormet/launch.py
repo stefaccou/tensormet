@@ -11,6 +11,7 @@ from tensormet.utils import (select_gpu,
 import os
 import sys
 import pickle
+import json
 import tensorly as tl
 from tensorly.tucker_tensor import TuckerTensor
 from pathlib import Path
@@ -28,7 +29,7 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
     - optionally notifies discord
     """
     # cfg is expected to be VectorRunConfig (cfg.exp is VectorExperimentConfig)
-    from tensormet.vector_creation import create_vectors_parquet_sharded
+    from tensormet.vector_creation import create_vectors_parquet_sharded, create_frame_vectors_parquet_sharded
 
     output_dir = cfg.output_dir()
     print("output_dir: ", output_dir)
@@ -62,8 +63,14 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
     start_time = time.time()
 
     # If you want the same stdout capture style as decomposition:
-    with tee_output(log_path):
-        summary = create_vectors_parquet_sharded(cfg, overwrite=do_overwrite)
+    if cfg.exp.type == "frames":
+        print('Frame-based vector creation')
+        with tee_output(log_path):
+            summary = create_frame_vectors_parquet_sharded(cfg, overwrite=do_overwrite)
+    else:
+        print("Syntactic slot-based vector creation")
+        with tee_output(log_path):
+            summary = create_vectors_parquet_sharded(cfg, overwrite=do_overwrite)
 
     end_time = time.time()
 
@@ -128,7 +135,7 @@ def launch_nnt_decomposition(cfg, gpu_id=None):
             p.parent.mkdir(parents=True, exist_ok=True)
 
     # If model already exists, skip (optional but recommended)
-    if paths["model"].exists() and not cfg.exp.overwrite:
+    if paths["model"].exists() and not cfg.exp.overwrite and not cfg.train.resume:
         print(f"Decomposition already exists at {paths['model']}, skipping...")
         sys.exit(0)
 
@@ -170,8 +177,24 @@ def launch_nnt_decomposition(cfg, gpu_id=None):
     tucker_decomp_torch = TuckerTensor((core_t, factors_t))
 
     torch.save(tucker_decomp_torch, paths["model"])
-    np.save(paths["errors"], np.array([cp.asnumpy(e) for e in errors]))
-    np.save(paths["fitness"], np.array([cp.asnumpy(f) for f in fitness_scores]))
+    np.save(paths["errors"], np.asarray(errors, dtype=float))
+
+    if fitness_scores:
+        last = fitness_scores[-1]
+        if isinstance(last, dict):
+            with open(paths["fitness_json"], "w") as f:
+                json.dump(fitness_scores, f, indent=2)
+        else:
+            np.save(paths["fitness"], np.array([cp.asnumpy(f) for f in fitness_scores]))
+
+    last_fitness = fitness_scores[-1] if fitness_scores else None
+    if isinstance(last_fitness, dict):
+        final_fitness = float(last_fitness[tucker_decomp_info["sem_primary_key"]])
+        final_fitness_full = last_fitness
+    else:
+        final_fitness = float(last_fitness) if last_fitness is not None else None
+        final_fitness_full = None
+
     append_jsonl(
         paths["runs_jsonl"],
         {
@@ -181,7 +204,8 @@ def launch_nnt_decomposition(cfg, gpu_id=None):
             "results": {
                 "iterations": int(tucker_decomp_info["iterations"]),
                 "final_error": float(tucker_decomp_info["final_error"]),
-                "final_fitness": (float(fitness_scores[-1]) if fitness_scores else None),
+                "final_fitness": final_fitness,
+                "final_fitness_full": final_fitness_full,
                 "runtime_seconds": round(end_time - start_time, 2),
                 "model_path": str(paths["model"]),
                 "errors_path": str(paths["errors"]),
@@ -197,3 +221,77 @@ def launch_nnt_decomposition(cfg, gpu_id=None):
     print("model, errors and config saved")
 
     return tucker_decomp_torch
+
+
+
+def launch_tensor_population(cfg):
+    """
+    Run sparse tensor population with standard launcher conventions:
+    - creates output directories
+    - logs a run record to output_dir/populated/runs.jsonl
+    - optionally notifies discord
+    """
+    # Assuming you rename the script 2_sparse_population...py to tensor_population.py
+    from tensormet.population import populate_tensors_parquet
+
+    vectors_dir = cfg.exp.vectors_dir()
+    output_dir = cfg.exp.output_dir()
+
+    # Mirroring your original script's logic for directory creation
+    populated_dir = output_dir / "populated"
+    populated_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "vocabularies").mkdir(parents=True, exist_ok=True)
+
+    # Where we record "runs"
+    runs_jsonl = populated_dir / "runs.jsonl"
+    log_path = populated_dir / "population_log.txt"
+
+    append_jsonl(
+        runs_jsonl,
+        {
+            "timestamp": utc_now_iso(),
+            "run_kind": "tensor_population",
+            "cfg": asdict(cfg),
+            "vectors_dir": str(vectors_dir),
+            "output_dir": str(output_dir),
+        },
+    )
+
+    start_time = time.time()
+
+    with tee_output(log_path):
+        results = populate_tensors_parquet(
+            path_to_vectors=vectors_dir,
+            top_ks=list(cfg.exp.top_ks),
+            save=True,
+            path_to_tensors=output_dir,
+            v_col=cfg.exp.v_col,
+            s_col=cfg.exp.s_col,
+            o_col=cfg.exp.o_col,
+            batch_rows=cfg.exp.batch_rows,
+            batch_readahead=cfg.exp.batch_readahead,
+            fragment_readahead=cfg.exp.fragment_readahead,
+        )
+
+    end_time = time.time()
+
+    append_jsonl(
+        runs_jsonl,
+        {
+            "timestamp": utc_now_iso(),
+            "run_kind": "tensor_population",
+            "cfg": asdict(cfg),
+            "results": {
+                "runtime_seconds": round(end_time - start_time, 2),
+                "top_ks_processed": list(cfg.exp.top_ks),
+            },
+        },
+    )
+
+    notify_discord(
+        f"Tensor population finished for {cfg.exp.dataset}. "
+        f"Top Ks: {list(cfg.exp.top_ks)}. "
+        f"Runtime: {end_time - start_time:.2f}s."
+    )
+
+    return results
