@@ -6,6 +6,7 @@ import torch
 import pickle
 import multiprocessing
 from dataclasses import dataclass
+from collections import defaultdict
 from contextlib import contextmanager
 from threadpoolctl import threadpool_limits
 import json
@@ -167,6 +168,16 @@ def einsum_letters(n):
         raise ValueError(f"Tensor order {n} too large for einsum-letter helper ({len(letters)} available).")
     return letters[:n]
 
+def voc_index(role: str) -> str:
+    return f"{role}2i"
+
+def extract_roles_from_vocab(vocab):
+    roles = [k[len("vocab_"):] for k in vocab.keys() if k.startswith("vocab_")]
+    if not roles:
+        return ["verb", "subject", "object"] #safe default
+    else:
+        return roles
+
 # --- Logging utilities ---
 def write_json(path: Path, obj: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -255,3 +266,52 @@ def tee_output(
             f.close()
         except Exception:
             pass
+
+# factor sharing
+def linked_factor_groups(num_factors: int, shared_factors=None) -> list[list[int]]:
+    """
+    Convert pairwise links like {(1,2), (2,3)} into connected groups:
+    [[1,2,3], [0], ...]
+    """
+    parent = list(range(num_factors))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    if shared_factors:
+        for a, b in shared_factors:
+            if not (0 <= a < num_factors and 0 <= b < num_factors):
+                raise ValueError(
+                    f"Invalid shared_factors entry {(a, b)} for {num_factors} factors."
+                )
+            union(a, b)
+
+    groups = defaultdict(list)
+    for i in range(num_factors):
+        groups[find(i)].append(i)
+
+    return list(groups.values())
+
+def nontrivial_linked_groups(shared_factors, num_factors: int = 3) -> list[list[int]]:
+    """
+    Normalize pairwise shared_factors into connected groups, matching population code.
+    """
+    if not shared_factors:
+        return []
+
+    groups = linked_factor_groups(num_factors=num_factors, shared_factors=shared_factors)
+    return [group for group in groups if len(group) > 1]
+
+def shared_factor_suffix(shared_factors) -> str:
+    if not shared_factors:
+        return ""
+    parts = ["shared" + "".join(map(str, pair)) for pair in sorted(shared_factors)]
+    return "_" + "_".join(parts)

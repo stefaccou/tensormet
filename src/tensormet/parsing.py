@@ -153,7 +153,8 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--method", type=str, default=None)
     parser.add_argument("--divergence", type=str, default=None)
     parser.add_argument("--dim", type=int, default=None)
-    parser.add_argument("--rank", type=_parse_rank, default=None,
+    parser.add_argument("--order", type=int, default=None) # new: order
+    parser.add_argument("--rank", type=str, default=None,
                         help="Comma-separated ranks, e.g. --rank 100,100,100 or single int")
     parser.add_argument("--name", type=str, default=None)
     parser.add_argument("--random-state", type=int, dest="random_state", default=None)
@@ -204,17 +205,19 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parsed = parser.parse_args(args=argv)
     parsed_dict = vars(parsed)
 
+
     # Build new ExperimentConfig from defaults, overriding only provided values
     exp_kwargs = {}
-    for field in ("dataset", "method", "divergence", "dim", "name",
-                  "random_state", "max_cpu_frac", "data_dir", "overwrite", "tier1"):
+    for field in ("dataset", "method", "order", "divergence", "dim", "name",
+                  "random_state", "max_cpu_frac", "data_dir", "overwrite", "tier1" ):
         v = parsed_dict.get(field, None)
         if v is not None:
             exp_kwargs[field] = v
 
     # rank needs special treatment
     if parsed_dict.get("rank") is not None:
-        exp_kwargs["rank"] = parsed_dict["rank"]
+        order = parsed_dict.get("order") or default_exp.order
+        exp_kwargs["rank"] = _parse_rank(parsed_dict["rank"], n_modes=order)
 
     new_exp = replace(default_exp, **exp_kwargs) if exp_kwargs else default_exp
 

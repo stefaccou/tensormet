@@ -1,3 +1,7 @@
+import math
+import itertools
+
+from tqdm import tqdm
 import numpy as np
 import cupy as cp
 import cupyx.scipy.sparse as cpx_sparse
@@ -13,7 +17,9 @@ from tensormet.sparse_ops import (
     unfold_from_vectorized_sparse,
     sparse_multi_mode_dot_vec,
     ptl_tucker_to_tensor,
-    gather_dense_at_block_nz
+    gather_dense_at_block_nz,
+    safe_ravel,
+    compute_Zcols_batch
 )
 from tensormet.utils import ThreadBudget, einsum_letters
 # -- Kullback-Leibler Divergence --
@@ -482,27 +488,7 @@ def _tucker_den_row_full(core, factors, mode, epsilon=1e-12):
     return den_row
 
 
-def _compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=1e-12):
-    """
-    Compute Z columns (as rows) for a batch of unfolding columns, without building full Z.
 
-    Returns Z_u with shape (m, R_mode), where m = batch size.
-    """
-    N = core.ndim
-    letters = einsum_letters(N)
-    core_subs = "".join(letters)
-
-    # factor-row matrices for each other mode: (m, Rk)
-    mats = [factors[k][idxs_by_mode[k]] for k in other_modes]
-
-    # einsum: core[a b c ...], M_b[m b], M_c[m c], ... -> out[m a_mode]
-    in_terms = [core_subs] + [("m" + letters[k]) for k in other_modes]
-    out_term = "m" + letters[mode]
-    eq = ",".join(in_terms) + "->" + out_term
-
-    Z_u = cp.einsum(eq, core, *mats)
-    Z_u = cp.clip(Z_u, a_min=epsilon, a_max=None)
-    return Z_u
 def _unravel_flat_indices_C(flat, shape):
     """
     flat : (m,) cupy int64
@@ -549,28 +535,115 @@ def _rhat_from_factor_rows_sequential(core, mats, epsilon=1e-12):
 
     r_hat = cp.clip(tmp, a_min=epsilon, a_max=None)  # (b,)
     return r_hat
+#
+# def _accumulate_core_num_outer(Num, w, mats):
+#     """
+#     Num: core-shaped accumulator (R0,...,R_{N-1})
+#     w  : (b,)
+#     mats[n]: (b, Rn)
+#
+#     Updates Num in-place: Num += sum_m w[m] * outer(mats0[m], mats1[m], ...)
+#     """
+#     b = w.shape[0]
+#     N = len(mats)
+#
+#     # Build T with shape (b, R0, R1, ..., R_{N-1}) using progressive outer products
+#     T = w[:, None] * mats[0]  # (b, R0)
+#
+#     for n in range(1, N):
+#         # Expand last axis and outer with mats[n]
+#         # T: (b, ..., R_{n-1}) -> (b, ..., R_{n-1}, 1)
+#         # mats[n]: (b, Rn) -> (b, 1, ..., 1, Rn)
+#         T = T[..., None] * mats[n].reshape((b,) + (1,) * (T.ndim - 1) + (mats[n].shape[1],))
+#
+#     # Sum over batch and add to Num
+#     Num += cp.sum(T, axis=0)
+
 def _accumulate_core_num_outer(Num, w, mats):
     """
-    Num: core-shaped accumulator (R0,...,R_{N-1})
-    w  : (b,)
-    mats[n]: (b, Rn)
-
-    Updates Num in-place: Num += sum_m w[m] * outer(mats0[m], mats1[m], ...)
+    Optimized core accumulator using Khatri-Rao products and cuBLAS Matrix Multiplication.
+    Replaces the slow, massively expanding outer product loop.
     """
-    b = w.shape[0]
     N = len(mats)
+    nnz = w.shape[0]
+    if nnz == 0: return
 
-    # Build T with shape (b, R0, R1, ..., R_{N-1}) using progressive outer products
-    T = w[:, None] * mats[0]  # (b, R0)
+    if N == 1:
+        Num += cp.sum(w[:, None] * mats[0], axis=0)
+        return
+    if N == 2:
+        Num += (mats[0] * w[:, None]).T @ mats[1]
+        return
 
-    for n in range(1, N):
-        # Expand last axis and outer with mats[n]
-        # T: (b, ..., R_{n-1}) -> (b, ..., R_{n-1}, 1)
-        # mats[n]: (b, Rn) -> (b, 1, ..., 1, Rn)
-        T = T[..., None] * mats[n].reshape((b,) + (1,) * (T.ndim - 1) + (mats[n].shape[1],))
+    # 1. Split modes into Left, Right, and Loop
+    # We want Left and Right KR products to fit well within memory (budget ~400MB)
+    budget_elements = 100_000_000
 
-    # Sum over batch and add to Num
-    Num += cp.sum(T, axis=0)
+    left_modes = []
+    left_size = 1
+    for i in range(N):
+        if left_size * mats[i].shape[1] * nnz < budget_elements:
+            left_modes.append(i)
+            left_size *= mats[i].shape[1]
+        else:
+            break
+
+    right_modes = []
+    right_size = 1
+    for i in reversed(range(len(left_modes), N)):
+        if right_size * mats[i].shape[1] * nnz < budget_elements:
+            right_modes.append(i)
+            right_size *= mats[i].shape[1]
+        else:
+            break
+    right_modes = right_modes[::-1]
+
+    loop_modes = [i for i in range(N) if i not in left_modes and i not in right_modes]
+
+    # Edge Cases
+    if not left_modes:
+        left_modes = [0]
+        if 0 in loop_modes: loop_modes.remove(0)
+        if 0 in right_modes: right_modes.remove(0)
+    if not right_modes and len(loop_modes) > 0:
+        right_modes = [loop_modes.pop()]
+
+    # 2. Build Khatri-Rao matrices for Left and Right
+    def build_KR(modes):
+        if not modes: return None
+        res = mats[modes[0]]
+        for i in modes[1:]:
+            res = (res[:, :, None] * mats[i][:, None, :]).reshape(nnz, -1)
+        return res
+
+    KR_L = build_KR(left_modes)
+    KR_R = build_KR(right_modes)
+
+    # 3. Contract using matrix multiplication
+    if not loop_modes:
+        slice_sum = (KR_L * w[:, None]).T @ KR_R
+        Num += slice_sum.reshape([mats[i].shape[1] for i in left_modes + right_modes])
+        return
+
+    loop_ranks = [mats[i].shape[1] for i in loop_modes]
+    for loop_idx in itertools.product(*[range(r) for r in loop_ranks]):
+        v = w.copy()
+        for loop_i, r in zip(loop_modes, loop_idx):
+            v *= mats[loop_i][:, r]
+
+        if KR_L is not None and KR_R is not None:
+            # Massive Matrix Multiplication
+            slice_sum = (KR_L * v[:, None]).T @ KR_R
+
+            # Auto-align the dimensions
+            full_slice = [slice(None) if i in left_modes + right_modes else loop_idx[loop_modes.index(i)] for i in
+                          range(N)]
+            Num[tuple(full_slice)] += slice_sum.reshape([mats[i].shape[1] for i in left_modes + right_modes])
+
+        elif KR_L is not None:
+            slice_sum = cp.sum(KR_L * v[:, None], axis=0)
+            full_slice = [slice(None) if i in left_modes else loop_idx[loop_modes.index(i)] for i in range(N)]
+            Num[tuple(full_slice)] += slice_sum.reshape([mats[i].shape[1] for i in left_modes])
 
 
 def _blocked_coo_to_flat_indices(vec_tensor, orig_shape):
@@ -685,83 +758,128 @@ def _core_multilinear_grams(core, grams, epsilon=1e-12):
 def _gpu_free_bytes():
     """
     Conservative 'free bytes now' estimate.
-    - memGetInfo: free bytes in the CUDA context (driver view)
-    - default mempool: may have cached blocks; it can still grow if driver has free
-    We return driver-free (most conservative for new allocations).
+    Flushes the CuPy memory pool first to get an accurate driver-level reading.
     """
+    # 1. Force CuPy to return all cached/unused memory to the CUDA driver
+    cp.get_default_memory_pool().free_all_blocks()
+
+    # 2. Now ask the driver how much memory is actually free
     free_b, total_b = cp.cuda.runtime.memGetInfo()
     return int(free_b)
 
+# def _estimate_batch_num_for_outer(
+#     core,
+#     factors,
+#     safety=0.9,
+#     temp_mult=1.1,
+# ):
+#     """
+#     Much more conservative batch estimate for _accumulate_core_num_outer,
+#     because it often materializes intermediate outer-products / broadcasts.
+#
+#     This is intentionally pessimistic: uses prod(R) scaling as a worst-case.
+#     """
+#     N = len(factors)
+#     dtype = core.dtype
+#
+#     itemsize = int(np.dtype(dtype).itemsize)
+#     R = [int(factors[n].shape[1]) for n in range(N)]
+#     core_size = int(np.prod(R))
+#
+#     # worst-case: per-b element touches/temporaries proportional to core_size
+#     # (many implementations end up with something like (b, core_size) transiently)
+#     bytes_per_b = core_size * itemsize
+#
+#     # plus gathered mats and indices (usually small compared to core_size, but add anyway)
+#     bytes_per_b += sum(R) * itemsize + N * 8
+#     bytes_per_b = int(np.ceil(bytes_per_b * temp_mult))
+#
+#     free_b = _gpu_free_bytes()
+#     budget_b = int(free_b * safety)
+#
+#     b = max(1, budget_b // max(1, bytes_per_b))
+#     return int(b)
 
-def _estimate_batch_num_for_outer(
-    core,
-    factors,
-    safety=0.9,
-    temp_mult=1.1,
-):
+
+def _estimate_batch_num_for_outer(core, factors, safety=0.60, temp_mult=2.0):
     """
-    Much more conservative batch estimate for _accumulate_core_num_outer,
-    because it often materializes intermediate outer-products / broadcasts.
-
-    This is intentionally pessimistic: uses prod(R) scaling as a worst-case.
+    New estimator for the optimized matrix-multiplication accumulator.
+    It no longer assumes the materialization of the full core outer product!
     """
     N = len(factors)
-    dtype = core.dtype
-
-    itemsize = int(np.dtype(dtype).itemsize)
+    itemsize = int(np.dtype(core.dtype).itemsize)
     R = [int(factors[n].shape[1]) for n in range(N)]
-    core_size = int(np.prod(R))
 
-    # worst-case: per-b element touches/temporaries proportional to core_size
-    # (many implementations end up with something like (b, core_size) transiently)
-    bytes_per_b = core_size * itemsize
+    # Max KR product size. We split into Left/Right roughly evenly.
+    half_N = (N + 1) // 2
+    largest_KR_rank = math.prod(sorted(R, reverse=True)[:half_N])
 
-    # plus gathered mats and indices (usually small compared to core_size, but add anyway)
-    bytes_per_b += sum(R) * itemsize + N * 8
-    bytes_per_b = int(np.ceil(bytes_per_b * temp_mult))
+    # Memory per batch element is dominated by the Khatri-Rao matrices
+    bytes_per_b = 2 * largest_KR_rank * itemsize
+    bytes_per_b = int(math.ceil(bytes_per_b * temp_mult))
 
-    free_b = _gpu_free_bytes()
+    free_b = int(_gpu_free_bytes())
     budget_b = int(free_b * safety)
 
     b = max(1, budget_b // max(1, bytes_per_b))
-    return int(b)
+
+    # Hard cap to prevent grid/memory timeout issues
+    hard_cap = max(1, int(1_000_000_000 // max(1, bytes_per_b)))
+    return min(int(b), hard_cap)
 
 
-def _estimate_batch_rhat_for_tensordot(
-    core,
-    factors,
-    safety=0.60,
-    temp_mult=1.3,     # tensordot may use extra workspace; keep >1
-):
-    """
-    Estimate safe batch size for _rhat_from_factor_rows_sequential that starts with:
-        tmp = tensordot(mats[0], core, axes=(1,0))  -> (b, prod(R[1:]))
-    """
-    N = len(factors)
+def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.40, temp_mult=4.0):  # Increased temp_mult
+    N = core.ndim
     R = [int(factors[n].shape[1]) for n in range(N)]
-
     dtype = core.dtype
     itemsize = int(np.dtype(dtype).itemsize)
 
-    # Dominant allocation: tmp has (b, prod(R[1:])) elements
-    prod_rest = int(np.prod(R[1:])) if N > 1 else 1
+    # The bottleneck: (batch, R1, R2...)
+    prod_rest = math.prod(R[1:])
     tmp_bytes_per_b = prod_rest * itemsize
 
-    # Also gather mats: sum_n (b*Rn) elements
-    mats_bytes_per_b = sum(R) * itemsize
-
-    # Small vectors (r_hat, w) and idx slices (negligible, but include)
-    small_bytes_per_b = (4 * itemsize) + (N * 8)
-
-    bytes_per_b = int(np.ceil((tmp_bytes_per_b + mats_bytes_per_b + small_bytes_per_b) * temp_mult))
+    # Total bytes per batch element
+    bytes_per_b = int(np.ceil(tmp_bytes_per_b * temp_mult))
 
     free_b = _gpu_free_bytes()
+    # Ensure we leave a large buffer for the rest of the graph
     budget_b = int(free_b * safety)
 
     b = budget_b // max(1, bytes_per_b)
-    return int(b)
+    return max(1, int(b))
 
 
+def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.60, temp_mult=3.0):
+    """
+    Estimate safe batch size for compute_Zcols_batch.
+    Uses pure Python math to avoid numpy 32-bit overflows and sets a hard cap.
+    """
+    N = core.ndim
+    R = [int(factors[n].shape[1]) for n in range(N)]
+    itemsize = int(np.dtype(core.dtype).itemsize)
+
+    other_modes = [k for k in range(N) if k != mode]
+    if not other_modes:
+        return 20000
+
+    k0 = other_modes[0]
+    # Pure Python math.prod guarantees no 32-bit wrap-around
+    remaining_R_prod = math.prod([R[k] for k in range(N) if k != k0])
+
+    # Element-wise operations allocate full temporary copies, so we need a multiplier of ~3.0
+    tmp_bytes_per_b = remaining_R_prod * itemsize
+    bytes_per_b = int(math.ceil(tmp_bytes_per_b * temp_mult))
+
+    free_b = int(_gpu_free_bytes())
+    budget_b = int(free_b * safety)
+
+    b = max(1, budget_b // max(1, bytes_per_b))
+
+    # HARD CAP: Prevent CUDA grid index limits from silently corrupting memory
+    # Cap peak temporary allocation to ~4GB per batch
+    hard_cap = max(1, int(2_000_000_000 // max(1, tmp_bytes_per_b)))
+
+    return min(int(b), hard_cap)
 
 def kl_factor_update_largedim(
     vec_tensor,
@@ -771,7 +889,7 @@ def kl_factor_update_largedim(
     shape,
     thread_budget=None,
     epsilon=1e-12,
-    batch_cols=20000,
+    batch_cols=None,
 ):
     """
     KL multiplicative update for Tucker factor A^(mode) WITHOUT building dense Z,
@@ -785,10 +903,27 @@ def kl_factor_update_largedim(
     """
 
     # Sparse unfolding X_(mode)
-    X = unfold_from_vectorized_sparse(vec_tensor, shape, mode).tocoo()
-    rows = X.row
-    cols = X.col
-    vals = X.data
+    # X = unfold_from_vectorized_sparse(vec_tensor, shape, mode).tocoo()
+    # rows = X.row
+    # cols = X.col
+    # vals = X.data
+
+    if batch_cols is None:
+        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode)
+    # print("batch cols:", batch_cols)
+
+    # new: avoid X buildup for large dimensions
+    flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
+    idxs = _unravel_flat_indices_C(flat, shape)
+
+    rows = idxs[mode]
+
+    other_modes = [m for m in range(len(shape)) if m != mode]
+    other_coords = [idxs[m] for m in other_modes]
+
+    # build a safe unfolded-column id in int64 only for grouping
+    other_shape = tuple(shape[m] for m in other_modes)
+    cols = safe_ravel(tuple(other_coords), other_shape, cp)
 
     A = factors[mode]  # (I_mode, R_mode)
 
@@ -812,7 +947,7 @@ def kl_factor_update_largedim(
         _, idxs_by_mode = _unravel_cols_for_mode(u, shape, mode)  # dict: other_mode -> (m,)
 
         # Z_u: (m, R_mode)
-        Z_u = _compute_Zcols_batch(
+        Z_u = compute_Zcols_batch(
             core=core,
             factors=factors,
             mode=mode,
@@ -891,7 +1026,10 @@ def kl_core_update_largedim(
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]  # each (b, Rn)
         r_hat = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon)  # (b,)
         w_all[start:end] = xvals[start:end] / r_hat
+
+
     # --- Pass 2: accumulate numerator in tiny batches (controls peak memory)
+    # this takes most time!
     for start in range(0, nnz, int(batch_num)):
         end = min(start + int(batch_num), nnz)
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]
@@ -980,7 +1118,7 @@ def fr_factor_update_largedim(
     shape,
     epsilon=1e-12,
     thread_budget=None, # kept for API compatibility; unused
-    batch_cols=20000,
+    batch_cols=None,
 ):
     """
     Frobenius (Euclidean) multiplicative update for Tucker factor A^(mode)
@@ -993,10 +1131,24 @@ def fr_factor_update_largedim(
     where X is the sparse unfolding and Z = transpose(unfold(tucker_to_tensor(skip_factor=mode), mode)).
     """
     # Sparse unfolding X_(mode)
-    X = unfold_from_vectorized_sparse(vec_tensor, shape, mode).tocoo()
-    rows = X.row
-    cols = X.col
-    vals = X.data
+    # X = unfold_from_vectorized_sparse(vec_tensor, shape, mode).tocoo()
+    # rows = X.row
+    # cols = X.col
+    # vals = X.data
+    if batch_cols is None:
+        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode)
+    # new: avoid X buildup for large dimensions
+    flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
+    idxs = _unravel_flat_indices_C(flat, shape)
+
+    rows = idxs[mode]
+
+    other_modes = [m for m in range(len(shape)) if m != mode]
+    other_coords = [idxs[m] for m in other_modes]
+
+    # build a safe unfolded-column id in int64 only for grouping
+    other_shape = tuple(shape[m] for m in other_modes)
+    cols = safe_ravel(tuple(other_coords), other_shape, cp)
 
     A = factors[mode]  # (I_mode, R_mode)
 
@@ -1018,7 +1170,7 @@ def fr_factor_update_largedim(
         _, idxs_by_mode = _unravel_cols_for_mode(u, shape, mode)
 
         # Z_u: (m, R_mode)  where row t is Z[column=u[t], :]
-        Z_u = _compute_Zcols_batch(
+        Z_u = compute_Zcols_batch(
             core=core,
             factors=factors,
             mode=mode,

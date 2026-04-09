@@ -8,6 +8,5 @@ if __name__ == "__main__":
     cfg = parse_run_config()
     print(cfg)
     print("run_id:", cfg.run_id())
-    print("artifacts:", cfg.artifact_paths())
-    print(cfg.exp.dataset)
+    # print("artifacts:", cfg.artifact_paths())
     tucker = launch_nnt_decomposition(cfg)

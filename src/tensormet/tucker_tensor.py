@@ -23,6 +23,12 @@ from tensormet.utils import (DATA_DIR,
                             tree_to_device,
                             notify_discord,
                             ThreadBudget,
+                            shared_factor_suffix,
+                            nontrivial_linked_groups,
+                            linked_factor_groups,
+                            voc_index,
+                            extract_roles_from_vocab,
+                            einsum_letters
                    )
 from tensormet.sparse_ops import initialize_nonnegative_tucker
 from tensormet.similarity import evaluate_sample, get_eval_num_threads
@@ -36,25 +42,38 @@ def _to_np(x):
         return x.detach().cpu().numpy()
     return x
 
-def _role_index(role: str) -> int:
-    if role == "verb":
-        return 0
-    elif role == "subject":
-        return 1
-    elif role == "object":
-        return 2
-    else:
-        raise ValueError("role must be one of {'verb','subject','object'}")
+# Old role index when all we had was VSO
+# def _role_index(role: str) -> int:
+#     if role == "verb":
+#         return 0
+#     elif role == "subject":
+#         return 1
+#     elif role == "object":
+#         return 2
+#     else:
+#         raise ValueError("role must be one of {'verb','subject','object'}")
+#
+# def voc_index(role: str) -> str:
+#     if role == "verb":
+#         return "v2i"
+#     elif role == "subject":
+#         return "s2i"
+#     elif role == "object":
+#         return "o2i"
+#     else:
+#         raise ValueError("role must be one of {'verb','subject','object'}")
 
-def _voc_index(role: str) -> str:
-    if role == "verb":
-        return "v2i"
-    elif role == "subject":
-        return "s2i"
-    elif role == "object":
-        return "o2i"
-    else:
-        raise ValueError("role must be one of {'verb','subject','object'}")
+def _role_index(role: str, role_names: list[str]) -> int:
+    try:
+        return role_names.index(role)
+    except ValueError as e:
+        raise ValueError(f"role must be one of {set(role_names)}") from e
+
+
+def _voc_list_key(role: str) -> str:
+    return f"vocab_{role}"
+
+
 
 def np_sim(a: np.ndarray, b: np.ndarray) -> float:
     """Computes cosine similarity between two numpy vectors."""
@@ -65,11 +84,22 @@ class TuckerDecomposition:
     """Encapsulating the tucker decomposition (core and factors) and the vocabulary,
     providing methods for scoring, slicing, visualisation, etc."""
     def __init__(self, core, factors: List[torch.Tensor],
-                 vocab: dict, shared_factors: set | None = None):
+                 vocab: dict, shared_factors: set | None = None,
+                 roles: Optional[List[str]] = None,
+                 ):
         self.core = core
         self.factors = factors
         self.vocab = vocab
         self.shared_factors = shared_factors or set()
+        # If roles aren't provided explicitly, parse them from the vocab keys
+        self.roles = extract_roles_from_vocab(self.vocab)
+
+    def get_role_index(self, role: str) -> int:
+        """Helper method to wrap the module-level _role_index using instance roles."""
+        return _role_index(role, self.roles)
+    
+    def _core_np(self):
+        return _to_np(self.core)
 
     # --- Construction and loading ---
     @classmethod
@@ -79,6 +109,7 @@ class TuckerDecomposition:
                        divergence: str="kl",
                        dims: int=4000,
                        rank: int=100,
+                       order: int=3,
                        iterations: int|None=None,
                        factor_sharing: bool|set=False,
                        map_location: str="cpu",
@@ -108,14 +139,11 @@ class TuckerDecomposition:
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
 
-        suffix = ""
-
         parsed_shared = None
         suffix = ""
 
         if factor_sharing is True:
             parsed_shared = {(1, 2)}
-            suffix = "_shared12"
         elif isinstance(factor_sharing, set) and factor_sharing:
             for item in factor_sharing:
                 if not (isinstance(item, tuple) and len(item) == 2):
@@ -123,9 +151,23 @@ class TuckerDecomposition:
                         f"factor_sharing must be a set of 2-tuples, got item {item!r}"
                     )
             parsed_shared = factor_sharing
-            suffix = "_shared" + "_".join(f"{a}{b}" for a, b in sorted(parsed_shared))
 
-        vocab_path = os.path.join(base, f"vocabularies/{dims}{suffix}.pkl")
+        if parsed_shared:
+            linked_nontrivial = nontrivial_linked_groups(parsed_shared, num_factors=3)
+            suffix = shared_factor_suffix(linked_nontrivial)
+
+        # Handle the new {order}D_ naming format vs legacy naming
+        vocab_path_new = os.path.join(base, f"vocabularies/{order}D_{dims}{suffix}.pkl")
+        vocab_path_old = os.path.join(base, f"vocabularies/{dims}{suffix}.pkl")
+
+        if os.path.exists(vocab_path_new):
+            vocab_path = vocab_path_new
+        elif os.path.exists(vocab_path_old):
+            vocab_path = vocab_path_old
+        else:
+            raise FileNotFoundError(f"Missing vocab file. Checked {vocab_path_new} and {vocab_path_old}")
+
+
         decomp_path = os.path.join(base, "decomposition")
         # Construct the prefix of the tensor file name
         name_prefix = f"{name + '_' if name else ''}"
@@ -151,16 +193,30 @@ class TuckerDecomposition:
 
         tensor_name = f"{file_prefix}{iterations}i.pt"
         decomp_path = os.path.join(decomp_path, tensor_name)
-        if not os.path.exists(vocab_path):
-            raise FileNotFoundError(f"Missing vocab file: {vocab_path}")
+
         if not os.path.exists(decomp_path):
             raise FileNotFoundError(f"Missing decomposition file: {decomp_path}")
-        # the vocab is here under f"vocabularies_[dims].pkl"
-        # Load with torch (they were saved with torch.save)
+
+        # --- 1. Load Vocab ---
         with open(vocab_path, "rb") as f:
             vocab = pickle.load(f)
-        (core, factors) = torch_or_pickle_load(decomp_path, map_location=map_location)
 
+        # --- 2. Extract Roles ---
+        roles = [k[len("vocab_"):] for k in vocab.keys() if k.startswith("vocab_")]
+
+        # --- 3. Backward Compatibility for Legacy Tensors ---
+        if roles == ["v", "s", "o"]:
+            roles = ["verb", "subject", "object"]
+            legacy_map = {"v": "verb", "s": "subject", "o": "object"}
+            new_vocab = {}
+            for old_r, new_r in legacy_map.items():
+                new_vocab[f"vocab_{new_r}"] = vocab.pop(f"vocab_{old_r}")
+                new_vocab[f"{new_r}2i"] = vocab.pop(f"{old_r}2i")
+            new_vocab.update(vocab)  # keep any remaining keys
+            vocab = new_vocab
+
+        # --- 4. Load Factors & Return ---
+        (core, factors) = torch_or_pickle_load(decomp_path, map_location=map_location)
         # if there is a "runs.jsonl" file in the decomposition folder, we print the content relevant to the loaded tensor
         runs_path = os.path.join(decomp_path, "runs.jsonl")
         if os.path.exists(runs_path):
@@ -177,40 +233,52 @@ class TuckerDecomposition:
         else:
             print("Warning: file creation predates logging of runs; no run info available.")
 
-        return cls(core, factors, vocab, shared_factors=parsed_shared)
+        return cls(core, factors, vocab, shared_factors=parsed_shared, roles=roles)
 
 
 
-
-    def check_vocab(self, triple: Tuple[str, str, str], return_type=bool) -> bool|tuple:
+    def check_vocab(self, triple: Tuple[str, ...], return_type=bool) -> bool|tuple:
         """Checks if the given (verb, subject, object) triple is in the vocabulary."""
-        v_in = triple[0] in self.vocab["v2i"]
-        s_in = triple[1] in self.vocab["s2i"]
-        o_in = triple[2] in self.vocab["o2i"]
+
+        in_roles = [triple[i] in self.vocab[voc_index(self.roles[i])] for i in range(len(self.roles))]
         if return_type == tuple:
-            return (v_in, s_in, o_in)
-        return v_in and s_in and o_in
+            return tuple(in_roles)
+        return all(in_roles)
+
+        # v_in = triple[0] in self.vocab["v2i"]
+        # s_in = triple[1] in self.vocab["s2i"]
+        # o_in = triple[2] in self.vocab["o2i"]
+        # if return_type == tuple:
+        #     return (v_in, s_in, o_in)
+        # return v_in and s_in and o_in
 
 
-    def fetch_latents(self, triple: Tuple[str, str, str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Fetches the latent representations for a given (verb, subject, object) triple."""
-        v_idx = self.vocab["v2i"][triple[0]]
-        s_idx = self.vocab["s2i"][triple[1]]
-        o_idx = self.vocab["o2i"][triple[2]]
-        V, S, O = [ _to_np(F) for F in self.factors]     # shapes (DIMS,R)
-        v = V[v_idx]                                     # (R,)
-        s = S[s_idx]                                     # (R,)
-        o = O[o_idx]                                     # (R,)
-        return v, s, o
+    # def fetch_latents(self, triple: Tuple[str, str, str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    #     """Fetches the latent representations for a given (verb, subject, object) triple."""
+    #     v_idx = self.vocab["v2i"][triple[0]]
+    #     s_idx = self.vocab["s2i"][triple[1]]
+    #     o_idx = self.vocab["o2i"][triple[2]]
+    #     V, S, O = [ _to_np(F) for F in self.factors]     # shapes (DIMS,R)
+    #     v = V[v_idx]                                     # (R,)
+    #     s = S[s_idx]                                     # (R,)
+    #     o = O[o_idx]                                     # (R,)
+    #     return v, s, o
+
+    def fetch_latents(self, triple: Tuple[str, ...]) -> Tuple[np.ndarray, ...]:
+        """Fetches the latent representations for a given tuple of elements."""
+        # Map fetch_single_latent across all elements and their corresponding roles
+        return tuple(
+            self.fetch_single_latent(triple[i], self.roles[i])
+            for i in range(len(self.roles))
+        )
 
     def fetch_single_latent(self, element, role) -> np.ndarray:
         """Fetches the latent representation for an element."""
-        el_idx = self.vocab[_voc_index(role)][element]
-        factor_slice = self.factors[_role_index(role)][el_idx]
+        el_idx = self.vocab[voc_index(role)][element]
+        factor_slice = self.factors[self.get_role_index(role)][el_idx]
         return _to_np(factor_slice)
 
-    def _core_np(self):
-        return _to_np(self.core)
+
 
     # -- Sparsity methods ---
     def sparse_representation(self):
@@ -253,129 +321,231 @@ class TuckerDecomposition:
 
     # -- Scoring and slicing methods ---
 
-    def score_scalar(self, triple: Tuple[str, str, str]) -> float:
-        """(1) Scalar reconstruction score ⟨G, a∘b∘c⟩."""
-        G = self._core_np()                                 # (R,R,R)
-        v, s, o = self.fetch_latents(triple)
-        return np.einsum('pqr,p,q,r->', G, v, s, o)
+    # def score_scalar_old(self, triple: Tuple[str, str, str]) -> float:
+    #     """(1) Scalar reconstruction score ⟨G, a∘b∘c⟩."""
+    #     G = self._core_np()                                 # (R,R,R)
+    #     v, s, o = self.fetch_latents(triple)
+    #     return np.einsum('pqr,p,q,r->', G, v, s, o)
 
-    def contribution_tensor(self, triple: Tuple[str, str, str]) -> np.ndarray:
-        """(2) Contribution tensor: G * (a∘b∘c) ∈ R^{R×R×R}."""
-        G = self._core_np()                                 # (R,R,R)
-        v, s, o = self.fetch_latents(triple)
-        # same as doing np.einsum(p, q, r ->pqr) and then multiplying by G
-        return np.einsum('p,q,r,pqr->pqr', v, s, o, G)
+    def score_scalar(self, triple: Tuple[str, ...]) -> float:
+        """(1) Scalar reconstruction score ⟨G, a∘b∘c...⟩."""
+        G = self._core_np()
+        latents = self.fetch_latents(triple)
+        modes = einsum_letters(len(self.roles))
 
-    def outer_product_latent(self, triple: Tuple[str, str, str]) -> np.ndarray:
-        """(3) Pseudo-inverse / HOSVD case: a∘b∘c (rank-1 core-space tensor)."""
-        v, s, o = self.fetch_latents(triple)
-        return np.einsum('p,q,r->pqr', v, s, o)
+        eq = f"{''.join(modes)},{','.join(modes)}->"
+        return np.einsum(eq, G, *latents)
 
-    def excluded_role_vector(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
+    # def contribution_tensor_old(self, triple: Tuple[str, str, str]) -> np.ndarray:
+    #     """(2) Contribution tensor: G * (a∘b∘c) ∈ R^{R×R×R}."""
+    #     G = self._core_np()                                 # (R,R,R)
+    #     v, s, o = self.fetch_latents(triple)
+    #     # same as doing np.einsum(p, q, r ->pqr) and then multiplying by G
+    #     return np.einsum('p,q,r,pqr->pqr', v, s, o, G)
+
+    def contribution_tensor(self, triple: Tuple[str, ...]) -> np.ndarray:
+        """(2) Contribution tensor: G * (a∘b∘c...)"""
+        G = self._core_np()
+        latents = self.fetch_latents(triple)
+        modes = einsum_letters(len(self.roles))
+        core_str = "".join(modes)
+
+        eq = f"{','.join(modes)},{core_str}->{core_str}"
+        return np.einsum(eq, *latents, G)
+
+    # def outer_product_latent_old(self, triple: Tuple[str, str, str]) -> np.ndarray:
+    #     """(3) Pseudo-inverse / HOSVD case: a∘b∘c (rank-1 core-space tensor)."""
+    #     v, s, o = self.fetch_latents(triple)
+    #     return np.einsum('p,q,r->pqr', v, s, o)
+
+    def outer_product_latent(self, triple: Tuple[str, ...]) -> np.ndarray:
+        """(3) Pseudo-inverse / HOSVD case: a∘b∘c... (rank-1 core-space tensor)."""
+        latents = self.fetch_latents(triple)
+        modes = einsum_letters(len(self.roles))
+
+        eq = f"{','.join(modes)}->{''.join(modes)}"
+        return np.einsum(eq, *latents)
+
+    # def excluded_role_vector_old(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
+    #     """
+    #     Fetches the latent vector for a given excluded role in the triple.
+    #     Can be understood as a "prediction":
+    #         Given the two other attested elements,what are the activations in the third element's dimensions?
+    #     """
+    #     v, s, o = self.fetch_latents(triple)
+    #     if role == "verb":
+    #         return np.einsum('pqr,q,r->p', self._core_np(), s, o)
+    #     elif role == "subject":
+    #         return np.einsum('pqr,p,r->q', self._core_np(), v, o)
+    #     elif role == "object":
+    #         return np.einsum('pqr,p,q->r', self._core_np(), v, s)
+    #     else:
+    #         raise ValueError("role must be one of {'verb','subject','object'}")
+
+    def excluded_role_vector(self, triple: Tuple[str, ...], role: str) -> np.ndarray:
         """
-        Fetches the latent vector for a given excluded role in the triple.
+        Fetches the latent vector for a given excluded role in the tuple.
         Can be understood as a "prediction":
-            Given the two other attested elements,what are the activations in the third element's dimensions?
+            Given the other attested elements, what are the activations in the target element's dimensions?
         """
-        v, s, o = self.fetch_latents(triple)
-        if role == "verb":
-            return np.einsum('pqr,q,r->p', self._core_np(), s, o)
-        elif role == "subject":
-            return np.einsum('pqr,p,r->q', self._core_np(), v, o)
-        elif role == "object":
-            return np.einsum('pqr,p,q->r', self._core_np(), v, s)
-        else:
-            raise ValueError("role must be one of {'verb','subject','object'}")
+        target_idx = self.get_role_index(role)
+        all_latents = self.fetch_latents(triple)
+        latents = [all_latents[i] for i in range(len(self.roles)) if i != target_idx]
 
-    def included_role_vector(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
+        modes = einsum_letters(len(self.roles))
+        core_str = "".join(modes)
+        vec_strs = [modes[i] for i in range(len(self.roles)) if i != target_idx]
+        out_str = modes[target_idx]
+
+        eq = f"{core_str},{','.join(vec_strs)}->{out_str}"
+        return np.einsum(eq, self._core_np(), *latents)
+
+    # def included_role_vector_old(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
+    #     """
+    #     Fetches the latent vector for a given included role in the triple.
+    #     Can be understood as quantifying "contribution":
+    #         How important are the dimensions of X in the final contextualised representation of XYZ?
+    #     """
+    #     v, s, o = self.fetch_latents(triple)
+    #     if role == "verb":
+    #         return np.einsum('pqr,p,q,r->p', self._core_np(), v, s, o)
+    #     elif role == "subject":
+    #         return np.einsum('pqr,p,q,r->q', self._core_np(), v, s, o)
+    #     elif role == "object":
+    #         return np.einsum('pqr,p,q,r->r', self._core_np(), v, s, o)
+    #     else:
+    #         raise ValueError("role must be one of {'verb','subject','object'}")
+
+    def included_role_vector(self, triple: Tuple[str, ...], role: str) -> np.ndarray:
         """
-        Fetches the latent vector for a given included role in the triple.
+        Fetches the latent vector for a given included role in the tuple.
         Can be understood as quantifying "contribution":
-            How important are the dimensions of X in the final contextualised representation of XYZ?
+            How important are the dimensions of X in the final contextualised representation?
         """
-        v, s, o = self.fetch_latents(triple)
-        if role == "verb":
-            return np.einsum('pqr,p,q,r->p', self._core_np(), v, s, o)
-        elif role == "subject":
-            return np.einsum('pqr,p,q,r->q', self._core_np(), v, s, o)
-        elif role == "object":
-            return np.einsum('pqr,p,q,r->r', self._core_np(), v, s, o)
-        else:
-            raise ValueError("role must be one of {'verb','subject','object'}")
+        target_idx = self.get_role_index(role)
+        latents = self.fetch_latents(triple)
 
-    def predicted_role_vector(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
-        """
-        Fetches the latent vector for a given excluded role in the triple, WITHOUT instantiating the element (OOV).
-        Can be understood as a "prediction":
-            Given the two other attested elements,what should be the activations in the third element's dimensions?
-        """
-        latents = {"verb":None, "subject":None, "object":None}
-        for i, element in enumerate(latents.keys()):
-            if not element == role:
-                latents[element] = self.fetch_single_latent(triple[i], element)
-        v = latents["verb"]
-        s = latents["subject"]
-        o = latents["object"]
+        modes = einsum_letters(len(self.roles))
+        core_str = "".join(modes)
+        out_str = modes[target_idx]
 
-        if role == "verb":
-            return np.einsum('pqr,q,r->p', self._core_np(), s, o)
-        elif role == "subject":
-            return np.einsum('pqr,p,r->q', self._core_np(), v, o)
+        eq = f"{core_str},{','.join(modes)}->{out_str}"
+        return np.einsum(eq, self._core_np(), *latents)
 
-        elif role == "object":
-            return np.einsum('pqr,p,q->r', self._core_np(), v, s)
-        else:
-            raise ValueError("role must be one of {'verb','subject','object'}")
+
+    # def predicted_role_vector_old(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
+    #     """
+    #     Fetches the latent vector for a given excluded role in the triple, WITHOUT instantiating the element (OOV).
+    #     Can be understood as a "prediction":
+    #         Given the two other attested elements,what should be the activations in the third element's dimensions?
+    #     """
+    #     latents = {"verb":None, "subject":None, "object":None}
+    #
+    #     v = latents["verb"]
+    #     s = latents["subject"]
+    #     o = latents["object"]
+    #
+    #     if role == "verb":
+    #         return np.einsum('pqr,q,r->p', self._core_np(), s, o)
+    #     elif role == "subject":
+    #         return np.einsum('pqr,p,r->q', self._core_np(), v, o)
+    #
+    #     elif role == "object":
+    #         return np.einsum('pqr,p,q->r', self._core_np(), v, s)
+    #     else:
+    #         raise ValueError("role must be one of {'verb','subject','object'}")
 
     # Slicing
 
-    def get_role_slice(self, role: str, normalize: bool=False) -> np.ndarray:
+    # def get_role_slice(self, role: str, normalize: bool=False) -> np.ndarray:
+    #     G = self._core_np()
+    #
+    #     if role == "verb":
+    #         # (num_verbs, R) × (R, R, R) -> (num_verbs, R, R)
+    #         slc = np.einsum('ip,pqr->i q r', _to_np(self.factors[0]), G)
+    #     elif role == "subject":
+    #         # (num_subj, R) × (R, R, R) -> (num_subj, R, R)
+    #         slc = np.einsum('jp,pqr->j p r', _to_np(self.factors[1]), G)
+    #     elif role == "object":
+    #         # (num_obj, R) × (R, R, R) -> (num_obj, R, R)
+    #         slc = np.einsum('kp,pqr->k p q', _to_np(self.factors[2]), G)
+    #
+    #     else:
+    #         raise ValueError("role must be one of {'verb','subject','object'}")
+    #     if normalize:
+    #         slc = slc / np.linalg.norm(slc, axis=-1, keepdims=True)
+    #     return slc
+    #
+    # def role_slice_from_tuple(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
+    #     G = self._core_np()
+    #     v, s, o = self.fetch_latents(triple)
+    #     if role == "verb":
+    #         slc = np.einsum('pqr,q,r->qr', G, s, o)
+    #     elif role == "subject":
+    #         slc = np.einsum('pqr,p,r->pr', G, v, o)
+    #     elif role == "object":
+    #         slc = np.einsum('pqr,p,q->pq', G, v, s)
+    #     else:
+    #         raise ValueError("role must be one of {'verb','subject','object'}")
+    #     return slc
+    #
+    # def get_weighted_role_slice_from_tuple(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
+    #     G = self._core_np()
+    #     v, s, o = self.fetch_latents(triple)
+    #     if role == "verb":
+    #         slc = np.einsum('pqr,p,q,r->qr', G, v, s, o)
+    #     elif role == "subject":
+    #         slc = np.einsum('pqr,p,q,r->pr', G, v, s, o)
+    #     elif role == "object":
+    #         slc = np.einsum('pqr,p,q,r->pq', G, v, s, o)
+    #     else:
+    #         raise ValueError("role must be one of {'verb','subject','object'}")
+    #     return slc
+
+    def get_role_slice(self, role: str, normalize: bool = False) -> np.ndarray:
+        target_idx = self.get_role_index(role)
         G = self._core_np()
+        factor = _to_np(self.factors[target_idx])
 
-        if role == "verb":
-            # (num_verbs, R) × (R, R, R) -> (num_verbs, R, R)
-            slc = np.einsum('ip,pqr->i q r', _to_np(self.factors[0]), G)
-        elif role == "subject":
-            # (num_subj, R) × (R, R, R) -> (num_subj, R, R)
-            slc = np.einsum('jp,pqr->j p r', _to_np(self.factors[1]), G)
-        elif role == "object":
-            # (num_obj, R) × (R, R, R) -> (num_obj, R, R)
-            slc = np.einsum('kp,pqr->k p q', _to_np(self.factors[2]), G)
+        modes = einsum_letters(len(self.roles))
+        core_str = "".join(modes)
+        other_modes = "".join([modes[i] for i in range(len(self.roles)) if i != target_idx])
+        v_char = "Z"  # Using 'Z' for the vocab dimension to safely avoid collisions
 
-        else:
-            raise ValueError("role must be one of {'verb','subject','object'}")
+        eq = f"{v_char}{modes[target_idx]},{core_str}->{v_char}{other_modes}"
+        slc = np.einsum(eq, factor, G)
+
         if normalize:
             slc = slc / np.linalg.norm(slc, axis=-1, keepdims=True)
         return slc
 
-    def role_slice_from_tuple(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
+    def role_slice_from_tuple(self, triple: Tuple[str, ...], role: str) -> np.ndarray:
+        target_idx = self.get_role_index(role)
         G = self._core_np()
-        v, s, o = self.fetch_latents(triple)
-        if role == "verb":
-            slc = np.einsum('pqr,q,r->qr', G, s, o)
-        elif role == "subject":
-            slc = np.einsum('pqr,p,r->pr', G, v, o)
-        elif role == "object":
-            slc = np.einsum('pqr,p,q->pq', G, v, s)
-        else:
-            raise ValueError("role must be one of {'verb','subject','object'}")
-        return slc
+        all_latents = self.fetch_latents(triple)
+        latents = [all_latents[i] for i in range(len(self.roles)) if i != target_idx]
 
-    def get_weighted_role_slice_from_tuple(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
+        modes = einsum_letters(len(self.roles))
+        core_str = "".join(modes)
+        other_modes = [modes[i] for i in range(len(self.roles)) if i != target_idx]
+
+        eq = f"{core_str},{','.join(other_modes)}->{''.join(other_modes)}"
+        return np.einsum(eq, G, *latents)
+
+    def get_weighted_role_slice_from_tuple(self, triple: Tuple[str, ...], role: str) -> np.ndarray:
+        target_idx = self.get_role_index(role)
         G = self._core_np()
-        v, s, o = self.fetch_latents(triple)
-        if role == "verb":
-            slc = np.einsum('pqr,p,q,r->qr', G, v, s, o)
-        elif role == "subject":
-            slc = np.einsum('pqr,p,q,r->pr', G, v, s, o)
-        elif role == "object":
-            slc = np.einsum('pqr,p,q,r->pq', G, v, s, o)
-        else:
-            raise ValueError("role must be one of {'verb','subject','object'}")
-        return slc
+        latents = self.fetch_latents(triple)
+
+        modes = einsum_letters(len(self.roles))
+        core_str = "".join(modes)
+        other_modes = "".join([modes[i] for i in range(len(self.roles)) if i != target_idx])
+
+        eq = f"{core_str},{','.join(modes)}->{other_modes}"
+        return np.einsum(eq, G, *latents)
 
     # we create a wrapper that routes to any of the slicing methods
-    def get_slice(self, triple: Tuple[str, str, str], role: str, method: str="slice") -> np.ndarray:
+    def get_slice(self, triple: Tuple[str, ...], role: str, method: str="slice") -> np.ndarray:
         if method == "slice":
             return self.get_role_slice(role=role)
         elif method == "weighted_tuple":
@@ -389,20 +559,21 @@ class TuckerDecomposition:
 
     # -- Visualisation and inspection methods ---
     def visualize_slice(self,
-                        triple: Tuple[str, str, str],
+                        triple: Tuple[str, ...],
                         role: str,
-                        normalize: bool=False,
-                        method: str="slice"):
+                        normalize: bool = False,
+                        method: str = "slice"):
 
-
-        target_word = triple[{"verb":0, "subject":1, "object":2}[role]]
+        target_word = triple[self.get_role_index(role)]
         slc = self.get_slice(triple=triple, role=role, method=method)
+
         if method == "slice":
-            word_id = self.vocab[f"{role[0]}2i"][target_word]
+            word_id = self.vocab[voc_index(role)][target_word]
             slc = slc[word_id]
 
         if normalize:
             slc = slc / np.linalg.norm(slc)
+
         plt.figure(figsize=(10, 8))
         im = plt.imshow(slc, cmap="Greys", aspect="auto")
         plt.colorbar(im)
@@ -416,14 +587,15 @@ class TuckerDecomposition:
 
     # top activations utility
     def retrieve_highest_activations(self,
-                                     triple: Tuple[str, str, str],
+                                     triple: Tuple[str, ...],
                                      role: str,
-                                     method: str="slice",
-                                     top_k: int=10):
-        target_word = triple[_role_index(role)]
+                                     method: str = "slice",
+                                     top_k: int = 10):
+        target_word = triple[self.get_role_index(role)]
         slc = self.get_slice(triple=triple, role=role, method=method)
+
         if method == "slice":
-            word_id = self.vocab[f"{role[0]}2i"][target_word]
+            word_id = self.vocab[voc_index(role)][target_word]
             slc = slc[word_id]
 
         # we retrieve the "coordinates" of the top-k highest activations
@@ -442,12 +614,12 @@ class TuckerDecomposition:
         For a given latent dimension of a role, return the top-k words with
         highest loading on that dimension.
         """
-        factor_idx = _role_index(role)
-        role_factors = self.factors[factor_idx]      # (N, R)
+        factor_idx = self.get_role_index(role)
+        role_factors = self.factors[factor_idx]  # (N, R)
         dim_values = _to_np(role_factors)[:, dim_index]
 
         scores, indices = torch.topk(torch.tensor(dim_values), top_k)
-        vocab_list = self.vocab[f"vocab_{role[0]}"]
+        vocab_list = self.vocab[_voc_list_key(role)]
 
         top_words = [
             (vocab_list[idx.item()], score.item())
@@ -456,10 +628,9 @@ class TuckerDecomposition:
         return top_words
 
     def get_top_dimensions_for_word(self,
-                                    word:str,
+                                    word: str,
                                     role: str,
-                                    top_k: int = 10
-                                    ):
+                                    top_k: int = 10):
         latent = self.fetch_single_latent(word, role)
         latent = torch.tensor(latent)
         scores, dims = torch.topk(latent, top_k)
@@ -468,24 +639,35 @@ class TuckerDecomposition:
         ]
         return top_scores
 
-    # todo: no safeguard against division by 0
-
-    def get_expected_element(self, target_tuple, role, verbose=True):
-        index = _role_index(role)
-        r2i = _voc_index(role)
+    def get_expected_element(self, target_tuple: Tuple[str, ...], role: str, verbose: bool = True):
+        index = self.get_role_index(role)
+        r2i = voc_index(role)
         latents = self.fetch_latents(target_tuple)
         G_item = self.excluded_role_vector(target_tuple, role=role)
-        factor = self.factors[index].cpu().numpy() if hasattr(self.factors[0], "cpu") else self.factors[index]
-        similarities = factor @ G_item / (np.linalg.norm(factor, axis=1) * np.linalg.norm(G_item))
-        # we get the top 5 most similar verbs
+
+        # Safely get the numpy array
+        factor = self.factors[index].cpu().numpy() if hasattr(self.factors[index], "cpu") else self.factors[index]
+
+        # Safely calculate norms to prevent division by 0
+        eps = 1e-12
+        factor_norm = np.linalg.norm(factor, axis=1)
+        G_item_norm = np.linalg.norm(G_item)
+
+        factor_norm = np.maximum(factor_norm, eps)
+        G_item_norm = max(G_item_norm, eps)
+
+        similarities = (factor @ G_item) / (factor_norm * G_item_norm)
+
+        # we get the top k most similar elements
         k = 5
         top_k_indices = np.argsort(similarities)[-k:][::-1]
 
         results = []
         for idx in top_k_indices:
-            role_str = next(k for k, v in self.vocab[r2i].items() if v == idx)
+            role_str = next(key for key, v in self.vocab[r2i].items() if v == idx)
 
-            role_act = self.factors[index][idx, :].cpu().numpy() if hasattr(self.factors[0], "cpu") else self.factors[index][idx, :]
+            role_act = self.factors[index][idx, :].cpu().numpy() if hasattr(self.factors[index], "cpu") else \
+            self.factors[index][idx, :]
             cos_sim = np_sim(role_act, latents[index])
 
             results.append({"token": role_str,
@@ -495,13 +677,15 @@ class TuckerDecomposition:
         if verbose:
             print(f"Top {k} most similar {role}s to the integrated core tensor:")
             for r in results:
-                print(f"Subject: {r['token']}, "
-                      f"Similarity: {r['similarity']}, "
-                      f"Cosine sim with target {role} activations: {r['activation_cosine']}"
-                )
+                # Fixed the hardcoded "Subject:" bug here!
+                print(f"{role.capitalize()}: {r['token']}, "
+                      f"Similarity: {r['similarity']:.4f}, "
+                      f"Cosine sim with target {role} activations: {r['activation_cosine']:.4f}"
+                      )
             return None
 
         return results
+
 
     def get_most_similar_elements(self,
                                   element,
@@ -531,7 +715,7 @@ class TuckerDecomposition:
         else:
             raise ValueError("Must be tuple or str")
 
-        i = _role_index(role)
+        i = self.get_role_index(role)
         F = self.factors[i].cpu().numpy() if hasattr(self.factors[0], "cpu") else self.factors[i]
 
 
@@ -546,7 +730,7 @@ class TuckerDecomposition:
         # --- safe cosine similarities ---
         similarities = (F @ latent) / (F_norm * G_norm)
         top_idx = np.argsort(-similarities)[:top_k]
-        r2i = _voc_index(role)
+        r2i = voc_index(role)
 
         top_sims = []
         for idx in top_idx:
@@ -555,51 +739,81 @@ class TuckerDecomposition:
 
         return top_sims
 
+    def batch_excluded_role_vector(self,
+                                   valid_indices: torch.Tensor,
+                                   role_name: str) -> torch.Tensor:
+        """Uses GPU-accelerated einsum for batch contraction."""
+        target_idx = self.get_role_index(role_name)
+        n_roles = len(self.roles)
+        device = self.factors[0].device
+
+        # 1. Gather latents directly on GPU
+        latents = []
+        for i in range(n_roles):
+            if i == target_idx: continue
+            # Slicing a torch tensor on GPU is nearly instantaneous
+            latents.append(self.factors[i][valid_indices[:, i]])
+
+        # 2. Setup Einstein Summation
+        modes = einsum_letters(n_roles)
+        core_str = "".join(modes)
+        input_strs = [f"n{modes[i]}" for i in range(n_roles) if i != target_idx]
+        eq = f"{core_str},{','.join(input_strs)}->n{modes[target_idx]}"
+
+        # 3. Compute on GPU
+        # Ensure core is on the same device as factors
+        core = self.core.to(device) if hasattr(self.core, 'to') else torch.tensor(self.core, device=device)
+        return torch.einsum(eq, core, *latents)
+
 
 class ExtendedTucker(TuckerDecomposition):
-    def __init__(self, core, factors: List[torch.Tensor],
-                 vocab: dict, shared_factors: set | None = None):
-        super().__init__(core, factors, vocab, shared_factors=shared_factors)
+    def __init__(
+        self,
+        core,
+        factors: List[torch.Tensor],
+        vocab: dict,
+        shared_factors: set | None = None,
+        roles: Optional[List[str]] = None,
+    ):
+        super().__init__(core, factors, vocab, shared_factors=shared_factors, roles=roles)
+
         self.is_extended: bool = False
         self.extended_roles: set[str] = set()
 
         self.extended_tokens: dict[str, set[str]] = {
-            "verb": set(),
-            "subject": set(),
-            "object": set()
+            role: set() for role in self.roles
         }
 
         self.extensions: dict[str, dict[str, np.ndarray]] = {
-            "verb": {},
-            "subject": {},
-            "object": {}
+            role: {} for role in self.roles
         }
 
         self.extension_counts: dict[str, dict[str, int]] = {
-            "verb": {},
-            "subject": {},
-            "object": {}
+            role: {} for role in self.roles
         }
 
         self.extension_lengths: dict[str, int] = {
-            "verb": 0,
-            "subject": 0,
-            "object": 0
+            role: 0 for role in self.roles
         }
 
     @classmethod
     def from_tucker(cls, t: TuckerDecomposition) -> "ExtendedTucker":
         """
         Create an ExtendedTucker that shares core/factors/vocab references with `t`.
-        (No copying; changes to dense tensors in-place will reflect in both.)
         """
-        return cls(t.core, t.factors, t.vocab, shared_factors=t.shared_factors)
+        return cls(
+            t.core,
+            t.factors,
+            t.vocab,
+            shared_factors=t.shared_factors,
+            roles=t.roles,
+        )
 
     @classmethod
     def extend_tucker(
         cls,
         t: TuckerDecomposition,
-        dataset,  # iterable of triples (verb, subject, object)
+        dataset,  # iterable of tuples
         roles: List[str],
         normalize: bool = True,
         normalize_mode: Literal["l2", "minmax"] = "l2",
@@ -610,13 +824,6 @@ class ExtendedTucker(TuckerDecomposition):
         min_count: int | None = None,
         top_k: int | None = None,
     ) -> "ExtendedTucker":
-        """
-        Build an ExtendedTucker from `t` and extend specified roles in-place on the new object.
-
-        Example:
-            extended = ExtendedTucker.extend_tucker(tucker, sample, ["verb","object"], min_count=5)
-        """
-
         ext = cls.from_tucker(t)
         for role in roles:
             ext.extend_role(
@@ -633,22 +840,45 @@ class ExtendedTucker(TuckerDecomposition):
             )
         return ext
 
-    # -- Override vocab-based extensions --
-    def check_vocab(self, triple: Tuple[str, str, str]) -> bool:
-        """True if each element is either in base vocab OR in extensions for that role."""
-        v_ok = (triple[0] in self.vocab["v2i"]) or (triple[0] in self.extensions["verb"])
-        s_ok = (triple[1] in self.vocab["s2i"]) or (triple[1] in self.extensions["subject"])
-        o_ok = (triple[2] in self.vocab["o2i"]) or (triple[2] in self.extensions["object"])
-        return v_ok and s_ok and o_ok
+    def _validate_role(self, role: str) -> None:
+        if role not in self.roles:
+            raise ValueError(f"role must be one of {set(self.roles)}, got {role!r}")
+
+    def _sync_extension_flags(self) -> None:
+        self.extended_roles = {
+            role for role in self.roles if self.extension_lengths[role] > 0
+        }
+        self.is_extended = len(self.extended_roles) > 0
+
+    def check_vocab(self, triple: Tuple[str, ...], return_type=bool) -> bool | tuple:
+        """
+        True if each element is either in base vocab OR in extensions for that role.
+        Mirrors the generalized TuckerDecomposition.check_vocab signature.
+        """
+        if len(triple) != len(self.roles):
+            raise ValueError(
+                f"Expected tuple of length {len(self.roles)}, got {len(triple)}"
+            )
+
+        in_roles = [
+            (triple[i] in self.vocab[voc_index(self.roles[i])]) or
+            (triple[i] in self.extensions[self.roles[i]])
+            for i in range(len(self.roles))
+        ]
+        if return_type == tuple:
+            return tuple(in_roles)
+        return all(in_roles)
 
     def fetch_single_latent(self, element, role) -> np.ndarray:
         """
         First try base vocab, else fall back to extension dict.
         """
-        vocab_key = _voc_index(role)
+        self._validate_role(role)
+
+        vocab_key = voc_index(role)
         if element in self.vocab[vocab_key]:
             el_idx = self.vocab[vocab_key][element]
-            factor_slice = self.factors[_role_index(role)][el_idx]
+            factor_slice = self.factors[self.get_role_index(role)][el_idx]
             return _to_np(factor_slice)
 
         if element in self.extensions[role]:
@@ -656,79 +886,48 @@ class ExtendedTucker(TuckerDecomposition):
 
         raise KeyError(f"{element!r} not in base vocab and not extended for role {role!r}")
 
-    def fetch_latents(self, triple: Tuple[str, str, str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Use fetch_single_latent so extended tokens work everywhere.
-        """
-        v = self.fetch_single_latent(triple[0], "verb")
-        s = self.fetch_single_latent(triple[1], "subject")
-        o = self.fetch_single_latent(triple[2], "object")
-        return v, s, o
+    # NOTE:
+    # fetch_latents does not need to be overridden anymore.
+    # The generalized parent implementation already maps over self.roles and
+    # uses fetch_single_latent, so extended tokens work automatically.
 
-    # -- Extension method --
     def extend_role(
-            self,
-            role: str,
-            sample,  # iterable of (v,s,o) triples
-            normalize: bool =True,
-            normalize_mode: Literal["l2", "minmax"] = "l2",
-            n_threads: int | None = None,
-            thread_budget: ThreadBudget | None = None,
-            fraction_threads: float = 0.75,
-            min_threads: int = 1,
-            min_count: int | None = None,
-            top_k: int | None = None,
+        self,
+        role: str,
+        sample,  # iterable of tuples
+        normalize: bool = True,
+        normalize_mode: Literal["l2", "minmax"] = "l2",
+        n_threads: int | None = None,
+        thread_budget: ThreadBudget | None = None,
+        fraction_threads: float = 0.75,
+        min_threads: int = 1,
+        min_count: int | None = None,
+        top_k: int | None = None,
     ) -> dict[str, np.ndarray]:
         """
-        Extend ONE role, store vectors in self.extensions[role], and return the computed dict.
-
-        Notes:
-          - We only build reps for OOV tokens that appear in contexts where the other two are in-vocab.
-          - Results are merged into any existing extension (later calls can add more tokens).
-
-        See matrix extension.ipynb for development
+        Extend one role by building representations for OOV tokens from contexts
+        where all other roles are in-vocab.
         """
-        if role not in {"verb", "subject", "object"}:
-            raise ValueError(f"role must be one of {{'verb','subject','object'}}, got {role!r}")
+        self._validate_role(role)
 
-        # default threads
         if n_threads is None:
-            n_threads = get_eval_num_threads(fraction=fraction_threads, min_threads=min_threads)
+            n_threads = get_eval_num_threads(
+                fraction=fraction_threads,
+                min_threads=min_threads,
+            )
 
-        r_idx = _role_index(role)
-        other_idxs = [i for i in (0, 1, 2) if i != r_idx]
+        r_idx = self.get_role_index(role)
+        other_idxs = [i for i in range(len(self.roles)) if i != r_idx]
 
-        this_vocab_key = _voc_index(role)
-        other_vocab_keys = [_voc_index("verb"), _voc_index("subject"), _voc_index("object")]
-        other_vocab_keys = [other_vocab_keys[i] for i in other_idxs]
-
-        this_vocab = self.vocab[this_vocab_key]
-        other_vocabs = [self.vocab[k] for k in other_vocab_keys]
-
-
-        # if normalize:
-        #     F_base = _to_np(self.factors[_role_index(role)])  # (N, R)
-        #     base_row_norms = np.linalg.norm(F_base, axis=1)
-        #     nz = base_row_norms[np.isfinite(base_row_norms) & (base_row_norms > 0)]
-        #     print(nz)
-        #     target_norm = float(np.median(nz)) if nz.size else 1.0
-        #     print(f"target norm:", target_norm)
-        #     eps = 1e-12
-        #
-        #     def _rescale_to_target(vec: np.ndarray) -> np.ndarray:
-        #         n = float(np.linalg.norm(vec))
-        #         if (not np.isfinite(n)) or (n < eps):
-        #             return np.zeros_like(vec, dtype=np.float64)
-        #         return vec * (target_norm / (n + eps))
-        # else:
-        #
-        #     def _rescale_to_target(vec: np.ndarray) -> np.ndarray:
-        #            return vec
+        this_vocab = self.vocab[voc_index(role)]
+        other_roles = [self.roles[i] for i in other_idxs]
+        other_vocabs = [self.vocab[voc_index(r)] for r in other_roles]
 
         eps = 1e-12
         range_q = (1.0, 99.0)
+
         if normalize and normalize_mode == "l2":
-            F_base = _to_np(self.factors[_role_index(role)]).astype(np.float64, copy=False)  # (N, R)
+            F_base = _to_np(self.factors[r_idx]).astype(np.float64, copy=False)
             base_row_norms = np.linalg.norm(F_base, axis=1)
             nz = base_row_norms[np.isfinite(base_row_norms) & (base_row_norms > 0)]
             target_norm = float(np.median(nz)) if nz.size else 1.0
@@ -745,7 +944,7 @@ class ExtendedTucker(TuckerDecomposition):
                 return out2
 
         elif normalize and normalize_mode == "minmax":
-            F_base = _to_np(self.factors[_role_index(role)]).astype(np.float64, copy=False)  # (N, R)
+            F_base = _to_np(self.factors[r_idx]).astype(np.float64, copy=False)
 
             lo_q, hi_q = range_q
             base_lo = np.nanpercentile(F_base, lo_q, axis=0)
@@ -758,26 +957,24 @@ class ExtendedTucker(TuckerDecomposition):
                     return extension
 
                 toks = list(extension.keys())
-                E = np.stack([np.asarray(extension[t], dtype=np.float64) for t in toks], axis=0)  # (M, R)
+                E = np.stack(
+                    [np.asarray(extension[t], dtype=np.float64) for t in toks],
+                    axis=0,
+                )
 
                 ext_lo = np.nanpercentile(E, lo_q, axis=0)
                 ext_hi = np.nanpercentile(E, hi_q, axis=0)
                 ext_span = ext_hi - ext_lo
 
-                # dims with no spread in the batch -> pin to base midpoint
                 flat = ext_span < eps
                 safe_span = np.where(flat, 1.0, ext_span)
 
                 E2 = (E - ext_lo) * (base_span / safe_span) + base_lo
                 E2[:, flat] = base_mid[flat]
 
-                # clean up NaNs/infs if any sneak in
                 bad = ~np.isfinite(E2)
                 if np.any(bad):
                     E2[bad] = np.take(base_mid, np.where(bad)[1])
-
-                # if clip_to_base:
-                #     E2 = np.clip(E2, base_lo, base_hi)
 
                 return {t: E2[i] for i, t in enumerate(toks)}
 
@@ -787,15 +984,19 @@ class ExtendedTucker(TuckerDecomposition):
 
         # collect OOV contexts
         out = defaultdict(list)
-        for triple in tqdm(sample, desc=f"building OOV add list ({role})"):
-            tok = triple[r_idx]
+        for tpl in tqdm(sample, desc=f"building OOV add list ({role})"):
+            if len(tpl) != len(self.roles):
+                raise ValueError(
+                    f"Sample tuple has length {len(tpl)} but expected {len(self.roles)}"
+                )
 
-            # skip already base-vocab or already-extended
+            tok = tpl[r_idx]
+
             if (tok in this_vocab) or (tok in self.extensions[role]):
                 continue
 
-            if all(triple[o_i] in o_v for o_i, o_v in zip(other_idxs, other_vocabs)):
-                out[tok].append(triple)
+            if all(tpl[o_i] in o_vocab for o_i, o_vocab in zip(other_idxs, other_vocabs)):
+                out[tok].append(tpl)
 
         if not out:
             return {}
@@ -818,31 +1019,33 @@ class ExtendedTucker(TuckerDecomposition):
         if not out:
             return {}
 
-        # ThreadBudget limiter
-        limiter = (thread_budget.limit() if thread_budget is not None else None)
+        limiter = thread_budget.limit() if thread_budget is not None else None
         if limiter is None:
-            ctx = contextmanager(lambda: (yield))()  # no-op
+            ctx = contextmanager(lambda: (yield))()
         else:
             ctx = limiter
 
         sums: dict[str, np.ndarray] = {}
         counts: dict[str, int] = {}
 
-        def _one_call(tok, ctx_triple):
-            rep = self.predicted_role_vector(ctx_triple, role)
+        def _one_call(tok, ctx_tuple):
+            rep = self.excluded_role_vector(ctx_tuple, role)
             rep = np.asarray(rep, dtype=np.float64)
-            # rep = _rescale_to_target(rep)
             return tok, rep
 
-        jobs = [(tok, ctx_triple) for tok, ctxs in out.items() for ctx_triple in ctxs]
+        jobs = [(tok, ctx_tuple) for tok, ctxs in out.items() for ctx_tuple in ctxs]
         if not jobs:
             return {}
 
         with ctx:
             with ThreadPoolExecutor(max_workers=n_threads) as ex:
-                futures = [ex.submit(_one_call, tok, ctx_triple) for tok, ctx_triple in jobs]
+                futures = [ex.submit(_one_call, tok, ctx_tuple) for tok, ctx_tuple in jobs]
 
-                for fut in tqdm(as_completed(futures), total=len(futures), desc=f"calculating reps ({role})"):
+                for fut in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc=f"calculating reps ({role})",
+                ):
                     tok, rep = fut.result()
                     if tok not in sums:
                         sums[tok] = rep.copy()
@@ -851,43 +1054,25 @@ class ExtendedTucker(TuckerDecomposition):
                         sums[tok] += rep
                         counts[tok] += 1
 
-        # average per token
         extension = {tok: (sums[tok] / counts[tok]) for tok in sums.keys()}
-
-        # if normalize:
-        #     for tok in list(extension.keys()):
-        #         extension[tok] = _rescale_to_target(np.asarray(extension[tok], dtype=np.float64))
-        # post-normalize (either l2 or per-dimension minmax)
         extension = _post_normalize(extension)
 
-        # store + flags
         for tok, vec in extension.items():
             self.extensions[role][tok] = np.asarray(vec)
             self.extended_tokens[role].add(tok)
             self.extension_counts[role][tok] = int(counts[tok])
 
         self.extension_lengths[role] = len(self.extensions[role])
-        self.is_extended = True
-        self.extended_roles.add(role)
+        self._sync_extension_flags()
 
         return extension
 
-
-
-
-
-
     def select_top_k(self, role: str, top_k: int):
-        """
-        Keep only the top_k most common extended tokens for `role`
-        (based on self.extension_counts[role][tok]).
+        self._validate_role(role)
 
-        If fewer than top_k tokens exist for that role, raise an error.
-        """
-        if role not in {"verb", "subject", "object"}:
-            raise ValueError(f"role must be one of {{'verb','subject','object'}}, got {role!r}")
         if top_k <= 0:
             raise ValueError(f"top_k must be > 0, got {top_k}")
+
         n_ext = len(self.extensions[role])
         if n_ext < top_k:
             raise ValueError(
@@ -895,77 +1080,65 @@ class ExtendedTucker(TuckerDecomposition):
                 f"have {n_ext}, requested top_k={top_k}"
             )
 
-        # rank by count desc, then token for determinism
         counts = self.extension_counts[role]
         ranked = sorted(self.extensions[role].keys(), key=lambda t: (-counts.get(t, 0), t))
-
         keep = set(ranked[:top_k])
 
-        # drop everything else
         drop = [tok for tok in self.extensions[role].keys() if tok not in keep]
         for tok in drop:
             self.extensions[role].pop(tok, None)
             self.extended_tokens[role].discard(tok)
             self.extension_counts[role].pop(tok, None)
 
-        # update length
         self.extension_lengths[role] = len(self.extensions[role])
-
-        # if we removed everything for a role, also update extended_roles / is_extended
-        if self.extension_lengths[role] == 0:
-            self.extended_roles.discard(role)
-        self.is_extended = any(self.extension_lengths[r] > 0 for r in ("verb", "subject", "object"))
+        self._sync_extension_flags()
 
         return ranked[:top_k]
 
-
-    def integrate_extension(self, top_k: int|None) -> TuckerDecomposition:
+    def integrate_extension(self, top_k: int | None = None) -> TuckerDecomposition:
         """
-        Materialize (append) the extension vectors into the factor matrices + vocab,
+        Materialize extension vectors into the factor matrices + vocab,
         returning a plain TuckerDecomposition.
-
-        - for each role, keep only the most common top_k extended tokens (by extension_counts)
-        - if a role has < top_k extended tokens: raise
         """
-        roles = ["verb", "subject", "object"]
-
-        # UPDATED: new versions that have the "shared_factors" flag should use it and keep the link
-        if hasattr(self, "shared_factors") and self.shared_factors:
-            # factors are shared, but the extensions are role-specific. The link would be lost here.
+        # Preserve linked/shared factors if configured
+        if getattr(self, "shared_factors", None):
             for a, b in self.shared_factors:
-                role_a, role_b = roles[a], roles[b]
+                role_a, role_b = self.roles[a], self.roles[b]
 
-                # Combine unique tokens from both roles
-                combined_toks = set(self.extensions[role_a].keys()) | set(self.extensions[role_b].keys())
+                combined_toks = (
+                    set(self.extensions[role_a].keys()) |
+                    set(self.extensions[role_b].keys())
+                )
 
                 for tok in combined_toks:
                     vecs = []
                     counts = 0
 
                     if tok in self.extensions[role_a]:
-                        vecs.append(self.extensions[role_a][tok] * self.extension_counts[role_a][tok])
-                        counts += self.extension_counts[role_a][tok]
+                        c = self.extension_counts[role_a][tok]
+                        vecs.append(self.extensions[role_a][tok] * c)
+                        counts += c
 
                     if tok in self.extensions[role_b]:
-                        vecs.append(self.extensions[role_b][tok] * self.extension_counts[role_b][tok])
-                        counts += self.extension_counts[role_b][tok]
+                        c = self.extension_counts[role_b][tok]
+                        vecs.append(self.extensions[role_b][tok] * c)
+                        counts += c
 
-                    # Calculate the weighted average vector
                     avg_vec = sum(vecs) / counts
 
-                    # Assign identical unified data back to both roles
-                    self.extensions[role_a][tok] = self.extensions[role_b][tok] = avg_vec
+                    self.extensions[role_a][tok] = avg_vec
+                    self.extensions[role_b][tok] = avg_vec
                     self.extended_tokens[role_a].add(tok)
                     self.extended_tokens[role_b].add(tok)
-                    self.extension_counts[role_a][tok] = self.extension_counts[role_b][tok] = counts
+                    self.extension_counts[role_a][tok] = counts
+                    self.extension_counts[role_b][tok] = counts
 
-                # Sync lengths
                 self.extension_lengths[role_a] = len(self.extensions[role_a])
                 self.extension_lengths[role_b] = len(self.extensions[role_b])
-        top_ks = {}
-        # sanity
-        if top_k:
-            for role in roles:
+
+        top_ks: dict[str, int] = {}
+        if top_k is not None:
+            for role in self.roles:
                 n_ext = self.extension_lengths[role]
                 if n_ext < top_k:
                     raise ValueError(
@@ -975,38 +1148,32 @@ class ExtendedTucker(TuckerDecomposition):
                 if n_ext > top_k:
                     self.select_top_k(role, top_k)
                 top_ks[role] = top_k
-
         else:
-            top_ks = {role:self.extension_lengths[role] for role in roles}
-        print(top_ks)
-        # build new vocab (shallow copy of dict + copies of the lists/mappings we mutate)
+            top_ks = {role: self.extension_lengths[role] for role in self.roles}
+
         new_vocab = dict(self.vocab)
-        for role in roles:
-            list_key = f"vocab_{role[0]}"  # vocab_v / vocab_s / vocab_o
-            map_key = _voc_index(role)  # v2i / s2i / o2i
+        for role in self.roles:
+            list_key = _voc_list_key(role)
+            map_key = voc_index(role)
 
             new_vocab[list_key] = list(new_vocab[list_key])
             new_vocab[map_key] = dict(new_vocab[map_key])
 
-
-        # build new factors by appending extension rows
         new_factors: List[Union[torch.Tensor, np.ndarray]] = []
-        for role in roles:
-            f_idx = _role_index(role)
+        for role in self.roles:
+            f_idx = self.get_role_index(role)
             F = self.factors[f_idx]
-
-            # deterministic order: most common first, then token
             counts = self.extension_counts[role]
-            if counts == {}:
-                print("No extensions for role", role)
+
+            if not counts:
                 new_factors.append(F)
                 continue
+
             toks = sorted(self.extensions[role].keys(), key=lambda t: (-counts.get(t, 0), t))
             toks = toks[:top_ks[role]]
 
             vecs_np = np.stack([np.asarray(self.extensions[role][tok]) for tok in toks], axis=0)
 
-            # append to factor (preserve type/device/dtype where possible)
             if isinstance(F, torch.Tensor):
                 add = torch.tensor(vecs_np, dtype=F.dtype, device=F.device)
                 F_new = torch.cat([F, add], dim=0)
@@ -1016,44 +1183,42 @@ class ExtendedTucker(TuckerDecomposition):
 
             new_factors.append(F_new)
 
-            # update vocab list + mapping
-            list_key = f"vocab_{role[0]}"
-            map_key = _voc_index(role)
+            list_key = _voc_list_key(role)
+            map_key = voc_index(role)
 
             base_n = len(new_vocab[list_key])
             for j, tok in enumerate(toks):
                 new_vocab[list_key].append(tok)
                 new_vocab[map_key][tok] = base_n + j
 
-        # optional: store a tiny bit of provenance in vocab
-        # new_vocab["is_extended"] = True
-        # new_vocab["extension_top_k"] = int(top_k)
+        return TuckerDecomposition(
+            self.core,
+            new_factors,
+            new_vocab,
+            shared_factors=self.shared_factors,
+            roles=self.roles,
+        )
 
-        return TuckerDecomposition(self.core, new_factors, new_vocab, shared_factors=self.shared_factors)
-
-    # -- Saving and loading --
-
-
-    def save_extensions(self,
-            path: str,
-            *,
-            roles: Optional[list[str]] = None,
+    def save_extensions(
+        self,
+        path: str,
+        *,
+        roles: Optional[list[str]] = None,
     ) -> None:
         """
-        Save ONLY extension vectors (as factor-row matrices) + metadata needed to restore them.
-
-        File contains:
-          - per role: tokens (ordered), counts, matrix (n_ext, R)
-          - flags: is_extended, extended_roles, extension_lengths
-          - a few sanity fields: rank
+        Save ONLY extension vectors and metadata needed to restore them.
         """
         if roles is None:
-            roles = ["verb", "subject", "object"]
+            roles = list(self.roles)
 
-        R = self.factors[0].shape[1] # or core, but as we're working with factors here its explicit
+        for role in roles:
+            self._validate_role(role)
+
+        R = self.factors[0].shape[1]
 
         payload = {
             "rank": R,
+            "roles_order": list(self.roles),
             "is_extended": bool(self.is_extended),
             "extended_roles": sorted(list(self.extended_roles)),
             "extension_lengths": dict(self.extension_lengths),
@@ -1061,10 +1226,6 @@ class ExtendedTucker(TuckerDecomposition):
         }
 
         for role in roles:
-            if role not in {"verb", "subject", "object"}:
-                raise ValueError(f"Unknown role: {role!r}")
-
-            # deterministic order: most common first, then token
             counts = self.extension_counts.get(role, {})
             toks = sorted(self.extensions[role].keys(), key=lambda t: (-counts.get(t, 0), t))
 
@@ -1085,7 +1246,6 @@ class ExtendedTucker(TuckerDecomposition):
 
             role_counts = [int(counts.get(tok, 0)) for tok in toks]
 
-
             payload["roles"][role] = {
                 "tokens": toks,
                 "counts": role_counts,
@@ -1093,34 +1253,23 @@ class ExtendedTucker(TuckerDecomposition):
                 "dtype": str(mat.dtype),
             }
 
-
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         torch.save(payload, path)
 
-
     def load_extensions_inplace(
-            self,
-            path: str,
-            *,
-            map_location: Union[str, torch.device] = "cpu",
-            strict_rank: bool = True,
-            overwrite: bool = False,
+        self,
+        path: str,
+        *,
+        map_location: Union[str, torch.device] = "cpu",
+        strict_rank: bool = True,
+        overwrite: bool = False,
     ) -> None:
         """
-        Load saved extensions into THIS ExtendedTucker instance.
-
-        - Does NOT touch core/factors/vocab (so this object stays "the same" wrt the base tucker).
-        - Populates: extensions, extended_tokens, extension_counts, extension_lengths, is_extended, extended_roles.
-
-        Args:
-          strict_rank: if True, require saved rank == current rank.
-          overwrite: if True, replace existing extensions for roles; else merge (new tokens added, existing left as-is).
+        Load saved extensions into this ExtendedTucker instance.
         """
-        # ---- load payload ----
         try:
             payload = torch.load(path, map_location=map_location)
         except Exception:
-            # allow non-torch pickle fallback
             import pickle
             with open(path, "rb") as f:
                 payload = pickle.load(f)
@@ -1132,8 +1281,7 @@ class ExtendedTucker(TuckerDecomposition):
 
         roles_blob = payload.get("roles", {})
         for role, blob in roles_blob.items():
-            if role not in {"verb", "subject", "object"}:
-                continue
+            self._validate_role(role)
 
             toks = blob.get("tokens", []) or []
             counts = blob.get("counts", []) or []
@@ -1162,33 +1310,26 @@ class ExtendedTucker(TuckerDecomposition):
 
             for i, tok in enumerate(toks):
                 if (not overwrite) and (tok in self.extensions[role]):
-                    # keep existing
                     continue
-                vec = np.asarray(mat_np[i], dtype=np.float64)  # keep your extension dtype stable
+                vec = np.asarray(mat_np[i], dtype=np.float64)
                 self.extensions[role][tok] = vec
                 self.extended_tokens[role].add(tok)
                 self.extension_counts[role][tok] = int(counts[i])
 
             self.extension_lengths[role] = len(self.extensions[role])
 
-        # flags
-        self.extended_roles = {r for r in ("verb", "subject", "object") if self.extension_lengths[r] > 0}
-        self.is_extended = len(self.extended_roles) > 0
+        self._sync_extension_flags()
 
     @classmethod
     def load_extensions(
-            cls,
-            t: TuckerDecomposition,
-            path: str,
-            *,
-            map_location: Union[str, torch.device] = "cpu",
-            strict_rank: bool = True,
-            overwrite: bool = False,
+        cls,
+        t: TuckerDecomposition,
+        path: str,
+        *,
+        map_location: Union[str, torch.device] = "cpu",
+        strict_rank: bool = True,
+        overwrite: bool = False,
     ) -> "ExtendedTucker":
-        """
-        Convenience: create an ExtendedTucker that shares references with `t`,
-        then load extensions from file.
-        """
         ext = cls.from_tucker(t)
         ext.load_extensions_inplace(
             path,
@@ -1341,53 +1482,54 @@ class SparseTupleTensor:
 
     # --- Construction and loading ---
     @classmethod
-    def load_from_disk(cls,
-                       dataset: str="fineweb-en",
-                       method: str="siiSoftPlus",
-                       dims: int=1000,
-                       map_location: str="cpu",
-                       tier1: bool=False,
-                       shared_factors: set|None=None,
-                          ) -> "SparseTupleTensor":
-
-        """Loads a precomputed tucker decomposition from disk.
-            Args:
-                dataset (str): name of the dataset
-                method (str): method used to compute the decomposition
-                    - one of "counting", "sc", "sii"
-                dims (int): dimensionality of the original tensor modes (vocab size)
-                rank (int): rank of the decomposition
-                iterations (int): number of iterations used to compute the decomposition
-                map_location (str): device to map the loaded tensors to
-            Returns:
-                ((core, factors), vocab)
-                    core: torch.Tensor
-                    factors: list[torch.Tensor]
-
+    def load_from_disk(
+            cls,
+            dataset: str = "fineweb-en",
+            method: str = "siiSoftPlus",
+            order: int = 3,
+            dims: int = 1000,
+            map_location: str = "cpu",
+            tier1: bool = False,
+            shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None,
+    ) -> "SparseTupleTensor":
         """
-        if method not in {"counting", "sc", "sii",
-                      "siiSoftPlus", "siiShifted", "scSoftPlus", "scShifted"}:
-            raise ValueError("method must be one of {'counting','sc','sii'}")
+        Load a populated sparse tensor from disk.
+
+        Expects population artifacts saved as:
+            tensors/{dataset}/populated/{method}_{dims}{suffix}.pt
+        where suffix matches the shared-factor naming convention.
+        """
+        if method not in {
+            "counting", "sc", "sii",
+            "siiSoftPlus", "siiShifted",
+            "scSoftPlus", "scShifted",
+        }:
+            raise ValueError(
+                "method must be one of "
+                "{'counting','sc','sii','siiSoftPlus','siiShifted','scSoftPlus','scShifted'}"
+            )
+
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
-        is_shared = bool(shared_factors)
-        if is_shared:
-            print("loading in shared population:", shared_factors)
-        suffix = "_shared12" if is_shared else ""
 
-        # vocab_path = os.path.join(base, f"vocabularies/{dims}.pkl")
-        populated_path = os.path.join(base,"populated", f"{method}_{dims}{suffix}.pt")
-        # if not os.path.exists(vocab_path):
-        #     raise FileNotFoundError(f"Missing vocab file: {vocab_path}")
+        linked_nontrivial = nontrivial_linked_groups(shared_factors, num_factors=order)
+        suffix = shared_factor_suffix(linked_nontrivial)
+        populated_path = os.path.join(base, "populated", f"{method}_{order}D_{dims}{suffix}.pt")
+
         if not os.path.exists(populated_path):
-            raise FileNotFoundError(f"Missing decomposition file: {populated_path}")
-        # the vocab is here under f"vocabularies_[dims].pkl"
-        # Load with torch (they were saved with torch.save)
-        # with open(vocab_path, "rb") as f:
-        #     vocab = pickle.load(f)
+            if order == 3: # legacy naming support
+                populated_path = os.path.join(base, "populated", f"{method}_{dims}{suffix}.pt")
+            else:
+                raise FileNotFoundError(f"Missing populated tensor file: {populated_path}")
+
         tensor = torch_or_pickle_load(populated_path, map_location=map_location)
 
-        return cls(tensor, device=map_location, sparsity_type="torch", shared_factors=shared_factors)
+        return cls(
+            tensor,
+            device=map_location,
+            sparsity_type="torch",
+            shared_factors=shared_factors,
+        )
 
 
 
@@ -1629,7 +1771,6 @@ class SparseTupleTensor:
             log_step = get_log_step(iteration, rec_log_every, rec_check_every)
             routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step, largedim=largedim)
             # --- factors ---
-
             for mode in modes:
                 factors[mode] = routing.factor_update(
                     vec_tensor=self.tensor,
@@ -1645,7 +1786,6 @@ class SparseTupleTensor:
                 if mode in linked_factors:
                     for other in linked_factors[mode]:
                         factors[other] = factors[mode]
-
 
             # --- core + error ---
             if routing.core_returns_error:
@@ -1752,7 +1892,8 @@ class SparseTupleTensor:
                     return_type=sem_error_type,
                 )
                 fitness_scores.append(sem_out)
-
+                if verbose:
+                    print(sem_out)
                 # Primary value used for early stopping / diff
                 if isinstance(sem_out, dict):
                     if sem_primary_key not in sem_out:

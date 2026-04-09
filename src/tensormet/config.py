@@ -43,6 +43,7 @@ class ExperimentConfig:
     method: str = "siiSoftPlus"
     divergence: str = "fr"
     dim: int = 1000
+    order: int=3
     rank: Tuple[int, ...] = (100, 100, 100)
     name: str = None
     random_state: int = 1
@@ -77,7 +78,8 @@ class RunConfig:
         # deterministic + readable
         r0 = self.exp.rank[0] if len(self.exp.rank) else "r"
         prefix = f"{self.exp.name}_" if self.exp.name else ""
-        return f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.dim}d_{r0}r_{self.train.n_iter_max}i.pt"
+        return (f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_"
+                f"{self.exp.dim}d_{r0}r_{self.train.n_iter_max}i.pt")
 
     def model_path(self) -> Path:
         return self.output_dir() / self.model_filename()
@@ -160,6 +162,7 @@ class RunConfig:
             # These are the variables that MUST match to safely resume
             is_compatible = (
                     old_exp.get("dataset") == self.exp.dataset and
+                    old_exp.get("order") == self.exp.order and # new: order
                     old_exp.get("method") == self.exp.method and
                     old_exp.get("divergence") == self.exp.divergence and
                     old_exp.get("dim") == self.exp.dim and
@@ -170,6 +173,7 @@ class RunConfig:
             )
             print(old_exp.get("dataset"), self.exp.dataset, "\n",
             old_exp.get("method"),self.exp.method, "\n",
+            old_exp.get("order"),self.exp.order, "\n", #new: order
             old_exp.get("divergence"), self.exp.divergence, "\n",
             old_exp.get("dim"), self.exp.dim, "\n",
             tuple(old_exp.get("rank", [])), tuple(self.exp.rank), "\n",

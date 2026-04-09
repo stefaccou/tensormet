@@ -4,7 +4,33 @@ import numpy as np
 from typing import List, Tuple, Optional, Union
 import cupy as cp
 import cupyx.scipy.sparse as cpx_sparse
+import math
+from tensormet.utils import einsum_letters
 
+# -------------------------------------------------------------------
+# Helper functions to strictly enforce int64 bounds, bypassing
+# np.ravel_multi_index / cp.ravel_multi_index C-level limits.
+# -------------------------------------------------------------------
+def safe_unravel(flat_idx, shape, xp):
+    """Unravels flat indices safely using pure 64-bit array math."""
+    coords = []
+    curr = flat_idx
+    for dim in reversed(shape):
+        coords.append(curr % dim)
+        curr = curr // dim
+    return tuple(reversed(coords))
+
+def safe_ravel(coords, shape, xp):
+    """Ravels coordinates safely using pure 64-bit array math."""
+    if not coords:
+        return xp.zeros(1, dtype=xp.int64)
+    flat = xp.zeros_like(coords[0], dtype=xp.int64)
+    stride = xp.int64(1)
+    for i in reversed(range(len(shape))):
+        flat += coords[i].astype(xp.int64) * stride
+        stride *= xp.int64(shape[i])
+    return flat
+# -------------------------------------------------------------------
 
 def unfold_from_vectorized_sparse(
     vec_tensor: cpx_sparse.spmatrix,
@@ -43,7 +69,9 @@ def unfold_from_vectorized_sparse(
     data_cp = cu.data
 
     orig_shape = tuple(orig_shape)
-    size = int(np.prod(orig_shape))
+    # size = int(np.prod(orig_shape))
+    # new: We now use math.prod to avoid np.prod 32-bit overflow
+    size = math.prod(orig_shape)
     int32_max = np.iinfo(np.int32).max
     block_size = min(size, int32_max)
 
@@ -53,18 +81,23 @@ def unfold_from_vectorized_sparse(
 
     flat_np = row_np + col_np * np.int64(block_size)
 
-    coords = np.unravel_index(flat_np, orig_shape)
+    # coords = np.unravel_index(flat_np, orig_shape)
+    # new: We now use safe unravelling
+    coords = safe_unravel(flat_np, orig_shape, np)
 
     row_unf_np = coords[mode]
 
     other_coords = coords[:mode] + coords[mode + 1:]
     other_shape = tuple(s for i, s in enumerate(orig_shape) if i != mode)
-    col_unf_np = np.ravel_multi_index(other_coords, other_shape)
+
+    # col_unf_np = np.ravel_multi_index(other_coords, other_shape)
+    # new: We now use safe ravelling
+    col_unf_np = safe_ravel(other_coords, other_shape, np)
 
     row_unf_cp = cp.asarray(row_unf_np)
     col_unf_cp = cp.asarray(col_unf_np)
 
-    unfolded_shape = (orig_shape[mode], int(np.prod(other_shape)))
+    unfolded_shape = (orig_shape[mode], int(math.prod(other_shape)))
     unfolded = cpx_sparse.coo_matrix(
         (data_cp, (row_unf_cp, col_unf_cp)),
         shape=unfolded_shape,
@@ -243,7 +276,9 @@ def fold_unfolded_sparse_to_vec(
         row, col = cp.nonzero(unfolded)
         data = unfolded[row, col]
 
-    coords_other = cp.unravel_index(col, other_shape)
+    # coords_other = cp.unravel_index(col, other_shape)
+    # new: We now use safe unravelling (force col to int64)
+    coords_other = safe_unravel(col.astype(cp.int64), other_shape, cp)
 
     coords_full = []
     idx_other = 0
@@ -256,11 +291,15 @@ def fold_unfolded_sparse_to_vec(
 
     coords_full = tuple(coords_full)
 
-    size = int(np.prod(new_shape))
+    # size = int(np.prod(new_shape))
+    # new: We now use math to force correct behaviour in large dimensions
+    size = math.prod(new_shape)
     int32_max = np.iinfo(np.int32).max
     block_size = min(size, int32_max)
 
-    flat = cp.ravel_multi_index(coords_full, new_shape)
+    # flat = cp.ravel_multi_index(coords_full, new_shape)
+    # New: use the safe ravelling function
+    flat = safe_ravel(coords_full, new_shape, cp)
 
     # --- block encoding of flat indices ---
     row_vec = flat % block_size
@@ -289,7 +328,8 @@ def gather_dense_at_block_nz(dense_nd: np.ndarray,
                              vec_tensor: cpx_sparse.spmatrix,
                              orig_shape) -> cp.ndarray:
     orig_shape = tuple(orig_shape)
-    size = int(np.prod(orig_shape))
+    # new: use math.prod instead of numpy
+    size = math.prod(orig_shape)
     int32_max = np.iinfo(np.int32).max
     block_size = min(size, int32_max)
 
@@ -298,7 +338,75 @@ def gather_dense_at_block_nz(dense_nd: np.ndarray,
     flat = coo.row + coo.col * block_size
     return dense_flat[flat.get()]
 
+# def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=1e-12):
+#     """
+#     Compute Z columns (as rows) for a batch of unfolding columns, without building full Z.
+#
+#     Returns Z_u with shape (m, R_mode), where m = batch size.
+#     """
+#     N = core.ndim
+#     letters = einsum_letters(N)
+#     core_subs = "".join(letters)
+#
+#     # factor-row matrices for each other mode: (m, Rk)
+#     mats = [factors[k][idxs_by_mode[k]] for k in other_modes]
+#
+#     # einsum: core[a b c ...], M_b[m b], M_c[m c], ... -> out[m a_mode]
+#     in_terms = [core_subs] + [("m" + letters[k]) for k in other_modes]
+#     out_term = "m" + letters[mode]
+#     eq = ",".join(in_terms) + "->" + out_term
+#
+#     Z_u = cp.einsum(eq, core, *mats)
+#     Z_u = cp.clip(Z_u, a_min=epsilon, a_max=None)
+#     return Z_u
 
+def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=1e-12):
+    """
+    Compute Z columns (as rows) for a batch of unfolding columns, without building full Z.
+
+    Returns
+    -------
+    Z_u : (m, R_mode)
+        Row t is the reconstructed unfolded column corresponding to the
+        coordinates encoded in idxs_by_mode for batch item t.
+    """
+    if not other_modes:
+        m = len(list(idxs_by_mode.values())[0]) if idxs_by_mode else 1
+        return cp.clip(cp.tile(core, (m, 1)), a_min=epsilon, a_max=None)
+
+    # 1. Introduce the batch dimension (m) with the first mode
+    k0 = other_modes[0]
+    M0 = factors[k0][idxs_by_mode[k0]]  # (m, R_k0)
+    m = M0.shape[0]
+
+    # tmp shape: (m, R_0, ..., R_{k0-1}, R_{k0+1}, ...)
+    tmp = cp.tensordot(M0, core, axes=(1, k0))
+
+    # Track the remaining core axes in their current order
+    remaining_axes = [i for i in range(core.ndim) if i != k0]
+
+    # 2. Contract the rest with broadcast+sum to prevent multiplying the 'm' dimension
+    for k in other_modes[1:]:
+        M = factors[k][idxs_by_mode[k]]  # (m, R_k)
+
+        # Find where axis k is currently located in tmp (shifted by +1 because 'm' is at index 0)
+        axis_idx = 1 + remaining_axes.index(k)
+
+        # Reshape M to broadcast across tmp: (m, 1, ..., R_k, ..., 1)
+        bcast_shape = [1] * tmp.ndim
+        bcast_shape[0] = m
+        bcast_shape[axis_idx] = M.shape[1]
+
+        # Multiply and sum over the rank dimension
+        tmp = cp.sum(tmp * M.reshape(bcast_shape), axis=axis_idx)
+
+        # Remove the contracted axis from tracking
+        remaining_axes.remove(k)
+
+    if tmp.ndim != 2:
+        raise RuntimeError(f"Expected 2D result after contractions, got shape {tmp.shape}")
+
+    return cp.clip(tmp, a_min=epsilon, a_max=None)
 
 
 def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, random_state):

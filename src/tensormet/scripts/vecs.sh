@@ -1,0 +1,14 @@
+python3 -m tensormet.scripts.vector_creation \
+    --type frames \
+    --dataset fineweb \
+    --output-dir "$DATA/vectors/HF_fineweb"\
+    --rows-per-flush 1000 \
+    --target-vectors 1000000 \
+    --spacy-model en_core_web_md \
+    --cpu-frac 1 \
+    --log-every-s 30 \
+    --batch-size 16 \
+    --rows-per-part 500000 \
+    --hf-path HuggingFaceFW/fineweb \
+    --hf-config CC-MAIN-2025-26 \
+    --hf-text-column text

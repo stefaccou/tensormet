@@ -1,12 +1,12 @@
-from math import log
-from collections import Counter
+from math import log, prod
+from collections import Counter, defaultdict
 from pathlib import Path
 import csv, os
 import numpy as np
 import time
 import torch
 from tqdm import tqdm
-from tensormet.utils import notify_discord, DATA_DIR, select_gpu
+from tensormet.utils import notify_discord, DATA_DIR, select_gpu, shared_factor_suffix, linked_factor_groups
 import pickle
 import ast
 
@@ -14,6 +14,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
+from itertools import combinations
+from functools import reduce
 # -- parquet helpers --
 
 def _normalize_str_array(arr: pa.Array) -> pa.Array:
@@ -344,6 +346,39 @@ def _most_common_keys(counter: Counter, k: int) -> list:
 #     notify_discord(f"Finished populating tensors from {path_to_vectors}.")
 #     return results
 
+def _shared_topk_hmean(counters: list[Counter], k: int, eps: float = 0.0) -> list:
+    """
+    Build a shared top-k vocabulary across multiple marginals using
+    generalized harmonic mean.
+
+    counters: list of Counter objects containing counts or probabilities
+    Returns: list of keys length k, sorted by descending harmonic mean.
+    """
+    if not counters:
+        return []
+
+    keys = set()
+    for counter in counters:
+        keys.update(counter.keys())
+
+    scored = []
+    n = len(counters)
+
+    for x in keys:
+        vals = [float(counter.get(x, 0.0)) for counter in counters]
+
+        if any(v == 0.0 for v in vals):
+            hm = 0.0
+        else:
+            hm = n / sum((1.0 / (v + eps)) for v in vals)
+
+        coverage = sum(vals)
+        scored.append((hm, coverage, x))
+
+    scored.sort(reverse=True)
+    return [x for (_, __, x) in scored[:k]]
+
+
 
 def populate_tensors_parquet(
     path_to_vectors,
@@ -422,7 +457,7 @@ def populate_tensors_parquet(
     vocabs_max = {col: _most_common_keys(single_probs[col], max_k) for col in cols_to_build}
 
     # Optional factor linking: linked columns share the same top-k vocabulary
-    linked_groups = _linked_factor_groups(len(cols_to_build), shared_factors)
+    linked_groups = linked_factor_groups(len(cols_to_build), shared_factors)
 
 
     if shared_factors:
@@ -646,21 +681,18 @@ def populate_tensors_parquet(
             vocab[f"{col}2i"] = col2i[col]
 
         linked_nontrivial = [group for group in linked_groups if len(group) > 1]
-        if linked_nontrivial:
-            suffix_parts = ["shared" + "".join(map(str, group)) for group in linked_nontrivial]
-            suffix = "_" + "_".join(suffix_parts)
-        else:
-            suffix = ""
+        suffix = shared_factor_suffix(linked_nontrivial)
+        order = len(cols_to_build)
 
         if save:
-            torch.save(count_tensor, f"{path_to_tensors}/populated/counting_{top_k}{suffix}.pt")
-            torch.save(sii_tensor,   f"{path_to_tensors}/populated/sii_{top_k}{suffix}.pt")
-            torch.save(sc_tensor,    f"{path_to_tensors}/populated/sc_{top_k}{suffix}.pt")
-            torch.save(sc_softplus,  f"{path_to_tensors}/populated/scSoftPlus_{top_k}{suffix}.pt")
-            torch.save(sii_softplus, f"{path_to_tensors}/populated/siiSoftPlus_{top_k}{suffix}.pt")
-            torch.save(sc_shifted,   f"{path_to_tensors}/populated/scShifted_{top_k}{suffix}.pt")
-            torch.save(sii_shifted,  f"{path_to_tensors}/populated/siiShifted_{top_k}{suffix}.pt")
-            with open(f"{path_to_tensors}/vocabularies/{top_k}{suffix}.pkl", "wb") as f:
+            torch.save(count_tensor, f"{path_to_tensors}/populated/counting_{order}D_{top_k}d{suffix}.pt")
+            torch.save(sii_tensor,   f"{path_to_tensors}/populated/sii_{order}D_{top_k}d{suffix}.pt")
+            torch.save(sc_tensor,    f"{path_to_tensors}/populated/sc_{order}D_{top_k}d{suffix}.pt")
+            torch.save(sc_softplus,  f"{path_to_tensors}/populated/scSoftPlus_{order}D_{top_k}d{suffix}.pt")
+            torch.save(sii_softplus, f"{path_to_tensors}/populated/siiSoftPlus_{order}D_{top_k}d{suffix}.pt")
+            torch.save(sc_shifted,   f"{path_to_tensors}/populated/scShifted_{order}D_{top_k}d{suffix}.pt")
+            torch.save(sii_shifted,  f"{path_to_tensors}/populated/siiShifted_{order}D_{top_k}d{suffix}.pt")
+            with open(f"{path_to_tensors}/vocabularies/{order}D_{top_k}d{suffix}.pkl", "wb") as f:
                 pickle.dump(vocab, f)
         else:
             results[top_k] = (count_tensor, sii_tensor, sc_tensor, vocab)

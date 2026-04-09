@@ -1,6 +1,6 @@
 [project]
 name = "tensormet"        # project name
-version = "0.1.9"
+version = "0.2.0"
 description = """
 Project utilities for tensor repo.
 """

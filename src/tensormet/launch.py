@@ -1,3 +1,4 @@
+from tensormet.tucker_tensor import extract_roles_from_vocab
 from tensormet.utils import (select_gpu,
                              ThreadBudget,
                              compute_num_threads,
@@ -6,7 +7,10 @@ from tensormet.utils import (select_gpu,
                              append_jsonl,
                              utc_now_iso,
                              tee_output,
-                             notify_discord
+                             notify_discord,
+                             extract_roles_from_vocab,
+                             shared_factor_suffix,
+                             linked_factor_groups
                              )
 import os
 import sys
@@ -97,13 +101,6 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
     return summary
 
 
-def _shared_suffix(shared_factors):
-    if not shared_factors:
-        return ""
-    parts = ["shared" + "".join(map(str, pair)) for pair in shared_factors]
-    return "_" + "_".join(sorted(parts))
-
-
 def launch_nnt_decomposition(cfg, gpu_id=None):
     thread_budget = ThreadBudget(n_threads=compute_num_threads(cfg.exp.max_cpu_frac))
 
@@ -116,31 +113,48 @@ def launch_nnt_decomposition(cfg, gpu_id=None):
     tl.set_backend("cupy")
 
     # we load the sample sentences only once
-    vector_path = os.path.join(DATA_DIR, "vectors", cfg.exp.dataset)
-    sentence_sample = load_eval_sentences_cached_parquet(vector_path=vector_path,
-                                                         dataset=cfg.exp.dataset,
-                                                         seed=cfg.exp.random_state,
-                                                         n_samples=cfg.eval.sem_fitness_target,
-                                                         )
 
-    is_shared = bool(cfg.train.shared_factors)
-    print("shared factors:", is_shared)
-    suffix = _shared_suffix(cfg.train.shared_factors)
+    # Calculate suffix using the exact same logic as population.py
+    linked_groups = linked_factor_groups(cfg.exp.order, cfg.train.shared_factors)
+    linked_nontrivial = [group for group in linked_groups if len(group) > 1]
+    suffix = shared_factor_suffix(linked_nontrivial)
+
+    # Note the added {cfg.exp.order}D_ to match what population.py writes
     vocab_path = os.path.join(
         DATA_DIR,
         "tensors",
         cfg.exp.dataset,
-        f"vocabularies/{cfg.exp.dim}{suffix}.pkl"
+        f"vocabularies/{cfg.exp.order}D_{cfg.exp.dim}{suffix}.pkl"
     )
-    with open(vocab_path, "rb") as f:
-        vocab = pickle.load(f)
+    try:
+        with open(vocab_path, "rb") as f:
+            vocab = pickle.load(f)
+    except FileNotFoundError:
+        vocab_path = os.path.join(
+            DATA_DIR,
+            "tensors",
+            cfg.exp.dataset,
+            f"vocabularies/{cfg.exp.dim}{suffix}.pkl"
+        )
+        with open(vocab_path, "rb") as f:
+            vocab = pickle.load(f)
 
+    roles = extract_roles_from_vocab(vocab)
+
+    vector_path = os.path.join(DATA_DIR, "vectors", cfg.exp.dataset)
+    sentence_sample = load_eval_sentences_cached_parquet(vector_path=vector_path,
+                                                         dataset=cfg.exp.dataset,
+                                                         roles=roles,
+                                                         seed=cfg.exp.random_state,
+                                                         n_samples=cfg.eval.sem_fitness_target,
+                                                         )
     if cfg.eval.remove_OOV:
         start = time.time()
         clean_sample = ensure_vocab(vocab, sentence_sample)
         print("cleaned sample in ", time.time() - start)
     else:
         clean_sample = sentence_sample
+
 
     paths = cfg.artifact_paths()
     for p in paths.values():
@@ -163,10 +177,13 @@ def launch_nnt_decomposition(cfg, gpu_id=None):
     sparse_tensor = SparseTupleTensor.load_from_disk(
         dataset=cfg.exp.dataset,
         method=cfg.exp.method,
+        order=cfg.exp.order,
         dims=cfg.exp.dim,
         tier1=cfg.exp.tier1,
         shared_factors=cfg.train.shared_factors,
     )
+
+
 
     with tee_output(paths["log"]):
         sparse_tensor.tensor_to_sparse("cupy")
@@ -276,6 +293,7 @@ def launch_tensor_population(cfg):
         results = populate_tensors_parquet(
             path_to_vectors=vectors_dir,
             top_ks=list(cfg.exp.top_ks),
+            shared_factors=cfg.exp.shared_factors,
             save=True,
             path_to_tensors=output_dir,
             cols_to_build=list(cfg.exp.cols_to_build),
@@ -299,10 +317,10 @@ def launch_tensor_population(cfg):
         },
     )
 
-    notify_discord(
-        f"Tensor population finished for {cfg.exp.dataset}. "
-        f"Top Ks: {list(cfg.exp.top_ks)}. "
-        f"Runtime: {end_time - start_time:.2f}s."
-    )
+    # notify_discord(
+    #     f"Tensor population finished for {cfg.exp.dataset}. "
+    #     f"Top Ks: {list(cfg.exp.top_ks)}. "
+    #     f"Runtime: {end_time - start_time:.2f}s."
+    # )
 
     return results
