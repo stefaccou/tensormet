@@ -5,7 +5,7 @@
 #SBATCH --nodes=1 --ntasks-per-node=12
 #SBATCH --mem=126000M
 #SBATCH --gpus-per-node=1
-#SBATCH --time=01:00:00
+#SBATCH --time=10:00:00
 #SBATCH --job-name=frame_decomposition
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
@@ -26,19 +26,19 @@ python3 -m tensormet.scripts.nnt \
       --divergence kl \
       --dim 4000 \
       --order 5 \
-      --rank 100 \
+      --rank 50 \
       --name long \
       --random-state 1 \
       --max-cpu-frac 1 \
       --verbose t \
       --shared-factors "1-2,2-3,3-4" \
-      --overwrite true \
+      --overwrite false \
       --iterations 1000 \
       --normalize-factors true \
       --patience 1000 \
       --return-errors full \
       --largedim true \
-      --checkpoint-saving-steps 50 \
+      --checkpoint-saving-steps 25 \
       --rec-log-every 5 \
       --sem-check-every 10 \
       --sem-error-type all \

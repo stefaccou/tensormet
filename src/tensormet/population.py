@@ -1,14 +1,12 @@
 from math import log, prod
 from collections import Counter, defaultdict
 from pathlib import Path
-import csv, os
-import numpy as np
-import time
+import os
+
 import torch
 from tqdm import tqdm
-from tensormet.utils import notify_discord, DATA_DIR, select_gpu, shared_factor_suffix, linked_factor_groups
+from tensormet.utils import DATA_DIR, shared_factor_suffix, linked_factor_groups
 import pickle
-import ast
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -16,8 +14,8 @@ import pyarrow.dataset as ds
 
 from itertools import combinations
 from functools import reduce
-# -- parquet helpers --
 
+# -- parquet helpers --
 def _normalize_str_array(arr: pa.Array) -> pa.Array:
     """
     Match original normalization for wrong elements that persist:
@@ -638,24 +636,41 @@ def populate_tensors_parquet(
                 continue
             indices.append([col2i[cols_to_build[i]][el] for i, el in enumerate(els_to_check)])
             count_values.append(float(cnt))
-            sii_values.append(float(specific_interaction_information(els_to_check)))
-            sc_values.append(float(specific_correlation(els_to_check)))
 
-        # size = (len(vocab_v), len(vocab_s), len(vocab_o))
+            # Use finite values instead of -inf to prevent coalesce/sorting issues
+            sii_val = specific_interaction_information(els_to_check)
+            sii_values.append(float(sii_val) if sii_val != float("-inf") else -1e38)
+
+            sc_val = specific_correlation(els_to_check)
+            sc_values.append(float(sc_val) if sc_val != float("-inf") else -1e38)
+
         size = tuple(len(vocabs[col]) for col in cols_to_build)
+
         if len(indices) == 0:
             idx = torch.empty((len(cols_to_build), 0), dtype=torch.long)
             empty = torch.empty((0,), dtype=torch.float32)
             count_tensor = torch.sparse_coo_tensor(idx, empty, size=size).coalesce()
             sii_tensor = torch.sparse_coo_tensor(idx, empty, size=size).coalesce()
             sc_tensor = torch.sparse_coo_tensor(idx, empty, size=size).coalesce()
-
         else:
-            idx = torch.tensor(indices, dtype=torch.long).t()
-            count_tensor = torch.sparse_coo_tensor(idx, torch.tensor(count_values, dtype=torch.float32), size=size).coalesce()
-            sii_tensor = torch.sparse_coo_tensor(idx, torch.tensor(sii_values, dtype=torch.float32), size=size).coalesce()
-            sc_tensor  = torch.sparse_coo_tensor(idx, torch.tensor(sc_values, dtype=torch.float32), size=size).coalesce()
+            # Convert to tensors and explicitly cast to long
+            idx = torch.tensor(indices, dtype=torch.long).t().contiguous()
 
+            # Create tensors
+            count_tensor = torch.sparse_coo_tensor(idx, torch.tensor(count_values, dtype=torch.float32), size=size)
+            sii_tensor = torch.sparse_coo_tensor(idx, torch.tensor(sii_values, dtype=torch.float32), size=size)
+            sc_tensor = torch.sparse_coo_tensor(idx, torch.tensor(sc_values, dtype=torch.float32), size=size)
+
+            # CRITICAL: Clear Python lists from memory before coalescing
+            del indices
+            del count_values
+            del sii_values
+            del sc_values
+
+            # Coalesce (this is the memory-intensive part)
+            count_tensor = count_tensor.coalesce()
+            sii_tensor = sii_tensor.coalesce()
+            sc_tensor = sc_tensor.coalesce()
         # normalized variants
         eps = 1e-8
         if sii_tensor._nnz():

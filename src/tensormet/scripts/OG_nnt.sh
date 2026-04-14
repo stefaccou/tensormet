@@ -17,4 +17,5 @@ python3 -m tensormet.scripts.nnt \
            --random-state 1 \
            --normalize-factors true \
            --return-errors full \
-           --overwrite true
+           --overwrite true \
+           --sem-error-type "all"

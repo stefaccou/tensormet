@@ -10,7 +10,7 @@ import cupyx.scipy.sparse as cpx_sparse
 import tensorly as tl
 from tensorly.tucker_tensor import validate_tucker_rank, tucker_normalize, TuckerTensor
 from tensorly.tenalg import mode_dot
-from typing import List, Optional, Union, Tuple, Dict, Literal
+from typing import List, Optional, Union, Tuple,  Literal
 from collections import defaultdict
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,7 +25,6 @@ from tensormet.utils import (DATA_DIR,
                             ThreadBudget,
                             shared_factor_suffix,
                             nontrivial_linked_groups,
-                            linked_factor_groups,
                             voc_index,
                             extract_roles_from_vocab,
                             einsum_letters
@@ -153,11 +152,13 @@ class TuckerDecomposition:
             parsed_shared = factor_sharing
 
         if parsed_shared:
-            linked_nontrivial = nontrivial_linked_groups(parsed_shared, num_factors=3)
+            linked_nontrivial = nontrivial_linked_groups(parsed_shared, num_factors=order)
             suffix = shared_factor_suffix(linked_nontrivial)
 
-        # Handle the new {order}D_ naming format vs legacy naming
-        vocab_path_new = os.path.join(base, f"vocabularies/{order}D_{dims}{suffix}.pkl")
+        # Handle the new {order}D_ naming format vs legacy naming.
+        # New format (post N-D migration): {order}D_{dims}d{suffix}.pkl
+        # Legacy format (3D only):         {dims}{suffix}.pkl
+        vocab_path_new = os.path.join(base, f"vocabularies/{order}D_{dims}d{suffix}.pkl")
         vocab_path_old = os.path.join(base, f"vocabularies/{dims}{suffix}.pkl")
 
         if os.path.exists(vocab_path_new):
@@ -169,27 +170,46 @@ class TuckerDecomposition:
 
 
         decomp_path = os.path.join(base, "decomposition")
-        # Construct the prefix of the tensor file name
+        # Construct candidate prefixes: new naming first, legacy fallback.
+        # New format (post N-D migration): {name}{div}_{method}_{order}D_{dims}d_{rank}r_
+        # Legacy format (3D only):         {name}{div}_{method}_{dims}d_{rank}r_
         name_prefix = f"{name + '_' if name else ''}"
-        file_prefix = f"{name_prefix}{divergence}_{method}_{dims}d_{rank}r_"
+        new_file_prefix    = f"{name_prefix}{divergence}_{method}_{order}D_{dims}d_{rank}r_"
+        legacy_file_prefix = f"{name_prefix}{divergence}_{method}_{dims}d_{rank}r_"
+
+        def _find_highest_iter(decomp_dir: str, prefix: str) -> int:
+            highest = -1
+            if os.path.exists(decomp_dir):
+                for filename in os.listdir(decomp_dir):
+                    if filename.startswith(prefix) and filename.endswith("i.pt"):
+                        iter_str = filename[len(prefix):-len("i.pt")]
+                        if iter_str.isdigit():
+                            highest = max(highest, int(iter_str))
+            return highest
 
         # Look for the highest iteration option if not specified
         if not iterations:
-            highest_iter = -1
-            if os.path.exists(decomp_path):
-                for filename in os.listdir(decomp_path):
-                    # Check if the file matches our prefix and the expected suffix "i.pt"
-                    if filename.startswith(file_prefix) and filename.endswith("i.pt"):
-                        # Extract the iteration number string from the filename
-                        iter_str = filename[len(file_prefix):-len("i.pt")]
-                        if iter_str.isdigit():
-                            highest_iter = max(highest_iter, int(iter_str))
-
+            highest_iter = _find_highest_iter(decomp_path, new_file_prefix)
             if highest_iter == -1:
-                raise FileNotFoundError(
-                    f"Could not find any decomposition files matching prefix '{file_prefix}' in {decomp_path}")
-
+                highest_iter = _find_highest_iter(decomp_path, legacy_file_prefix)
+                if highest_iter != -1:
+                    print(f"No new-style ({order}D) decomposition found; falling back to legacy naming.")
+                    file_prefix = legacy_file_prefix
+                else:
+                    raise FileNotFoundError(
+                        f"Could not find any decomposition files in {decomp_path} "
+                        f"matching '{new_file_prefix}' or '{legacy_file_prefix}'"
+                    )
+            else:
+                file_prefix = new_file_prefix
             iterations = highest_iter
+        else:
+            # When iterations is given explicitly, prefer new naming, fall back to legacy.
+            file_prefix = new_file_prefix
+            if not os.path.exists(os.path.join(decomp_path, f"{new_file_prefix}{iterations}i.pt")):
+                if os.path.exists(os.path.join(decomp_path, f"{legacy_file_prefix}{iterations}i.pt")):
+                    print(f"No new-style ({order}D) decomposition found; falling back to legacy naming.")
+                    file_prefix = legacy_file_prefix
 
         tensor_name = f"{file_prefix}{iterations}i.pt"
         decomp_path = os.path.join(decomp_path, tensor_name)
@@ -1514,7 +1534,7 @@ class SparseTupleTensor:
 
         linked_nontrivial = nontrivial_linked_groups(shared_factors, num_factors=order)
         suffix = shared_factor_suffix(linked_nontrivial)
-        populated_path = os.path.join(base, "populated", f"{method}_{order}D_{dims}{suffix}.pt")
+        populated_path = os.path.join(base, "populated", f"{method}_{order}D_{dims}d{suffix}.pt")
 
         if not os.path.exists(populated_path):
             if order == 3: # legacy naming support
@@ -1698,6 +1718,7 @@ class SparseTupleTensor:
             time_iteration = cfg.eval.time_iteration
             # saving
             save_intermediate = cfg.eval.save_intermediate
+            tier1 = cfg.exp.tier1
 
 
         except Exception as e:
@@ -1780,6 +1801,7 @@ class SparseTupleTensor:
                     shape=shape,
                     thread_budget=thread_budget,
                     epsilon=epsilon,
+                    verbose=verbose
                 )
 
                 # new: factor linking
@@ -1798,6 +1820,7 @@ class SparseTupleTensor:
                     modes=modes,
                     thread_budget=thread_budget,  # we always pass it, even if not needed, to ensure consistency
                     epsilon=epsilon,
+                    verbose=verbose
                 )
             else:
                 # KL: core update, then compute error separately
@@ -1809,6 +1832,7 @@ class SparseTupleTensor:
                     modes=modes,
                     thread_budget=thread_budget,
                     epsilon=epsilon,
+                    verbose=verbose
                 )
                 rel_err = routing.error_fn(
                     vec_tensor=self.tensor,
@@ -1817,6 +1841,7 @@ class SparseTupleTensor:
                     factors=factors,
                     thread_budget=thread_budget,
                     epsilon=epsilon,
+                    verbose=verbose
                 )
             # Normalize if desired
             if normalize_factors:
@@ -1880,9 +1905,9 @@ class SparseTupleTensor:
                 tl.set_backend("pytorch")
                 core_cpu = tl.tensor(cp.asnumpy(core))
                 factors_cpu = [tl.tensor(cp.asnumpy(f)) for f in factors]
-                tucker_decomp = TuckerDecomposition(core=core_cpu, factors=factors_cpu, vocab=vocab)
+                roles = extract_roles_from_vocab(vocab)
+                tucker_decomp = TuckerDecomposition(core=core_cpu, factors=factors_cpu, vocab=vocab, roles=roles)
 
-                print(iteration, end=":\t")
                 sem_out = evaluate_sample(
                     tucker_decomp,
                     sample_sentences,
@@ -1892,15 +1917,23 @@ class SparseTupleTensor:
                     return_type=sem_error_type,
                 )
                 fitness_scores.append(sem_out)
-                if verbose:
-                    print(sem_out)
                 # Primary value used for early stopping / diff
                 if isinstance(sem_out, dict):
                     if sem_primary_key not in sem_out:
                         raise KeyError(f"Primary semantic key '{sem_primary_key}' missing from returned scores.")
                     sem_value = float(sem_out[sem_primary_key])
+                    sem_all_dump = json.dumps(sem_out)
                 else:
                     sem_value = float(sem_out)
+                    sem_all_dump = str(sem_out)
+
+                _rec_err_log = rec_errors[-1] if rec_errors else None
+                print(
+                    f"Iteration {iteration + 1}\t"
+                    f"Rec_error: {_rec_err_log}\t"
+                    f"Sem({sem_primary_key}): {sem_value}\t"
+                    f"Sem_all: {sem_all_dump}"
+                )
 
                 tl.set_backend("cupy")
 

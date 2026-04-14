@@ -27,7 +27,7 @@ class EvalConfig:
     rec_check_every: int = 20
     rec_log_every: int = 20 # defaults to rec_check_every if not passed
     sem_check_every: int = 20
-    sem_error_type: Union[str, Tuple[str, ...]] = "average_rank_score" # updated 2026-03-04
+    sem_error_type: Union[str, Tuple[str, ...]] = "full" # updated 2026-03-04
     sem_softmax_temperature: float = 0.1
     sem_fitness_target: int = 10_000
     n_sentence_cache: Optional[int] = None  # if we later want to cap loaded sentences
@@ -129,14 +129,19 @@ class RunConfig:
         paths = self.artifact_paths()
         out_dir = paths["model"].parent
 
-        # 1. Build a wildcard pattern for the base name
-        # e.g., name_fr_siiSoftPlus_1000d_50r_
+        # 1. Build wildcard patterns for the base name.
+        # Try new naming first (includes {order}D_), then fall back to legacy (no order prefix).
         r0 = self.exp.rank[0] if len(self.exp.rank) else "r"
         prefix = f"{self.exp.name}_" if self.exp.name else ""
-        base_name_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.dim}d_{r0}r_"
+        new_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{self.exp.dim}d_{r0}r_"
+        legacy_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.dim}d_{r0}r_"
 
-        # Find all JSON config files matching this structural prefix
-        candidate_configs = list(out_dir.glob(f"{base_name_pattern}*i_config.json"))
+        # Find all JSON config files matching either pattern
+        candidate_configs = list(out_dir.glob(f"{new_pattern}*i_config.json"))
+        if not candidate_configs:
+            candidate_configs = list(out_dir.glob(f"{legacy_pattern}*i_config.json"))
+            if candidate_configs:
+                print(f"No new-style ({self.exp.order}D) checkpoints found; falling back to legacy naming.")
 
         best_candidate_paths = paths
         latest_iter = -1

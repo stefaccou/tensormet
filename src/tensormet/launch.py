@@ -124,12 +124,16 @@ def launch_nnt_decomposition(cfg, gpu_id=None):
         DATA_DIR,
         "tensors",
         cfg.exp.dataset,
-        f"vocabularies/{cfg.exp.order}D_{cfg.exp.dim}{suffix}.pkl"
+        f"vocabularies/{cfg.exp.order}D_{cfg.exp.dim}d{suffix}.pkl"
     )
     try:
         with open(vocab_path, "rb") as f:
             vocab = pickle.load(f)
+        print("loaded vocab")
+        roles = extract_roles_from_vocab(vocab)
+        print("roles:", roles)
     except FileNotFoundError:
+        print(vocab_path, "not found")
         vocab_path = os.path.join(
             DATA_DIR,
             "tensors",
@@ -138,13 +142,28 @@ def launch_nnt_decomposition(cfg, gpu_id=None):
         )
         with open(vocab_path, "rb") as f:
             vocab = pickle.load(f)
+        print("legacy role definition")
+        roles = None
 
-    roles = extract_roles_from_vocab(vocab)
+        # Map vocab role names -> actual parquet column names
+    _VOCAB_TO_PARQUET = {
+        "verb": "root", "v": "root",
+        "subject": "nsubj", "s": "nsubj",
+        "object": "obj", "o": "obj",
+    }
+    parquet_roles = (
+        [_VOCAB_TO_PARQUET.get(r, r) for r in roles]
+        if roles is not None
+        else ["root", "nsubj", "obj"]  # legacy fallback default
+    )
+
+
+
 
     vector_path = os.path.join(DATA_DIR, "vectors", cfg.exp.dataset)
     sentence_sample = load_eval_sentences_cached_parquet(vector_path=vector_path,
                                                          dataset=cfg.exp.dataset,
-                                                         roles=roles,
+                                                         roles=parquet_roles,
                                                          seed=cfg.exp.random_state,
                                                          n_samples=cfg.eval.sem_fitness_target,
                                                          )

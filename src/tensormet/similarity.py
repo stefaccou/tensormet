@@ -3,7 +3,6 @@ import os
 import csv
 from tensormet.utils import ThreadBudget, DATA_DIR, voc_index
 import random
-from contextlib import contextmanager
 import numpy as np
 from pathlib import Path
 import pickle
@@ -302,9 +301,8 @@ def evaluate_sample(tensor,
         "OOV": OOV,
         "OOV_rate": OOV / n_samples,
         "tilde_excluded_prob_score": excluded_tilde / num_valid,
-        "tilde_rate": tildes / (num_valid * (n_roles - 1)) if n_roles > 1 else 0.0
+        "tilde_rate": tildes / (num_valid * n_roles) if n_roles > 0 else 0.0
     }
-    print(scores)
     # Format numeric types for output
     for k, v in scores.items():
         if isinstance(v, (np.generic, torch.Tensor)):
@@ -402,18 +400,21 @@ def load_eval_sentences_cached_parquet(
     *,
     dataset: str,
     roles: List[str] = ("root", "nsubj", "obj"),
+    column_map=None,          # e.g. {"verb": "root", "subject": "nsubj", "object": "obj"}
     cache_dir: str | os.PathLike = DATA_DIR / "vectors" / "cache",
     n_samples: int = 100,
     seed: int = 42,
-) -> List[Tuple[str, str, str]]:
+) -> List[Tuple[str, ...]]:
     """
-    Read unique (root, nsubj, obj) triples from a Parquet file or Parquet directory,
-    sample deterministically (like evaluate_sample), and cache the sampled list.
+    Read unique tuples from a Parquet file or Parquet directory, using the columns
+    specified by `roles`, sample deterministically, and cache the sampled list.
 
     Supports:
       - a single .parquet file
       - a directory containing many parquet parts (recommended)
     """
+
+    # legacy handling
     vector_path = Path(vector_path)
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -439,6 +440,7 @@ def load_eval_sentences_cached_parquet(
 
     cache_name = (
         f"eval_sentences__dataset={dataset}"
+        f"__roles={','.join(roles)}"
         f"__n={n_samples}"
         f"__seed={seed}"
         f"__{fingerprint}"
@@ -464,16 +466,16 @@ def load_eval_sentences_cached_parquet(
     #                    table["obj"].to_pylist()))
     table = dataset_obj.to_table(columns=roles)
     table = table.drop_null()
-    triples = list(zip(*[table[r].to_pylist() for r in roles]))
+    tuples = list(zip(*[table[r].to_pylist() for r in roles]))
 
-    if n_samples > len(triples):
+    if n_samples > len(tuples):
         raise ValueError(
-            f"n_samples={n_samples} > number of unique triples={len(triples)} "
+            f"n_samples={n_samples} > number of unique tuples={len(tuples)} "
             f"parsed from {vector_path}"
         )
 
     rng = random.Random(seed)
-    sampled = rng.sample(triples, n_samples)
+    sampled = rng.sample(tuples, n_samples)
 
     tmp = cache_file.with_suffix(".tmp")
     with tmp.open("wb") as f:

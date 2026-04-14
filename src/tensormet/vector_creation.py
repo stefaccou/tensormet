@@ -22,7 +22,7 @@ from tensormet.config import VectorRunConfig
 
 import gc
 
-from frame_semantic_transformer import FrameSemanticTransformer
+from frame_semantic_transformer import FrameSemanticTransformer # This now needs a custom environment!
 from nltk.corpus import framenet as fn
 
 SCHEMA = pa.schema([

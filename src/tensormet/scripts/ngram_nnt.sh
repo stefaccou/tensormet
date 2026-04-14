@@ -1,12 +1,12 @@
 python3 -m tensormet.scripts.nnt \
-           --dataset frame_based \
+           --dataset 4gram \
            --method siiSoftPlus \
            --divergence kl \
            --dim 4000 \
-           --order 5 \
-           --rank 50,50,50,50,50 \
+           --order 4 \
+           --rank 50,50,50,50 \
            --name testMultiDim \
-           --shared-factors "1-2,2-3,3-4" \
+           --shared-factors "0-1,1-2,2-3" \
            --verbose t \
            --max-cpu-frac 0.8 \
            --patience 1000 \
@@ -18,5 +18,6 @@ python3 -m tensormet.scripts.nnt \
            --random-state 1 \
            --normalize-factors true \
            --return-errors full \
-           --overwrite f \
-           --sem-fitness-target 10000
+           --overwrite false \
+           --sem-fitness-target 10000 \
+           --resume t

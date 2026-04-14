@@ -24,7 +24,7 @@ from tensormet.sparse_ops import (
 from tensormet.utils import ThreadBudget, einsum_letters
 # -- Kullback-Leibler Divergence --
 
-def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12):
+def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False):
     """
     One multiplicative KL update for a single factor matrix A_n (for `mode`).
 
@@ -47,6 +47,9 @@ def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None,
     -------
     A : updated factor
     """
+
+    if verbose:
+        print(f"  Updating factor {mode}...")
 
     # Sparse unfolding for this mode
     X = unfold_from_vectorized_sparse(vec_tensor, shape, mode)
@@ -85,78 +88,8 @@ def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None,
     A = tl.clip(A, a_min=epsilon, a_max=None)
     return A
 
-def kl_factor_update_largedim_old(vec_tensor, core, factors, mode, shape, thread_budget, epsilon=1e-12):
-    """
-    One multiplicative KL update for a single factor matrix A_n (for `mode`).
-    Use when dimensions become large to fully avoid reconstruction on GPU.
 
-    Parameters
-    ----------
-    vec_tensor : cupyx.scipy.sparse.coo_matrix
-        Vectorized sparse tensor (COO).
-    shape : tuple[int, ...]
-        Original tensor shape.
-    core : cupy.ndarray
-        Tucker core on GPU (CuPy).
-    factors : list[cupy.ndarray]
-        Tucker factors on GPU (CuPy).
-    mode : int
-        Mode to update.
-    epsilon : float
-        Small positive constant for numerical stability / nonnegativity.
-
-    Returns
-    -------
-    A : updated factor
-    """
-    X = unfold_from_vectorized_sparse(vec_tensor, shape, mode)
-    core_np = tl.to_numpy(core)
-    factors_np = [tl.to_numpy(f) for f in factors]
-    # Dense reconstruction excluding current factor, unfolded along mode
-    tucker = ptl.TuckerTensor(core=core_np,
-                                  factors=factors_np)
-    with thread_budget.limit():
-        Z = ptl_tucker_to_tensor(tucker, skip_factor=mode)
-    Z = ptl.tens2mat(Z, mode)
-
-
-    A = factors[mode]  # (I_mode, R)
-    rows = X.row
-    cols = X.col
-    vals = X.data
-
-    # Compute reconstruction only at nonzeros: R_nz = sum_r A[i,r] * Z[r,j]
-    # A_rows: (nnz, R)
-    A_rows = A[rows, :]
-
-    Z_cols_T = tl.transpose(Z[:, cols.get()])
-    Z_cols_T = cp.asarray(Z_cols_T)
-
-    R_nz = tl.sum(A_rows * Z_cols_T, axis=1)
-    R_nz = tl.clip(R_nz, a_min=epsilon, a_max=None)
-
-
-    # W = X / (A Z) at nonzeros
-
-    W_data = vals / R_nz
-    W = cpx_sparse.coo_matrix((W_data, (rows, cols)), shape=X.shape)
-
-    numerator = W @ tl.transpose(cp.asarray(Z))
-
-
-    # denominator = sum_j Z[r,j] broadcast to (I_mode, R)
-    # den_row = tl.sum(Z, axis=1)  # (R,)
-
-    den_row = tl.sum(Z, axis=1)
-    denominator = den_row[np.newaxis, :]
-    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
-
-    # Multiplicative update
-    A = A * (numerator / (cp.asarray(denominator + 1e-12)))
-    A = tl.clip(A, a_min=epsilon, a_max=None)
-    return A
-
-def kl_core_update(vec_tensor, shape, core, factors, modes, thread_budget, epsilon=1e-12):
+def kl_core_update(vec_tensor, shape, core, factors, modes, thread_budget, epsilon=1e-12, verbose=False):
     """
     One multiplicative KL update for the core tensor.
 
@@ -173,6 +106,9 @@ def kl_core_update(vec_tensor, shape, core, factors, modes, thread_budget, epsil
     -------
     core : updated core.
     """
+    if verbose:
+        print("  Updating core...")
+
     # Build a CPU Tucker object for pytensorlab reconstruction
     core_np = tl.to_numpy(core)
     factors_np = [tl.to_numpy(f) for f in factors]
@@ -221,6 +157,7 @@ def kl_compute_errors(
         factors,
         thread_budget: ThreadBudget,
         epsilon=1e-12,
+        verbose=False,
 ):
 
     """Generalised KL divergence C_KL(X || R) for sparse X.
@@ -230,6 +167,9 @@ def kl_compute_errors(
     core       : current core G
     factors    : list of factor matrices A^{(n)}
     """
+
+    if verbose:
+        print("  Computing KL errors...")
 
     core_np = tl.to_numpy(core)
     factors_np = [tl.to_numpy(f) for f in factors]
@@ -282,7 +222,10 @@ def kl_compute_errors(
 
 
 # -- Frobenius Norm --
-def fr_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12):
+def fr_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False):
+    if verbose:
+        print(f"  Updating factor {mode}...")
+
     # This still explodes! The created Z tensor does not always fit in memory
     X = unfold_from_vectorized_sparse(vec_tensor, shape,
                                              mode)  # this is the same as B when using dense tensor!
@@ -298,7 +241,7 @@ def fr_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None,
     return A
 
 
-def fr_core_update(vec_tensor, shape, core, factors, modes, thread_budget=None, epsilon=1e-12):
+def fr_core_update(vec_tensor, shape, core, factors, modes, thread_budget=None, epsilon=1e-12, verbose=False):
     """
     One multiplicative update for the core tensor.
 
@@ -308,6 +251,9 @@ def fr_core_update(vec_tensor, shape, core, factors, modes, thread_budget=None, 
     -------
     core : updated core.
     """
+
+    if verbose:
+        print("  Updating core...")
 
     numerator = sparse_multi_mode_dot_vec(
         vec_tensor=vec_tensor,
@@ -336,6 +282,7 @@ def fr_compute_errors(
         factors,
         thread_budget: ThreadBudget,
         epsilon=1e-12,
+        verbose=False,
 ):
     """Relative Frobenius error ||X - X̂||_F / ||X||_F for sparse X.
 
@@ -344,6 +291,9 @@ def fr_compute_errors(
     core       : current core G
     factors    : list of factor matrices A^{(n)}
     """
+
+    if verbose:
+        print("  Computing Frobenius errors...")
 
     shape = tuple(shape)
 
@@ -385,7 +335,7 @@ def fr_compute_errors(
     relative_error = residual_norm / norm_X
     return relative_error
 
-def fr_combined_core_errors(vec_tensor, shape, core, factors, modes, thread_budget=None, epsilon=1e-12):
+def fr_combined_core_errors(vec_tensor, shape, core, factors, modes, thread_budget=None, epsilon=1e-12, verbose=False):
     """
         One multiplicative KL update for the core tensor.
 
@@ -395,6 +345,9 @@ def fr_combined_core_errors(vec_tensor, shape, core, factors, modes, thread_budg
         -------
         core : updated core.
         """
+
+    if verbose:
+        print("  Computing combined core/errors...")
 
     numerator = sparse_multi_mode_dot_vec(
         vec_tensor=vec_tensor,
@@ -432,7 +385,9 @@ def null_compute_errors(vec_tensor: cpx_sparse.spmatrix,
         core,
         factors,
         thread_budget: ThreadBudget,
-        epsilon=1e-12,) -> None:
+        epsilon=1e-12,
+        verbose=False,
+) -> None:
     # takes the same input, but returns nothing
     return
 
@@ -462,6 +417,7 @@ def _unravel_cols_for_mode(cols, shape, mode):
 
     idxs = list(reversed(idxs_rev))
     return other_modes, {m: idxs[i] for i, m in enumerate(other_modes)}
+
 def _tucker_den_row_full(core, factors, mode, epsilon=1e-12):
     """
     Exact denominator vector for KL MU update:
@@ -535,29 +491,6 @@ def _rhat_from_factor_rows_sequential(core, mats, epsilon=1e-12):
 
     r_hat = cp.clip(tmp, a_min=epsilon, a_max=None)  # (b,)
     return r_hat
-#
-# def _accumulate_core_num_outer(Num, w, mats):
-#     """
-#     Num: core-shaped accumulator (R0,...,R_{N-1})
-#     w  : (b,)
-#     mats[n]: (b, Rn)
-#
-#     Updates Num in-place: Num += sum_m w[m] * outer(mats0[m], mats1[m], ...)
-#     """
-#     b = w.shape[0]
-#     N = len(mats)
-#
-#     # Build T with shape (b, R0, R1, ..., R_{N-1}) using progressive outer products
-#     T = w[:, None] * mats[0]  # (b, R0)
-#
-#     for n in range(1, N):
-#         # Expand last axis and outer with mats[n]
-#         # T: (b, ..., R_{n-1}) -> (b, ..., R_{n-1}, 1)
-#         # mats[n]: (b, Rn) -> (b, 1, ..., 1, Rn)
-#         T = T[..., None] * mats[n].reshape((b,) + (1,) * (T.ndim - 1) + (mats[n].shape[1],))
-#
-#     # Sum over batch and add to Num
-#     Num += cp.sum(T, axis=0)
 
 def _accumulate_core_num_outer(Num, w, mats):
     """
@@ -767,41 +700,7 @@ def _gpu_free_bytes():
     free_b, total_b = cp.cuda.runtime.memGetInfo()
     return int(free_b)
 
-# def _estimate_batch_num_for_outer(
-#     core,
-#     factors,
-#     safety=0.9,
-#     temp_mult=1.1,
-# ):
-#     """
-#     Much more conservative batch estimate for _accumulate_core_num_outer,
-#     because it often materializes intermediate outer-products / broadcasts.
-#
-#     This is intentionally pessimistic: uses prod(R) scaling as a worst-case.
-#     """
-#     N = len(factors)
-#     dtype = core.dtype
-#
-#     itemsize = int(np.dtype(dtype).itemsize)
-#     R = [int(factors[n].shape[1]) for n in range(N)]
-#     core_size = int(np.prod(R))
-#
-#     # worst-case: per-b element touches/temporaries proportional to core_size
-#     # (many implementations end up with something like (b, core_size) transiently)
-#     bytes_per_b = core_size * itemsize
-#
-#     # plus gathered mats and indices (usually small compared to core_size, but add anyway)
-#     bytes_per_b += sum(R) * itemsize + N * 8
-#     bytes_per_b = int(np.ceil(bytes_per_b * temp_mult))
-#
-#     free_b = _gpu_free_bytes()
-#     budget_b = int(free_b * safety)
-#
-#     b = max(1, budget_b // max(1, bytes_per_b))
-#     return int(b)
-
-
-def _estimate_batch_num_for_outer(core, factors, safety=0.60, temp_mult=2.0):
+def _estimate_batch_num_for_outer(core, factors, safety=0.80, temp_mult=2.0):
     """
     New estimator for the optimized matrix-multiplication accumulator.
     It no longer assumes the materialization of the full core outer product!
@@ -828,7 +727,7 @@ def _estimate_batch_num_for_outer(core, factors, safety=0.60, temp_mult=2.0):
     return min(int(b), hard_cap)
 
 
-def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.40, temp_mult=4.0):  # Increased temp_mult
+def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.60, temp_mult=4.0):  # Increased temp_mult
     N = core.ndim
     R = [int(factors[n].shape[1]) for n in range(N)]
     dtype = core.dtype
@@ -849,7 +748,7 @@ def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.40, temp_mult=4.0
     return max(1, int(b))
 
 
-def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.60, temp_mult=3.0):
+def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.80, temp_mult=2.0):
     """
     Estimate safe batch size for compute_Zcols_batch.
     Uses pure Python math to avoid numpy 32-bit overflows and sets a hard cap.
@@ -890,6 +789,7 @@ def kl_factor_update_largedim(
     thread_budget=None,
     epsilon=1e-12,
     batch_cols=None,
+    verbose=False,
 ):
     """
     KL multiplicative update for Tucker factor A^(mode) WITHOUT building dense Z,
@@ -907,6 +807,9 @@ def kl_factor_update_largedim(
     # rows = X.row
     # cols = X.col
     # vals = X.data
+
+    if verbose:
+        print(f"  Updating factor {mode}...")
 
     if batch_cols is None:
         batch_cols = _estimate_batch_cols_for_Z(core, factors, mode)
@@ -940,7 +843,10 @@ def kl_factor_update_largedim(
     # Decode unique columns once per batch (general N-way unravel)
     other_modes = [m for m in range(len(shape)) if m != mode]
 
-    for start in range(0, int(ucols.size), int(batch_cols)):
+    col_batches = range(0, int(ucols.size), int(batch_cols))
+    if verbose:
+        col_batches = tqdm(col_batches, desc=f"  Factor {mode} col-batches", unit="batch", leave=False)
+    for start in col_batches:
         end = min(start + int(batch_cols), int(ucols.size))
         u = ucols[start:end]
 
@@ -995,7 +901,11 @@ def kl_core_update_largedim(
     epsilon=1e-12,
     batch_rhat=None, # tested, quite efficient up to 8K dims
     batch_num=None, # tested, quite efficient up to 8K dims
+    verbose=False,
 ):
+    if verbose:
+        print("  Updating core...")
+
     if batch_rhat is None:
         batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
     if batch_num is None:
@@ -1020,17 +930,22 @@ def kl_core_update_largedim(
     # Stashing w costs nnz floats; if that's too big, you can stream (see note below).
     w_all = cp.empty_like(xvals)
 
-    for start in range(0, nnz, int(batch_rhat)):
+    rhat_batches = range(0, nnz, int(batch_rhat))
+    if verbose:
+        rhat_batches = tqdm(rhat_batches, desc="  Core r_hat pass", unit="batch", leave=False)
+    for start in rhat_batches:
         end = min(start + int(batch_rhat), nnz)
 
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]  # each (b, Rn)
         r_hat = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon)  # (b,)
         w_all[start:end] = xvals[start:end] / r_hat
 
-
     # --- Pass 2: accumulate numerator in tiny batches (controls peak memory)
     # this takes most time!
-    for start in range(0, nnz, int(batch_num)):
+    num_batches = range(0, nnz, int(batch_num))
+    if verbose:
+        num_batches = tqdm(num_batches, desc="  Core numerator pass", unit="batch", leave=False)
+    for start in num_batches:
         end = min(start + int(batch_num), nnz)
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]
         w = w_all[start:end]
@@ -1058,6 +973,7 @@ def kl_compute_errors_largedim(
     thread_budget=None,          # kept for API compatibility; unused
     epsilon=1e-12,
     batch_rhat=None, # tested up to 8K
+    verbose=False,
 ):
     """
     Relative generalized KL divergence C_KL(X || R) for sparse X,
@@ -1067,6 +983,9 @@ def kl_compute_errors_largedim(
       KL = sum_{nz} [x log(x/r) - x + r] + (sum_R - sum_{nz} r)
       rel_KL = KL / sum_{nz} x
     """
+    if verbose:
+        print("  Computing KL errors...")
+
     if batch_rhat is None:
         batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
 
@@ -1087,7 +1006,10 @@ def kl_compute_errors_largedim(
 
     # --- compute r_nz in batches (like your core update r_hat pass) ---
     r_nz = cp.empty_like(x_nz)
-    for start in range(0, nnz, int(batch_rhat)):
+    rhat_batches = range(0, nnz, int(batch_rhat))
+    if verbose:
+        rhat_batches = tqdm(rhat_batches, desc="  KL error r_hat pass", unit="batch", leave=False)
+    for start in rhat_batches:
         end = min(start + int(batch_rhat), nnz)
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]  # each (b, Rn)
         r_nz[start:end] = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon)
@@ -1119,6 +1041,7 @@ def fr_factor_update_largedim(
     epsilon=1e-12,
     thread_budget=None, # kept for API compatibility; unused
     batch_cols=None,
+    verbose=False,
 ):
     """
     Frobenius (Euclidean) multiplicative update for Tucker factor A^(mode)
@@ -1135,6 +1058,9 @@ def fr_factor_update_largedim(
     # rows = X.row
     # cols = X.col
     # vals = X.data
+    if verbose:
+        print(f"  Updating factor {mode}...")
+
     if batch_cols is None:
         batch_cols = _estimate_batch_cols_for_Z(core, factors, mode)
     # new: avoid X buildup for large dimensions
@@ -1163,7 +1089,10 @@ def fr_factor_update_largedim(
     ucols, inv = cp.unique(cols, return_inverse=True)
     other_modes = [m for m in range(len(shape)) if m != mode]
 
-    for start in range(0, int(ucols.size), int(batch_cols)):
+    col_batches = range(0, int(ucols.size), int(batch_cols))
+    if verbose:
+        col_batches = tqdm(col_batches, desc=f"  Factor {mode} col-batches", unit="batch", leave=False)
+    for start in col_batches:
         end = min(start + int(batch_cols), int(ucols.size))
         u = ucols[start:end]
 
@@ -1208,6 +1137,7 @@ def fr_core_update_largedim(
     thread_budget=None,      # kept for API compatibility
     epsilon=1e-12,
     batch_num=64,
+    verbose=False,
 ):
     """
     Frobenius (Euclidean) multiplicative update for the Tucker core WITHOUT dense recon.
@@ -1219,6 +1149,9 @@ def fr_core_update_largedim(
 
     but numerator is accumulated by streaming NNZ and building only core-sized tensors.
     """
+    if verbose:
+        print("  Updating core...")
+
     if batch_num is None:
         batch_num = _estimate_batch_num_for_outer(core, factors)
     shape = tuple(int(s) for s in shape)
@@ -1240,7 +1173,10 @@ def fr_core_update_largedim(
     # --- numerator: core-shaped accumulator, streamed over NNZ ---
     Num = cp.zeros_like(core)
     # small batches keep peak memory down (like your pass-2 accumulator)
-    for start in range(0, nnz, int(batch_num)):
+    num_batches = range(0, nnz, int(batch_num))
+    if verbose:
+        num_batches = tqdm(num_batches, desc="  Core numerator pass", unit="batch", leave=False)
+    for start in num_batches:
         end = min(start + int(batch_num), nnz)
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]  # each (b, Rn)
         w = xvals[start:end]  # Frobenius numerator uses X directly (no X/R like KL)
@@ -1264,6 +1200,7 @@ def fr_compute_errors_largedim(
     thread_budget=None,     # API compatibility; unused
     epsilon=1e-12,
     batch_rhat=1000,        # same role as in KL error
+    verbose=False,
 ):
     """
     Relative Frobenius error ||X - X̂||_F / ||X||_F for sparse X,
@@ -1276,6 +1213,9 @@ def fr_compute_errors_largedim(
       - <X, X̂>   = sum_{nz} x * x̂  where x̂ computed at nz by Tucker contraction
       - ||X̂||_F^2 = <core, core ×_n (A_n^T A_n)> (exact, no dense X̂)
     """
+    if verbose:
+        print("  Computing Frobenius errors...")
+
     if batch_rhat is None:
         batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
     shape = tuple(int(s) for s in shape)
@@ -1307,7 +1247,10 @@ def fr_compute_errors_largedim(
     # --- compute xhat_nz in batches (same technique as KL error) ---
     inner_prod = cp.asarray(0.0, dtype=core.dtype)
 
-    for start in range(0, nnz, int(batch_rhat)):
+    rhat_batches = range(0, nnz, int(batch_rhat))
+    if verbose:
+        rhat_batches = tqdm(rhat_batches, desc="  Frobenius error r_hat pass", unit="batch", leave=False)
+    for start in rhat_batches:
         end = min(start + int(batch_rhat), nnz)
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]  # (b, Rn)
         xhat_b = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon)  # (b,)
@@ -1325,3 +1268,146 @@ def fr_compute_errors_largedim(
     residual_norm = cp.sqrt(residual_sq)
 
     return residual_norm / cp.maximum(norm_X, epsilon)
+
+
+
+def fr_factor_update_largedim_tier1(
+    vec_tensor,
+    core,
+    factors,
+    mode,
+    shape,
+    epsilon=1e-12,
+    thread_budget=None,
+    batch_cols=None,
+    verbose=False,
+):
+    if verbose:
+        print(f"  Updating factor {mode}...")
+
+    if batch_cols is None:
+        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode)
+
+    flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
+    idxs = _unravel_flat_indices_C(flat, shape)
+    rows = idxs[mode]
+    nnz = int(flat.size)
+
+    other_modes = [m for m in range(len(shape)) if m != mode]
+    other_coords = [idxs[m] for m in other_modes]
+    other_shape = tuple(shape[m] for m in other_modes)
+    cols = safe_ravel(tuple(other_coords), other_shape, cp)
+
+    A = factors[mode]
+    I_mode, R = int(A.shape[0]), int(A.shape[1])
+
+    # Denominator: exact Gram — unchanged
+    Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon)
+    denominator = cp.clip(A @ Gram, a_min=epsilon, a_max=None)
+
+    # Deduplicate columns for efficient Z computation
+    ucols, inv = cp.unique(cols, return_inverse=True)
+    n_ucols = int(ucols.size)
+
+    # Pre-allocate Z for all unique columns in one go
+    Z_unique = cp.zeros((n_ucols, R), dtype=core.dtype)
+
+    col_batches = range(0, n_ucols, int(batch_cols))
+    if verbose:
+        col_batches = tqdm(col_batches, desc=f"  Factor {mode} Z-batches", unit="batch", leave=False)
+
+    for start in col_batches:
+        end = min(start + int(batch_cols), n_ucols)
+        u = ucols[start:end]
+        _, idxs_by_mode = _unravel_cols_for_mode(u, shape, mode)
+        Z_unique[start:end] = compute_Zcols_batch(
+            core=core, factors=factors, mode=mode,
+            other_modes=other_modes, idxs_by_mode=idxs_by_mode, epsilon=epsilon,
+        )
+
+    # GPU gather: expand unique Z to all NNZ — fully parallel, no scatter
+    Z_nz = Z_unique[inv]  # (nnz, R)
+
+    # Build sparse S: shape (I_mode, nnz), S[row_k, k] = val_k
+    # Then numerator = S @ Z_nz via cuSPARSE SpMM — replaces cp.add.at
+    k_idx = cp.arange(nnz, dtype=cp.int32)
+    S = cpx_sparse.csr_matrix(
+        (vals, (rows.astype(cp.int32), k_idx)),
+        shape=(I_mode, nnz),
+    )
+    numerator = cp.clip(S @ Z_nz, a_min=epsilon, a_max=None)
+
+    A_new = cp.clip(A * (numerator / (denominator + 1e-12)), a_min=epsilon, a_max=None)
+    return A_new
+
+
+def kl_factor_update_largedim_tier1(
+    vec_tensor,
+    core,
+    factors,
+    mode,
+    shape,
+    thread_budget=None,
+    epsilon=1e-12,
+    batch_cols=None,
+    verbose=False,
+):
+    if verbose:
+        print(f"  Updating factor {mode}...")
+
+    if batch_cols is None:
+        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode)
+
+    flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
+    idxs = _unravel_flat_indices_C(flat, shape)
+    rows = idxs[mode]
+    nnz = int(flat.size)
+
+    other_modes = [m for m in range(len(shape)) if m != mode]
+    other_coords = [idxs[m] for m in other_modes]
+    other_shape = tuple(shape[m] for m in other_modes)
+    cols = safe_ravel(tuple(other_coords), other_shape, cp)
+
+    A = factors[mode]
+    I_mode, R = int(A.shape[0]), int(A.shape[1])
+
+    # Exact denominator (no approximation)
+    den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon)
+    denominator = den_row[None, :]  # (1, R)
+
+    ucols, inv = cp.unique(cols, return_inverse=True)
+    n_ucols = int(ucols.size)
+
+    Z_unique = cp.zeros((n_ucols, R), dtype=core.dtype)
+
+    col_batches = range(0, n_ucols, int(batch_cols))
+    if verbose:
+        col_batches = tqdm(col_batches, desc=f"  Factor {mode} Z-batches", unit="batch", leave=False)
+
+    for start in col_batches:
+        end = min(start + int(batch_cols), n_ucols)
+        u = ucols[start:end]
+        _, idxs_by_mode = _unravel_cols_for_mode(u, shape, mode)
+        Z_unique[start:end] = compute_Zcols_batch(
+            core=core, factors=factors, mode=mode,
+            other_modes=other_modes, idxs_by_mode=idxs_by_mode, epsilon=epsilon,
+        )
+
+    # GPU gather — parallel, zero contention
+    Z_nz = Z_unique[inv]  # (nnz, R)
+
+    # KL weights: w_k = x_k / (A[row_k] · Z_nz[k])
+    A_rows = A[rows]                                         # (nnz, R)
+    R_nz = cp.clip(cp.sum(A_rows * Z_nz, axis=1), a_min=epsilon, a_max=None)  # (nnz,)
+    w = vals / R_nz                                          # (nnz,)
+
+    # SpMM: numerator = S_W @ Z_nz  where S_W[row_k, k] = w_k
+    k_idx = cp.arange(nnz, dtype=cp.int32)
+    S_W = cpx_sparse.csr_matrix(
+        (w, (rows.astype(cp.int32), k_idx)),
+        shape=(I_mode, nnz),
+    )
+    numerator = cp.clip(S_W @ Z_nz, a_min=epsilon, a_max=None)
+
+    A_new = cp.clip(A * (numerator / (denominator + 1e-12)), a_min=epsilon, a_max=None)
+    return A_new
