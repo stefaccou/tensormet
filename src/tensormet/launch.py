@@ -33,7 +33,12 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
     - optionally notifies discord
     """
     # cfg is expected to be VectorRunConfig (cfg.exp is VectorExperimentConfig)
-    from tensormet.vector_creation import create_vectors_parquet_sharded, create_frame_vectors_parquet_sharded
+    from tensormet.vector_creation import (
+        create_vectors_parquet_sharded,
+        create_frame_vectors_parquet_sharded,
+        create_ngram_vectors_parquet_sharded,
+    )
+    from tensormet.config import parse_ngram_orders
 
     output_dir = cfg.output_dir()
     print("output_dir: ", output_dir)
@@ -66,11 +71,16 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
 
     start_time = time.time()
 
-    # If you want the same stdout capture style as decomposition:
+    _orders = parse_ngram_orders(cfg.exp.type)
     if cfg.exp.type == "frames":
         print('Frame-based vector creation')
         with tee_output(log_path):
             summary = create_frame_vectors_parquet_sharded(cfg, overwrite=do_overwrite)
+    elif _orders is not None:
+        orders_str = ", ".join(f"{n}-gram" for n in _orders)
+        print(f'N-gram vector creation ({orders_str})')
+        with tee_output(log_path):
+            summary = create_ngram_vectors_parquet_sharded(cfg, overwrite=do_overwrite)
     else:
         print("Syntactic slot-based vector creation")
         with tee_output(log_path):
@@ -101,8 +111,11 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
     return summary
 
 
-def launch_nnt_decomposition(cfg, gpu_id=None):
+def launch_nnt_decomposition(cfg):
     thread_budget = ThreadBudget(n_threads=compute_num_threads(cfg.exp.max_cpu_frac))
+    _n_gpus = getattr(cfg.train, "n_gpus", 1)
+    _gpu_id = getattr(cfg.train, "gpu_id", None)
+    select_gpu(gpu_id=_gpu_id, n_gpus=_n_gpus)
 
     # load in GPU sensitive modules only AFTER device has been set!
     import torch
@@ -226,7 +239,7 @@ def launch_nnt_decomposition(cfg, gpu_id=None):
     tucker_decomp_torch = TuckerTensor((core_t, factors_t))
 
     torch.save(tucker_decomp_torch, paths["model"])
-    np.save(paths["errors"], np.asarray(errors, dtype=float))
+    np.save(paths["errors"], np.array([e.get() if hasattr(e, "get") else float(e) for e in errors], dtype=float))
 
     if fitness_scores:
         last = fitness_scores[-1]

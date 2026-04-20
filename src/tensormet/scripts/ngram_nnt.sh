@@ -1,23 +1,26 @@
 python3 -m tensormet.scripts.nnt \
-           --dataset 4gram \
+           --dataset 5gram \
            --method siiSoftPlus \
            --divergence kl \
            --dim 4000 \
-           --order 4 \
-           --rank 50,50,50,50 \
-           --name testMultiDim \
+           --order 5 \
+           --rank 50 \
+           --name frac \
            --shared-factors "0-1,1-2,2-3" \
            --verbose t \
            --max-cpu-frac 0.8 \
            --patience 1000 \
            --iterations 1000  \
-           --rec-log-every 2 \
+           --rec-log-every 1 \
            --largedim true \
            --sem-check-every 10 \
-           --checkpoint-saving-steps 25 \
+           --checkpoint-saving-steps 50 \
            --random-state 1 \
            --normalize-factors true \
            --return-errors full \
            --overwrite false \
            --sem-fitness-target 10000 \
-           --resume t
+           --sem-error-type all \
+           --resume t \
+           --n-gpus 3 \
+           --subsample-frac 0.01

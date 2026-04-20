@@ -5,7 +5,7 @@ import os
 
 import torch
 from tqdm import tqdm
-from tensormet.utils import DATA_DIR, shared_factor_suffix, linked_factor_groups
+from tensormet.utils import DATA_DIR, shared_factor_suffix, linked_factor_groups, SparseCOOTensor, _INT64_MAX
 import pickle
 
 import pyarrow as pa
@@ -14,6 +14,19 @@ import pyarrow.dataset as ds
 
 from itertools import combinations
 from functools import reduce
+
+def _make_sparse_coo(idx: torch.Tensor, values: torch.Tensor, size: tuple):
+    """
+    Create a sparse COO tensor, falling back to SparseCOOTensor when
+    prod(size) would overflow int64 (e.g. 5-gram with top_k >= ~9500).
+    """
+    numel = 1
+    for d in size:
+        numel *= d
+        if numel > _INT64_MAX:
+            return SparseCOOTensor(idx, values, size)
+    return torch.sparse_coo_tensor(idx, values, size=size)
+
 
 # -- parquet helpers --
 def _normalize_str_array(arr: pa.Array) -> pa.Array:
@@ -263,7 +276,7 @@ def _most_common_keys(counter: Counter, k: int) -> list:
 #     results = {}
 #
 #     for top_k in top_ks:
-#         print(f"\nBuilding tensors for top_k={top_k} (no rescan) ...")
+#         print(f"\nBuilding tensors for top_k={top_k} ...")
 #
 #         vocab_v = vocab_v_max[:top_k]
 #         vocab_s = vocab_s_max[:top_k]
@@ -619,7 +632,7 @@ def populate_tensors_parquet(
     results = {}
 
     for top_k in top_ks:
-        print(f"\nBuilding tensors for top_k={top_k} (no rescan) ...")
+        print(f"\nBuilding tensors for top_k={top_k}...")
         vocabs = {col:vocabs_max[col][:top_k] for col in cols_to_build}
         col2i = {col:{el:i for i, el in enumerate(vocabs[col])} for col in cols_to_build}
 
@@ -649,17 +662,17 @@ def populate_tensors_parquet(
         if len(indices) == 0:
             idx = torch.empty((len(cols_to_build), 0), dtype=torch.long)
             empty = torch.empty((0,), dtype=torch.float32)
-            count_tensor = torch.sparse_coo_tensor(idx, empty, size=size).coalesce()
-            sii_tensor = torch.sparse_coo_tensor(idx, empty, size=size).coalesce()
-            sc_tensor = torch.sparse_coo_tensor(idx, empty, size=size).coalesce()
+            count_tensor = _make_sparse_coo(idx, empty, size).coalesce()
+            sii_tensor = _make_sparse_coo(idx, empty, size).coalesce()
+            sc_tensor = _make_sparse_coo(idx, empty, size).coalesce()
         else:
             # Convert to tensors and explicitly cast to long
             idx = torch.tensor(indices, dtype=torch.long).t().contiguous()
 
             # Create tensors
-            count_tensor = torch.sparse_coo_tensor(idx, torch.tensor(count_values, dtype=torch.float32), size=size)
-            sii_tensor = torch.sparse_coo_tensor(idx, torch.tensor(sii_values, dtype=torch.float32), size=size)
-            sc_tensor = torch.sparse_coo_tensor(idx, torch.tensor(sc_values, dtype=torch.float32), size=size)
+            count_tensor = _make_sparse_coo(idx, torch.tensor(count_values, dtype=torch.float32), size)
+            sii_tensor = _make_sparse_coo(idx, torch.tensor(sii_values, dtype=torch.float32), size)
+            sc_tensor = _make_sparse_coo(idx, torch.tensor(sc_values, dtype=torch.float32), size)
 
             # CRITICAL: Clear Python lists from memory before coalescing
             del indices
@@ -675,16 +688,16 @@ def populate_tensors_parquet(
         eps = 1e-8
         if sii_tensor._nnz():
             vvals = sii_tensor.values()
-            sii_shifted = torch.sparse_coo_tensor(sii_tensor.indices(), vvals - vvals.min() + eps, size=size).coalesce()
-            sii_softplus = torch.sparse_coo_tensor(sii_tensor.indices(), torch.nn.functional.softplus(vvals), size=size).coalesce()
+            sii_shifted = _make_sparse_coo(sii_tensor.indices(), vvals - vvals.min() + eps, size).coalesce()
+            sii_softplus = _make_sparse_coo(sii_tensor.indices(), torch.nn.functional.softplus(vvals), size).coalesce()
         else:
             sii_shifted = sii_tensor
             sii_softplus = sii_tensor
 
         if sc_tensor._nnz():
             vvals = sc_tensor.values()
-            sc_shifted = torch.sparse_coo_tensor(sc_tensor.indices(), vvals - vvals.min() + eps, size=size).coalesce()
-            sc_softplus = torch.sparse_coo_tensor(sc_tensor.indices(), torch.nn.functional.softplus(vvals), size=size).coalesce()
+            sc_shifted = _make_sparse_coo(sc_tensor.indices(), vvals - vvals.min() + eps, size).coalesce()
+            sc_softplus = _make_sparse_coo(sc_tensor.indices(), torch.nn.functional.softplus(vvals), size).coalesce()
         else:
             sc_shifted = sc_tensor
             sc_softplus = sc_tensor

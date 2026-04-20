@@ -4,7 +4,37 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, Union, Set, Any
 import hashlib
 import json
-from tensormet.utils import DATA_DIR
+import re
+from tensormet.utils import DATA_DIR, shared_factor_suffix, nontrivial_linked_groups
+
+
+def parse_ngram_order(type_str: str) -> Optional[int]:
+    """Parse a single n-gram type string like '3gram', '3-gram' → n (int).
+
+    Returns None if the string is not a recognised n-gram pattern.
+    Does not handle comma-separated multi-gram strings; use parse_ngram_orders for that.
+    """
+    m = re.fullmatch(r"(\d+)-?gram", type_str.strip().lower())
+    return int(m.group(1)) if m else None
+
+
+def parse_ngram_orders(type_str: str) -> Optional[list]:
+    """Parse single or comma-separated n-gram type strings → sorted list of ints.
+
+    Examples:
+        "3gram"         → [3]
+        "4-gram"        → [4]
+        "4gram,5gram"   → [4, 5]
+        "3-gram,4gram,5-gram" → [3, 4, 5]
+        "syntactic"     → None
+    """
+    orders = []
+    for part in type_str.split(","):
+        n = parse_ngram_order(part.strip())
+        if n is None:
+            return None   # any non-ngram token → not an ngram type string
+        orders.append(n)
+    return sorted(set(orders)) if orders else None
 
 @dataclass(frozen=True)
 class TrainingConfig:
@@ -21,6 +51,10 @@ class TrainingConfig:
     largedim: bool = False
     checkpoint_saving_steps: int = 0 # defaults to 0 -> Falsy
     resume: bool = False  # <-- ADDED for checkpoint resumption
+    n_gpus: int = 1  # number of GPUs for NNZ sharding; 1 = single-GPU fallback
+    gpu_id: Optional[Union[int, Tuple[int, ...]]] = None  # one int or tuple of ints to pin; None = auto-select
+    subsample_frac: float = 1.0    # fraction of NNZ per update; 1.0 = exact
+    subsample_warmup: int = 0      # iterations using full NNZ before stochastic mode begins
 
 @dataclass(frozen=True)
 class EvalConfig:
@@ -78,8 +112,11 @@ class RunConfig:
         # deterministic + readable
         r0 = self.exp.rank[0] if len(self.exp.rank) else "r"
         prefix = f"{self.exp.name}_" if self.exp.name else ""
+        linked_nontrivial = nontrivial_linked_groups(self.train.shared_factors, num_factors=self.exp.order)
+        sf_suffix = shared_factor_suffix(linked_nontrivial)
+        ss_suffix = f"_{str(self.train.subsample_frac).replace('.', 'p')}ss" if self.train.subsample_frac != 1.0 else ""
         return (f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_"
-                f"{self.exp.dim}d_{r0}r_{self.train.n_iter_max}i.pt")
+                f"{self.exp.dim}d{sf_suffix}_{r0}r{ss_suffix}_{self.train.n_iter_max}i.pt")
 
     def model_path(self) -> Path:
         return self.output_dir() / self.model_filename()
@@ -133,11 +170,21 @@ class RunConfig:
         # Try new naming first (includes {order}D_), then fall back to legacy (no order prefix).
         r0 = self.exp.rank[0] if len(self.exp.rank) else "r"
         prefix = f"{self.exp.name}_" if self.exp.name else ""
-        new_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{self.exp.dim}d_{r0}r_"
+        linked_nontrivial = nontrivial_linked_groups(self.train.shared_factors, num_factors=self.exp.order)
+        sf_suffix = shared_factor_suffix(linked_nontrivial)
+        ss_suffix = f"_{str(self.train.subsample_frac).replace('.', 'p')}ss" if self.train.subsample_frac != 1.0 else ""
+        new_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{self.exp.dim}d{sf_suffix}_{r0}r{ss_suffix}_"
         legacy_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.dim}d_{r0}r_"
 
-        # Find all JSON config files matching either pattern
+        # Pattern without shared-factor suffix, for legacy fallback when sf_suffix is set
+        new_pattern_no_sf = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{self.exp.dim}d_{r0}r{ss_suffix}_"
+
+        # Find all JSON config files: new (with sf_suffix) → new (without sf_suffix) → legacy
         candidate_configs = list(out_dir.glob(f"{new_pattern}*i_config.json"))
+        if not candidate_configs and sf_suffix:
+            candidate_configs = list(out_dir.glob(f"{new_pattern_no_sf}*i_config.json"))
+            if candidate_configs:
+                print(f"No shared-factor checkpoints found; falling back to non-shared naming.")
         if not candidate_configs:
             candidate_configs = list(out_dir.glob(f"{legacy_pattern}*i_config.json"))
             if candidate_configs:
@@ -174,18 +221,21 @@ class RunConfig:
                     tuple(old_exp.get("rank", [])) == tuple(self.exp.rank) and
                     old_train.get("init") == self.train.init and
                     _canonical_shared_factors(old_train.get("shared_factors")) ==
-                    _canonical_shared_factors(self.train.shared_factors)
+                    _canonical_shared_factors(self.train.shared_factors) and
+                    float(old_train.get("subsample_frac", 1.0)) == self.train.subsample_frac
             )
-            print(old_exp.get("dataset"), self.exp.dataset, "\n",
-            old_exp.get("method"),self.exp.method, "\n",
-            old_exp.get("order"),self.exp.order, "\n", #new: order
-            old_exp.get("divergence"), self.exp.divergence, "\n",
-            old_exp.get("dim"), self.exp.dim, "\n",
-            tuple(old_exp.get("rank", [])), tuple(self.exp.rank), "\n",
-            old_train.get("init"), self.train.init, "\n",
+
+            print(old_exp.get("dataset"), self.exp.dataset, "\t",
+            old_exp.get("method"),self.exp.method, "\t",
+            old_exp.get("order"),self.exp.order, "\t", #new: order
+            old_exp.get("divergence"), self.exp.divergence, "\t",
+            old_exp.get("dim"), self.exp.dim, "\t",
+            tuple(old_exp.get("rank", [])), tuple(self.exp.rank), "\t",
+            old_train.get("init"), self.train.init, "\t",
             # Cast both to string to safely compare parsed JSON strings with Python sets
             _canonical_shared_factors(old_train.get("shared_factors")),
-            _canonical_shared_factors(self.train.shared_factors))
+            _canonical_shared_factors(self.train.shared_factors), "\t",
+            float(old_train.get("subsample_frac", 1.0)), self.train.subsample_frac)
 
 
             if is_compatible:
@@ -299,6 +349,9 @@ class VectorExperimentConfig:
     # logging
     log_every_s: float = 30.0
 
+    # optional custom path label (replaces dataset+config in output paths)
+    name: Optional[str] = None
+
 @dataclass(frozen=True)
 class HFStreamConfig:
     """How to stream texts from a HF dataset."""
@@ -335,10 +388,25 @@ class VectorRunConfig:
     exp: VectorExperimentConfig
     hf: HFStreamConfig
 
-    def output_dir(self) -> Path:
+    def _path_label(self) -> str:
+        """Label used in output paths: custom name if set, otherwise '{dataset}_{config}'."""
+        if self.exp.name:
+            return self.exp.name
         dataset = self.hf.path.replace("/", "-").strip()
         config = (self.hf.config or "").replace("/", "-").strip()
-        return self.exp.output_dir / f"{dataset}_{config}_{self.exp.target_vectors}v"
+        return f"{dataset}_{config}"
+
+    def output_dir(self) -> Path:
+        label = self._path_label()
+        if parse_ngram_orders(self.exp.type) is not None:
+            # shared base dir for all n-gram orders from this run
+            return self.exp.output_dir / f"ngrams_{label}_{self.exp.target_vectors}v"
+        return self.exp.output_dir / f"{label}_{self.exp.target_vectors}v"
+
+    def ngram_dir(self, n: int) -> Path:
+        """Per-order n-gram parquet directory: {n}-gram-{label}_{target_vectors}."""
+        label = self._path_label()
+        return self.exp.output_dir / f"{n}-gram-{label}_{self.exp.target_vectors}"
 
 
 @dataclass(frozen=True)

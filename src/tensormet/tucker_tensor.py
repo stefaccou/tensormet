@@ -4,6 +4,7 @@ import sparse
 import torch
 import json
 import cupy as cp
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 import cupyx.scipy.sparse as cpx_sparse
@@ -27,12 +28,22 @@ from tensormet.utils import (DATA_DIR,
                             nontrivial_linked_groups,
                             voc_index,
                             extract_roles_from_vocab,
-                            einsum_letters
+                            einsum_letters,
+                            SparseCOOTensor,
                    )
 from tensormet.sparse_ops import initialize_nonnegative_tucker
 from tensormet.similarity import evaluate_sample, get_eval_num_threads
-from tensormet.routing import get_update_routing_step, get_log_step
-
+from tensormet.routing import get_update_routing_step, get_log_step, UpdateRouting
+from tensormet.stochastic_sparse import subsample_coo, make_iteration_rng
+from tensormet.sharded_sparse import (
+            ShardedSparseTensor,
+            make_sharded_kl_factor_update,
+            make_sharded_fr_factor_update,
+            make_sharded_kl_core_update,
+            make_sharded_fr_core_update,
+            make_sharded_kl_compute_errors,
+            make_sharded_fr_compute_errors,
+        )
 import time
 
 def _to_np(x):
@@ -110,10 +121,11 @@ class TuckerDecomposition:
                        rank: int=100,
                        order: int=3,
                        iterations: int|None=None,
-                       factor_sharing: bool|set=False,
+                       factor_sharing: bool|set|str=False,
                        map_location: str="cpu",
                        name: Optional[str]=None,
                        tier1: bool=False,
+                       subsample_frac: float=1.0,
                           ) -> "TuckerDecomposition":
 
         """Loads a precomputed tucker decomposition from disk.
@@ -141,7 +153,9 @@ class TuckerDecomposition:
         parsed_shared = None
         suffix = ""
 
-        if factor_sharing is True:
+        if factor_sharing == "all":
+            parsed_shared = {(i, j) for i in range(order) for j in range(i + 1, order)}
+        elif factor_sharing is True:
             parsed_shared = {(1, 2)}
         elif isinstance(factor_sharing, set) and factor_sharing:
             for item in factor_sharing:
@@ -169,13 +183,17 @@ class TuckerDecomposition:
             raise FileNotFoundError(f"Missing vocab file. Checked {vocab_path_new} and {vocab_path_old}")
 
 
+
         decomp_path = os.path.join(base, "decomposition")
         # Construct candidate prefixes: new naming first, legacy fallback.
-        # New format (post N-D migration): {name}{div}_{method}_{order}D_{dims}d_{rank}r_
-        # Legacy format (3D only):         {name}{div}_{method}_{dims}d_{rank}r_
+        # New format: {name}{div}_{method}_{order}D_{dims}d{sf_suffix}_{rank}r_
+        # Legacy format (3D only): {name}{div}_{method}_{dims}d_{rank}r_
         name_prefix = f"{name + '_' if name else ''}"
-        new_file_prefix    = f"{name_prefix}{divergence}_{method}_{order}D_{dims}d_{rank}r_"
-        legacy_file_prefix = f"{name_prefix}{divergence}_{method}_{dims}d_{rank}r_"
+        ss_suffix = f"_{str(subsample_frac).replace('.', 'p')}ss" if subsample_frac != 1.0 else ""
+
+        new_file_prefix      = f"{name_prefix}{divergence}_{method}_{order}D_{dims}d{suffix}_{rank}r{ss_suffix}_"
+        new_file_prefix_no_sf = f"{name_prefix}{divergence}_{method}_{order}D_{dims}d_{rank}r{ss_suffix}_"
+        legacy_file_prefix   = f"{name_prefix}{divergence}_{method}_{dims}d_{rank}r_"
 
         def _find_highest_iter(decomp_dir: str, prefix: str) -> int:
             highest = -1
@@ -190,6 +208,13 @@ class TuckerDecomposition:
         # Look for the highest iteration option if not specified
         if not iterations:
             highest_iter = _find_highest_iter(decomp_path, new_file_prefix)
+            if highest_iter != -1:
+                file_prefix = new_file_prefix
+            elif suffix:
+                highest_iter = _find_highest_iter(decomp_path, new_file_prefix_no_sf)
+                if highest_iter != -1:
+                    print(f"No shared-factor decomposition found; falling back to non-shared naming.")
+                    file_prefix = new_file_prefix_no_sf
             if highest_iter == -1:
                 highest_iter = _find_highest_iter(decomp_path, legacy_file_prefix)
                 if highest_iter != -1:
@@ -200,14 +225,15 @@ class TuckerDecomposition:
                         f"Could not find any decomposition files in {decomp_path} "
                         f"matching '{new_file_prefix}' or '{legacy_file_prefix}'"
                     )
-            else:
-                file_prefix = new_file_prefix
             iterations = highest_iter
         else:
             # When iterations is given explicitly, prefer new naming, fall back to legacy.
             file_prefix = new_file_prefix
             if not os.path.exists(os.path.join(decomp_path, f"{new_file_prefix}{iterations}i.pt")):
-                if os.path.exists(os.path.join(decomp_path, f"{legacy_file_prefix}{iterations}i.pt")):
+                if suffix and os.path.exists(os.path.join(decomp_path, f"{new_file_prefix_no_sf}{iterations}i.pt")):
+                    print(f"No shared-factor decomposition found; falling back to non-shared naming.")
+                    file_prefix = new_file_prefix_no_sf
+                elif os.path.exists(os.path.join(decomp_path, f"{legacy_file_prefix}{iterations}i.pt")):
                     print(f"No new-style ({order}D) decomposition found; falling back to legacy naming.")
                     file_prefix = legacy_file_prefix
 
@@ -1410,7 +1436,7 @@ def cupy_to_torch_sparse(
             indices_np = np.vstack([row_np, col_np])
         else:
             # --- decode block encoding ---
-            size = int(np.prod(shape))
+            size = math.prod(shape)  # arbitrary-precision; never overflows
             int32_max = np.iinfo(np.int32).max
             block_size = min(size, int32_max)
 
@@ -1442,7 +1468,7 @@ def torch_sparse_to_cupy(
     Returns:
         (cupy_coo_matrix, original_shape)
     """
-    if not x.is_sparse:
+    if not (isinstance(x, (torch.Tensor, SparseCOOTensor)) and x.is_sparse):
         raise TypeError("torch_sparse_to_cupy expects a torch sparse tensor (COO).")
     x = x.coalesce()
     indices = x.indices()  # (ndim, nnz)
@@ -1465,7 +1491,7 @@ def torch_sparse_to_cupy(
     else:
         # --- NEW BLOCK ENCODING ---
         coords = [indices_np[d] for d in range(ndim)]
-        size = int(np.prod(shape))  # prod of original N-D shape
+        size = math.prod(shape)  # arbitrary-precision; never overflows
         flat = np.ravel_multi_index(coords, shape)  # 0..size-1
 
         int32_max = np.iinfo(np.int32).max
@@ -1510,7 +1536,7 @@ class SparseTupleTensor:
             dims: int = 1000,
             map_location: str = "cpu",
             tier1: bool = False,
-            shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None,
+            shared_factors: Optional[Union[Tuple[Tuple[int, int], ...], str]] = None,
     ) -> "SparseTupleTensor":
         """
         Load a populated sparse tensor from disk.
@@ -1531,6 +1557,9 @@ class SparseTupleTensor:
 
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
+
+        if shared_factors == "all":
+            shared_factors = tuple(sorted((i, j) for i in range(order) for j in range(i + 1, order)))
 
         linked_nontrivial = nontrivial_linked_groups(shared_factors, num_factors=order)
         suffix = shared_factor_suffix(linked_nontrivial)
@@ -1600,8 +1629,8 @@ class SparseTupleTensor:
                 raise NotImplementedError("sparsity_type must be one of {'dense', None, 'cupy', 'tensorflow','torch'}")
 
         elif sparse_type == "sparse":
-            # can only work from a sparse torch tensor
-            if not isinstance(self.tensor, torch.Tensor) or not self.tensor.is_sparse:
+            # can only work from a sparse torch tensor (or SparseCOOTensor)
+            if not (isinstance(self.tensor, (torch.Tensor, SparseCOOTensor)) and self.tensor.is_sparse):
                 raise TypeError("sparse expects self.tensor to be a torch sparse tensor.")
             coords = self.tensor.indices().numpy()       # shape (nnz, ndim)
             data   = self.tensor.values().numpy()        # shape (nnz,)
@@ -1610,7 +1639,7 @@ class SparseTupleTensor:
             return sparse_tensor
 
         elif sparse_type == "cupy":
-            if not isinstance(self.tensor, torch.Tensor) or not self.tensor.is_sparse:
+            if not (isinstance(self.tensor, (torch.Tensor, SparseCOOTensor)) and self.tensor.is_sparse):
                 raise TypeError("cupy expects self.tensor to be a torch sparse tensor.")
             tensor_cupy, shape = torch_sparse_to_cupy(self.tensor)
             return tensor_cupy
@@ -1627,6 +1656,8 @@ class SparseTupleTensor:
 
 
     def tensor_to_dense(self):
+        if isinstance(self.tensor, SparseCOOTensor):
+            raise TypeError("tensor_to_dense is not supported for SparseCOOTensor (numel overflow).")
         if not isinstance(self.tensor, torch.Tensor) or not self.tensor.is_sparse:
             raise TypeError("tensor_to_dense expects self.tensor to be a torch sparse tensor.")
         self.tensor = self.tensor.to_dense()
@@ -1758,6 +1789,21 @@ class SparseTupleTensor:
         else:
             core, factors = initialize_nonnegative_tucker(self.tensor, shape, rank, modes, init, random_state)
 
+        # --- multi-GPU shard initialisation ---
+
+        _n_gpus = getattr(cfg.train, "n_gpus", 1)
+        _subsample_frac = getattr(cfg.train, "subsample_frac", 1.0)
+        _subsample_warmup = getattr(cfg.train, "subsample_warmup", 0)
+        if _n_gpus > 1:
+            _sst = ShardedSparseTensor.from_coo(
+                self.tensor, shape, device_ids=list(range(_n_gpus)),
+                subsample_frac=_subsample_frac,
+            )
+        else:
+            _sst = None
+
+        # --- stochastic subsampling RNG (single-GPU path) ---
+        _iter_rng = make_iteration_rng(cfg.exp.random_state) if _subsample_frac < 1.0 else None
 
         linked_factors = defaultdict(set)
         if self.shared_factors:
@@ -1791,10 +1837,38 @@ class SparseTupleTensor:
                 start_time = time.time()
             log_step = get_log_step(iteration, rec_log_every, rec_check_every)
             routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step, largedim=largedim)
+            # --- multi-GPU routing override (largedim variants only) ---
+            if _sst is not None:
+                if divergence == "kl" and (dim >= 4000 or largedim):
+                    routing = UpdateRouting(
+                        factor_update=make_sharded_kl_factor_update(_sst),
+                        core_update=make_sharded_kl_core_update(_sst),
+                        error_fn=make_sharded_kl_compute_errors(_sst),
+                        core_returns_error=routing.core_returns_error,
+                    )
+                elif divergence == "fr" and (dim > 4000 or largedim):
+                    routing = UpdateRouting(
+                        factor_update=make_sharded_fr_factor_update(_sst),
+                        core_update=make_sharded_fr_core_update(_sst),
+                        error_fn=make_sharded_fr_compute_errors(_sst),
+                        core_returns_error=routing.core_returns_error,
+                    )
+            # --- stochastic tensor selection ---
+            if _sst is not None:
+                _sst.set_iter_seed(iteration)
+            _use_subsample = (
+                _subsample_frac < 1.0
+                and iteration >= _subsample_warmup
+                and _sst is None   # multi-GPU handles sampling internally
+            )
+            _current_tensor = (
+                subsample_coo(self.tensor, shape, _subsample_frac, _iter_rng)
+                if _use_subsample else self.tensor
+            )
             # --- factors ---
             for mode in modes:
                 factors[mode] = routing.factor_update(
-                    vec_tensor=self.tensor,
+                    vec_tensor=_current_tensor,
                     core=core,
                     factors=factors,
                     mode=mode,
@@ -1813,7 +1887,7 @@ class SparseTupleTensor:
             if routing.core_returns_error:
                 # FR: combined core update + error in one call
                 core, rel_err = routing.core_update(
-                    vec_tensor=self.tensor,
+                    vec_tensor=_current_tensor,
                     shape=shape,
                     core=core,
                     factors=factors,
@@ -1825,7 +1899,7 @@ class SparseTupleTensor:
             else:
                 # KL: core update, then compute error separately
                 core = routing.core_update(
-                    vec_tensor=self.tensor,
+                    vec_tensor=_current_tensor,
                     shape=shape,
                     core=core,
                     factors=factors,
@@ -1835,7 +1909,7 @@ class SparseTupleTensor:
                     verbose=verbose
                 )
                 rel_err = routing.error_fn(
-                    vec_tensor=self.tensor,
+                    vec_tensor=_current_tensor,
                     shape=shape,
                     core=core,
                     factors=factors,

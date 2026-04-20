@@ -83,39 +83,55 @@ def print_elapsed_time(start_time, message=""):
     print(f"{tabs}Elapsed time: {int(minutes)} minutes and {seconds} seconds.")
     return now
 
-def select_gpu(gpu_id=None):
-    """Selects the least used GPU or a specific one if gpu_id is provided."""
+def select_gpu(gpu_id=None, n_gpus: int = 1):
+    """
+    Select GPU(s) for the current process and set CUDA_VISIBLE_DEVICES.
+
+    Modes:
+      n_gpus=1, gpu_id=None   — auto-select the single least-used GPU
+      n_gpus=1, gpu_id=int    — pin to that specific physical GPU
+      n_gpus>1, gpu_id=None   — auto-select the N least-used GPUs
+      n_gpus>1, gpu_id=list   — pin to those specific physical GPUs
+
+    After this call, logical device indices 0…n_gpus-1 map to the selected
+    physical GPUs via CUDA_VISIBLE_DEVICES remapping.
+
+    Returns torch.device(0) (the primary logical device).
+    """
     if torch.cuda.device_count() == 0:
         print("No GPU available.")
         return torch.device("cpu")
 
-    elif gpu_id is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        device = torch.device(gpu_id)
-        return device
+    # --- explicit pin ---
+    if gpu_id is not None:
+        ids = [gpu_id] if isinstance(gpu_id, int) else list(gpu_id)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in ids)
+        print(f"Pinned to GPU(s): {ids}")
+        return torch.device(0)
+
+    # --- auto-select n_gpus least-used GPUs ---
     try:
         import pynvml
         pynvml.nvmlInit()
         device_count = pynvml.nvmlDeviceGetCount()
-        min_used_mem = float('inf')
-        best_gpu = 0
-
+        mem_used = []
         for i in range(device_count):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            used_mem = mem_info.used
-
-            if used_mem < min_used_mem:
-                min_used_mem = used_mem
-                best_gpu = i
-
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(best_gpu)
-        print(f"Selected GPU {best_gpu} with {min_used_mem / (1024 ** 2):.2f} MB used memory.")
+            mem_used.append((mem_info.used, i))
         pynvml.nvmlShutdown()
-        device = torch.device(best_gpu)
-        return device
+
+        mem_used.sort()  # ascending by used memory → least loaded first
+        n_select = min(n_gpus, len(mem_used))
+        selected = [idx for _, idx in mem_used[:n_select]]
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in selected)
+        for rank, (used, phys) in enumerate(mem_used[:n_select]):
+            print(f"  GPU rank {rank} → physical GPU {phys}  "
+                  f"({used / (1024 ** 2):.0f} MB used)")
+        return torch.device(0)
     except Exception as e:
         print("Could not select GPU automatically:", e)
+        return torch.device(0)
 
 def torch_or_pickle_load(path, map_location="cpu"):
     """Tries to load a torch-saved file, if fails, tries pickle."""
@@ -132,6 +148,8 @@ def tree_to_device(x, device):
     """Helps to move (core,factors) objects to the right device."""
     if torch.is_tensor(x):
         return x.to(device)
+    elif isinstance(x, SparseCOOTensor):
+        return x.to(device)
     elif isinstance(x, dict):
         return {k: tree_to_device(v, device) for k, v in x.items()}
     elif isinstance(x, (list, tuple)):
@@ -140,6 +158,59 @@ def tree_to_device(x, device):
     else:
         # print(f"Warning: could not move object of type {type(x)} to device {device}.")
         raise ValueError("Unsupported type for tree_to_device.")
+
+
+_INT64_MAX = (1 << 63) - 1
+
+
+class SparseCOOTensor:
+    """
+    Lightweight COO sparse tensor that avoids PyTorch's int64 numel overflow
+    for very high-order tensors (e.g. 5-gram with top_k=10000, where
+    prod(shape) = 10^20 > int64_max).
+
+    Exposes the same interface used in this codebase as torch.sparse_coo_tensor:
+    .indices(), .values(), ._nnz(), .coalesce(), .size(), .shape, .is_sparse,
+    and .to(device).  Serialises transparently via torch.save / torch.load.
+    """
+    is_sparse = True
+
+    def __init__(self, indices: torch.Tensor, values: torch.Tensor, size: tuple):
+        # indices: (ndim, nnz) long tensor; values: (nnz,) float tensor
+        self._indices = indices
+        self._values = values
+        self._size = tuple(int(d) for d in size)
+
+    # --- core interface ---
+
+    def indices(self) -> torch.Tensor:
+        return self._indices
+
+    def values(self) -> torch.Tensor:
+        return self._values
+
+    def _nnz(self) -> int:
+        return int(self._values.shape[0])
+
+    def coalesce(self) -> "SparseCOOTensor":
+        # Entries are built from a Counter (unique keys), so no duplicates exist.
+        return self
+
+    def size(self) -> torch.Size:
+        return torch.Size(self._size)
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size(self._size)
+
+    def to(self, device) -> "SparseCOOTensor":
+        return SparseCOOTensor(self._indices.to(device), self._values.to(device), self._size)
+
+    def __repr__(self) -> str:
+        return (
+            f"SparseCOOTensor(shape={self._size}, nnz={self._nnz()}, "
+            f"dtype={self._values.dtype})"
+        )
 
 def compute_num_threads(max_cpu_frac: float = 0.75, min_threads: int = 1) -> int:
     """Deterministic thread budget based on available CPUs."""

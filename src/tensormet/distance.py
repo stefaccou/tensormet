@@ -880,8 +880,13 @@ def kl_factor_update_largedim(
 
         W_data = v_i / R_nz            # (nnz_b,)
 
-        # numerator[row] += W * Z
-        cp.add.at(numerator, r_i, W_data[:, None] * Z_rows)
+        # numerator[row] += W * Z  — cuSPARSE SpMM (no serialised atomics)
+        nnz_b = int(r_i.size)
+        S_b = cpx_sparse.csr_matrix(
+            (W_data, (r_i.astype(cp.int32), cp.arange(nnz_b, dtype=cp.int32))),
+            shape=(numerator.shape[0], nnz_b),
+        )
+        numerator += S_b @ Z_rows
 
     # Multiplicative KL update (matching your dense version structure)
     A_new = A * (numerator / (denominator + 1e-12))
@@ -1119,8 +1124,13 @@ def fr_factor_update_largedim(
 
         Z_rows = Z_u[u_i]           # (nnz_b, R_mode)
 
-        # numerator[row] += X_ij * Z[j,:]
-        cp.add.at(numerator, r_i, v_i[:, None] * Z_rows)
+        # numerator[row] += X_ij * Z[j,:]  — cuSPARSE SpMM (no serialised atomics)
+        nnz_b = int(r_i.size)
+        S_b = cpx_sparse.csr_matrix(
+            (v_i, (r_i.astype(cp.int32), cp.arange(nnz_b, dtype=cp.int32))),
+            shape=(numerator.shape[0], nnz_b),
+        )
+        numerator += S_b @ Z_rows
 
     # MU update
     A_new = A * (numerator / (denominator + 1e-12))

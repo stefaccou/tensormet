@@ -32,6 +32,7 @@ from tensormet.config import (
     _default_hf_config_for_dataset, #todo Fix this import
     PopulationExperimentConfig,
     PopulationRunConfig,
+    parse_ngram_order,
 )
 
 
@@ -67,12 +68,14 @@ def _parse_shared_factors(s: str):
 
     Accepts:
       --shared-factors none
+      --shared-factors all
       --shared-factors 1-2
       --shared-factors 1-2,2-0
       --shared-factors 1:2,2:0
 
     Returns:
-      None  (if 'none'/'null'/'')
+      None   (if 'none'/'null'/'')
+      "all"  (sentinel — resolved to all pairs after order is known)
       tuple(((a,b), ...))
     """
     if s is None:
@@ -80,6 +83,8 @@ def _parse_shared_factors(s: str):
     s2 = str(s).strip().lower()
     if s2 in ("", "none", "null", "no"):
         return None
+    if s2 == "all":
+        return "all"
 
     pairs = set()
     for token in s.split(","):
@@ -120,6 +125,24 @@ def _parse_cols_to_build(s: str) -> Tuple[str, ...]:
 def _none_if_missing(value, sentinel=None):
     # Helper: treat argparse's default sentinel as missing -> return None
     return None if value is sentinel else value
+
+
+def _parse_gpu_id(s: str):
+    """
+    Parse --gpu-id as a single int or a comma-separated list of ints.
+
+      "0"     → 0          (single GPU, stays an int for backwards compat)
+      "0,1"   → (0, 1)     (multi-GPU explicit pin)
+      "0,1,2" → (0, 1, 2)
+    """
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    try:
+        vals = tuple(int(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid --gpu-id value: {s!r}. Expected int or comma-separated ints.")
+    if not vals:
+        raise argparse.ArgumentTypeError(f"Invalid --gpu-id value: {s!r}")
+    return vals[0] if len(vals) == 1 else vals
 
 
 def _parse_top_ks(s: str) -> Tuple[int, ...]:
@@ -178,7 +201,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "--shared-factors",
         type=_parse_shared_factors,
         default=None,
-        help="Factor linking, e.g. --shared-factors 1-2,2-0 . Use 'none' to disable.",
+        help="Factor linking, e.g. --shared-factors 1-2,2-0 or 'all' to share all. Use 'none' to disable.",
     )
     parser.add_argument("--warmup-steps", type=int, dest="warmup_steps", default=None)
     parser.add_argument("--patience", type=int, default=None)
@@ -189,6 +212,13 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     # NEW: Checkpoint resumption flag
     parser.add_argument("--resume", type=_parse_bool, default=None,
                         help="Resume training from the latest available checkpoint for this configuration.")
+    # NEW: multi-gpu
+    parser.add_argument("--n-gpus", type=int, dest="n_gpus", default=None)
+    parser.add_argument("--gpu-id", type=_parse_gpu_id, dest="gpu_id", default=None,
+                        help="Physical GPU(s) to pin, e.g. --gpu-id 0 or --gpu-id 0,1,2")
+    parser.add_argument("--subsample-frac", type=float, dest="subsample_frac", default=None)
+    parser.add_argument("--subsample-warmup", type=int, dest="subsample_warmup", default=None)
+
     # Eval-level args
     parser.add_argument("--rec-check-every", type=int, dest="rec_check_every", default=None)
     parser.add_argument("--rec-log-every", type=int, dest="rec_log_every", default=None)
@@ -221,6 +251,11 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
 
     new_exp = replace(default_exp, **exp_kwargs) if exp_kwargs else default_exp
 
+    # Resolve "all" sentinel for shared_factors now that order is known
+    if parsed_dict.get("shared_factors") == "all":
+        n = new_exp.order
+        parsed_dict["shared_factors"] = tuple(sorted((i, j) for i in range(n) for j in range(i + 1, n)))
+
     # Training overrides
     train_kwargs = {}
     train_fields = (
@@ -237,6 +272,10 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "largedim",
         "checkpoint_saving_steps",
         "resume",
+        "n_gpus",
+        "gpu_id",
+        "subsample_frac",
+        "subsample_warmup",
     )
     # argparse used dashes -> underscores mapping; check each
     for f in train_fields:
@@ -318,6 +357,13 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
 
     parser.add_argument("--log-every-s", type=float, dest="log_every_s", default=None)
 
+    parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Custom label used in output paths instead of the dataset+config combination.",
+    )
+
     # HFStreamConfig overrides (optional)
     parser.add_argument("--hf-path", type=str, dest="hf_path", default=None)
     parser.add_argument("--hf-config", type=str, dest="hf_config", default=None)
@@ -340,10 +386,30 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
         "batch_size",
         "cpu_frac",
         "log_every_s",
+        "name",
     )
     for f in exp_fields:
         if d.get(f) is not None:
             exp_kwargs[f] = d[f]
+
+    # Normalise n-gram type strings:
+    #   "3-gram"       → "3gram"
+    #   "4gram,5-gram" → "4gram,5gram"
+    if "type" in exp_kwargs:
+        raw_type = exp_kwargs["type"]
+        parts = [p.strip() for p in raw_type.split(",") if p.strip()]
+        normalised = []
+        all_ngram = True
+        for part in parts:
+            n = parse_ngram_order(part)
+            if n is not None:
+                normalised.append(f"{n}gram")
+            else:
+                all_ngram = False
+                normalised.append(part)
+        if all_ngram and normalised:
+            exp_kwargs["type"] = ",".join(normalised)
+
     new_exp = replace(default_exp, **exp_kwargs) if exp_kwargs else default_exp
 
     # ---- hf config: derive from dataset unless overridden ----
@@ -390,7 +456,7 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
         "--shared-factors",
         type=_parse_shared_factors,
         default=None,
-        help="Factor linking for population, e.g. --shared-factors 2-3 or 1-2,2-3 . Use 'none' to disable.",
+        help="Factor linking for population, e.g. --shared-factors 2-3 or 1-2,2-3 or 'all'. Use 'none' to disable.",
     )
     parser.add_argument("--batch-rows", type=int, dest="batch_rows", default=None)
     parser.add_argument("--batch-readahead", type=int, dest="batch_readahead", default=None)
@@ -399,6 +465,12 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
 
     parsed = parser.parse_args(args=argv)
     d = vars(parsed)
+
+    # Resolve "all" sentinel for shared_factors using cols_to_build length
+    if d.get("shared_factors") == "all":
+        cols = d.get("cols_to_build") or default_exp.cols_to_build
+        n = len(cols)
+        d["shared_factors"] = tuple(sorted((i, j) for i in range(n) for j in range(i + 1, n)))
 
     exp_kwargs = {}
     for f in (
