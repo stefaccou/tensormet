@@ -121,7 +121,7 @@ class TuckerDecomposition:
                        rank: int=100,
                        order: int=3,
                        iterations: int|None=None,
-                       factor_sharing: bool|set|str=False,
+                       shared_factors: bool|set|str=False,
                        map_location: str="cpu",
                        name: Optional[str]=None,
                        tier1: bool=False,
@@ -153,17 +153,17 @@ class TuckerDecomposition:
         parsed_shared = None
         suffix = ""
 
-        if factor_sharing == "all":
+        if shared_factors == "all":
             parsed_shared = {(i, j) for i in range(order) for j in range(i + 1, order)}
-        elif factor_sharing is True:
+        elif shared_factors is True:
             parsed_shared = {(1, 2)}
-        elif isinstance(factor_sharing, set) and factor_sharing:
-            for item in factor_sharing:
+        elif isinstance(shared_factors, set) and shared_factors:
+            for item in shared_factors:
                 if not (isinstance(item, tuple) and len(item) == 2):
                     raise TypeError(
-                        f"factor_sharing must be a set of 2-tuples, got item {item!r}"
+                        f"shared_factors must be a set of 2-tuples, got item {item!r}"
                     )
-            parsed_shared = factor_sharing
+            parsed_shared = shared_factors
 
         if parsed_shared:
             linked_nontrivial = nontrivial_linked_groups(parsed_shared, num_factors=order)
@@ -784,6 +784,86 @@ class TuckerDecomposition:
             top_sims.append(role_str)
 
         return top_sims
+
+    def get_top_combinations(
+            self,
+            fixed_element: str,
+            fixed_role: str,
+            top_k: int = 10,
+            restrict_roles: Optional[dict[str, list[str]]] = None,
+            exclude_oov: bool = True,
+            oov_token: str = "~",
+    ) -> list[tuple[tuple, float]]:
+        fixed_idx = self.get_role_index(fixed_role)
+        other_idxs = [i for i in range(len(self.roles)) if i != fixed_idx]
+
+        if len(other_idxs) > 2:
+            raise NotImplementedError(
+                "get_top_combinations currently supports at most 2 free roles "
+                f"(found {len(other_idxs)} for order-{len(self.roles)} tensor). "
+                "Consider fixing additional roles or filing a feature request."
+            )
+
+        v_latent = self.fetch_single_latent(fixed_element, fixed_role)
+
+        G = self._core_np()
+        modes = einsum_letters(len(self.roles))
+        fixed_char = modes[fixed_idx]
+        other_chars = [modes[i] for i in other_idxs]
+        eq_contract = f"{''.join(modes)},{fixed_char}->{''.join(other_chars)}"
+        G_fixed = np.einsum(eq_contract, G, v_latent)
+
+        role_names_free: list[str] = [self.roles[i] for i in other_idxs]
+        factors_free: list[np.ndarray] = []
+        vocab_lists_free: list[list[str]] = []
+
+        for role in role_names_free:
+            factor = _to_np(self.factors[self.get_role_index(role)])
+            vocab_list = list(self.vocab[_voc_list_key(role)])
+
+            if restrict_roles and role in restrict_roles:
+                r2i = self.vocab[voc_index(role)]
+                keep_words = [w for w in restrict_roles[role] if w in r2i]
+                keep_idxs = [r2i[w] for w in keep_words]
+                factor = factor[keep_idxs]
+                vocab_list = keep_words
+
+            if exclude_oov and oov_token in vocab_list:
+                oov_idx = vocab_list.index(oov_token)
+                keep_mask = [i for i in range(len(vocab_list)) if i != oov_idx]
+                factor = factor[keep_mask]
+                vocab_list = [w for w in vocab_list if w != oov_token]
+
+            factors_free.append(factor)
+            vocab_lists_free.append(vocab_list)
+
+        F_a, F_b = factors_free
+        scores = F_a @ G_fixed @ F_b.T
+
+        n_a, n_b = scores.shape
+        flat = scores.ravel()
+
+        if top_k >= flat.size:
+            top_flat = np.argsort(-flat)
+        else:
+            part = np.argpartition(flat, -top_k)[-top_k:]
+            top_flat = part[np.argsort(-flat[part])]
+
+        vocab_a, vocab_b = vocab_lists_free
+
+        results = []
+        for flat_idx in top_flat:
+            i, j = divmod(int(flat_idx), n_b)
+            score = float(scores[i, j])
+
+            combo: list[str] = [None] * len(self.roles)  # type: ignore[list-item]
+            combo[fixed_idx] = fixed_element
+            combo[other_idxs[0]] = vocab_a[i]
+            combo[other_idxs[1]] = vocab_b[j]
+
+            results.append((tuple(combo), score))
+
+        return results
 
     def batch_excluded_role_vector(self,
                                    valid_indices: torch.Tensor,

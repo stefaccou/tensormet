@@ -605,6 +605,12 @@ def populate_tensors_parquet(
                 else:
                     denominator_terms.append(p)
 
+                # Alternative, swapped version. Works worse on VSO
+                # if r % 2 == 0:
+                #     denominator_terms.append(p)
+                # else:
+                #     numerator_terms.append(p)
+
         return log(prod(numerator_terms) / prod(denominator_terms))
 
 

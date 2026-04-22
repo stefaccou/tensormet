@@ -111,6 +111,77 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
     return summary
 
 
+def launch_tensor_population(cfg):
+    """
+    Run sparse tensor population with standard launcher conventions:
+    - creates output directories
+    - logs a run record to output_dir/populated/runs.jsonl
+    - optionally notifies discord
+    """
+    # Assuming you rename the script 2_sparse_population...py to tensor_population.py
+    from tensormet.population import populate_tensors_parquet
+
+    vectors_dir = cfg.exp.vectors_dir()
+    output_dir = cfg.exp.output_dir()
+
+    # Mirroring your original script's logic for directory creation
+    populated_dir = output_dir / "populated"
+    populated_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "vocabularies").mkdir(parents=True, exist_ok=True)
+
+    # Where we record "runs"
+    runs_jsonl = populated_dir / "runs.jsonl"
+    log_path = populated_dir / "population_log.txt"
+
+    append_jsonl(
+        runs_jsonl,
+        {
+            "timestamp": utc_now_iso(),
+            "run_kind": "tensor_population",
+            "cfg": asdict(cfg),
+            "vectors_dir": str(vectors_dir),
+            "output_dir": str(output_dir),
+        },
+    )
+
+    start_time = time.time()
+
+    with tee_output(log_path):
+        results = populate_tensors_parquet(
+            path_to_vectors=vectors_dir,
+            top_ks=list(cfg.exp.top_ks),
+            shared_factors=cfg.exp.shared_factors,
+            save=True,
+            path_to_tensors=output_dir,
+            cols_to_build=list(cfg.exp.cols_to_build),
+            batch_rows=cfg.exp.batch_rows,
+            batch_readahead=cfg.exp.batch_readahead,
+            fragment_readahead=cfg.exp.fragment_readahead,
+        )
+
+    end_time = time.time()
+
+    append_jsonl(
+        runs_jsonl,
+        {
+            "timestamp": utc_now_iso(),
+            "run_kind": "tensor_population",
+            "cfg": asdict(cfg),
+            "results": {
+                "runtime_seconds": round(end_time - start_time, 2),
+                "top_ks_processed": list(cfg.exp.top_ks),
+            },
+        },
+    )
+
+    # notify_discord(
+    #     f"Tensor population finished for {cfg.exp.dataset}. "
+    #     f"Top Ks: {list(cfg.exp.top_ks)}. "
+    #     f"Runtime: {end_time - start_time:.2f}s."
+    # )
+
+    return results
+
 def launch_nnt_decomposition(cfg):
     thread_budget = ThreadBudget(n_threads=compute_num_threads(cfg.exp.max_cpu_frac))
     _n_gpus = getattr(cfg.train, "n_gpus", 1)
@@ -284,75 +355,3 @@ def launch_nnt_decomposition(cfg):
 
     return tucker_decomp_torch
 
-
-
-def launch_tensor_population(cfg):
-    """
-    Run sparse tensor population with standard launcher conventions:
-    - creates output directories
-    - logs a run record to output_dir/populated/runs.jsonl
-    - optionally notifies discord
-    """
-    # Assuming you rename the script 2_sparse_population...py to tensor_population.py
-    from tensormet.population import populate_tensors_parquet
-
-    vectors_dir = cfg.exp.vectors_dir()
-    output_dir = cfg.exp.output_dir()
-
-    # Mirroring your original script's logic for directory creation
-    populated_dir = output_dir / "populated"
-    populated_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "vocabularies").mkdir(parents=True, exist_ok=True)
-
-    # Where we record "runs"
-    runs_jsonl = populated_dir / "runs.jsonl"
-    log_path = populated_dir / "population_log.txt"
-
-    append_jsonl(
-        runs_jsonl,
-        {
-            "timestamp": utc_now_iso(),
-            "run_kind": "tensor_population",
-            "cfg": asdict(cfg),
-            "vectors_dir": str(vectors_dir),
-            "output_dir": str(output_dir),
-        },
-    )
-
-    start_time = time.time()
-
-    with tee_output(log_path):
-        results = populate_tensors_parquet(
-            path_to_vectors=vectors_dir,
-            top_ks=list(cfg.exp.top_ks),
-            shared_factors=cfg.exp.shared_factors,
-            save=True,
-            path_to_tensors=output_dir,
-            cols_to_build=list(cfg.exp.cols_to_build),
-            batch_rows=cfg.exp.batch_rows,
-            batch_readahead=cfg.exp.batch_readahead,
-            fragment_readahead=cfg.exp.fragment_readahead,
-        )
-
-    end_time = time.time()
-
-    append_jsonl(
-        runs_jsonl,
-        {
-            "timestamp": utc_now_iso(),
-            "run_kind": "tensor_population",
-            "cfg": asdict(cfg),
-            "results": {
-                "runtime_seconds": round(end_time - start_time, 2),
-                "top_ks_processed": list(cfg.exp.top_ks),
-            },
-        },
-    )
-
-    # notify_discord(
-    #     f"Tensor population finished for {cfg.exp.dataset}. "
-    #     f"Top Ks: {list(cfg.exp.top_ks)}. "
-    #     f"Runtime: {end_time - start_time:.2f}s."
-    # )
-
-    return results
