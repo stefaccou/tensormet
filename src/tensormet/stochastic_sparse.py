@@ -36,8 +36,9 @@ shard index — no per-iteration resharding is needed.
 
 from __future__ import annotations
 
-import cupy as cp
-import cupyx.scipy.sparse as cpx_sparse
+from tensormet.utils import guarded_cupy_import
+cp, cpx_sparse = guarded_cupy_import()
+
 
 
 def subsample_coo(

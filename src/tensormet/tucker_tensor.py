@@ -3,11 +3,9 @@ import pickle
 import sparse
 import torch
 import json
-import cupy as cp
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-import cupyx.scipy.sparse as cpx_sparse
 import tensorly as tl
 from tensorly.tucker_tensor import validate_tucker_rank, tucker_normalize, TuckerTensor
 from tensorly.tenalg import mode_dot
@@ -30,6 +28,7 @@ from tensormet.utils import (DATA_DIR,
                             extract_roles_from_vocab,
                             einsum_letters,
                             SparseCOOTensor,
+                            guarded_cupy_import
                    )
 from tensormet.sparse_ops import initialize_nonnegative_tucker
 from tensormet.similarity import evaluate_sample, get_eval_num_threads
@@ -45,6 +44,10 @@ from tensormet.sharded_sparse import (
             make_sharded_fr_compute_errors,
         )
 import time
+
+cp, cpx_sparse = guarded_cupy_import()
+
+
 
 def _to_np(x):
     # Accept NumPy arrays or torch tensors; return NumPy view/copy

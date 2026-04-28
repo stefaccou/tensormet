@@ -22,6 +22,35 @@ if data_path is None:
 DATA_DIR = Path(data_path)
 
 
+def guarded_cupy_import(check_cuda: bool = True) -> Tuple[Optional[object], Optional[object]]:
+    """
+    Try to import cupy and cupyx.scipy.sparse. If anything fails or no CUDA device is visible,
+    return (None, None) and emit a warning via logging.
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        logger.warning("cupy not installed; falling back to CPU (cp/cpx_sparse disabled).")
+        return None, None
+
+    try:
+        import cupyx.scipy.sparse as cpx_sparse  # type: ignore
+    except Exception:
+        cpx_sparse = None
+
+    if check_cuda:
+        try:
+            device_count = cp.cuda.runtime.getDeviceCount()
+            if device_count == 0:
+                logger.warning("cupy installed but no GPU visible; falling back to CPU (cp/cpx_sparse disabled).")
+                return None, None
+        except Exception:
+            logger.warning("cupy present but CUDA access failed; falling back to CPU (cp/cpx_sparse disabled).")
+            return None, None
+
+    return cp, cpx_sparse
+
 def notify_discord(message, job_finished=True):
     try:
 

@@ -3,8 +3,8 @@ import itertools
 
 from tqdm import tqdm
 import numpy as np
-import cupy as cp
-import cupyx.scipy.sparse as cpx_sparse
+# import cupy as cp
+# import cupyx.scipy.sparse as cpx_sparse
 
 import tensorly as tl
 import pytensorlab as ptl
@@ -21,7 +21,10 @@ from tensormet.sparse_ops import (
     safe_ravel,
     compute_Zcols_batch
 )
-from tensormet.utils import ThreadBudget, einsum_letters
+from tensormet.utils import ThreadBudget, einsum_letters, guarded_cupy_import
+
+cp, cpx_sparse = guarded_cupy_import()
+
 # -- Kullback-Leibler Divergence --
 
 def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False):
