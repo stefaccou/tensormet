@@ -21,9 +21,9 @@ from tensormet.sparse_ops import (
     safe_ravel,
     compute_Zcols_batch
 )
-from tensormet.utils import ThreadBudget, einsum_letters, guarded_cupy_import
+from tensormet.utils import ThreadBudget, einsum_letters, make_lazy_cupy_pair
 
-cp, cpx_sparse = guarded_cupy_import()
+cp, cpx_sparse = make_lazy_cupy_pair()
 
 # -- Kullback-Leibler Divergence --
 

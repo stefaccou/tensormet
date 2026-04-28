@@ -72,9 +72,9 @@ from tensormet.distance import (
     _tucker_gram_ZtZ,                       # distance.py:622
 )
 from tensormet.sparse_ops import compute_Zcols_batch, safe_ravel
-from tensormet.utils import guarded_cupy_import
+from tensormet.utils import make_lazy_cupy_pair
 
-cp, cpx_sparse = guarded_cupy_import()
+cp, cpx_sparse = make_lazy_cupy_pair()
 
 # ---------------------------------------------------------------------------
 # Internal utilities

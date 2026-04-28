@@ -52,6 +52,55 @@ def guarded_cupy_import(check_cuda: bool = True) -> Tuple[Optional[object], Opti
 
     return cp, cpx_sparse
 
+
+class _LazyGPU:
+    """Proxy for a GPU module (cupy or cupyx.scipy.sparse) that defers import
+    until first attribute access.  All existing call sites using cp.xxx or
+    cpx_sparse.xxx continue to work unchanged; CUDA is never probed at import
+    time when this proxy is used instead of a direct module-level import."""
+
+    def __init__(self, index: int) -> None:
+        # 0 → cupy, 1 → cupyx.scipy.sparse
+        object.__setattr__(self, "_index", index)
+        object.__setattr__(self, "_module", None)
+        object.__setattr__(self, "_resolved", False)
+
+    def _resolve(self):
+        if not object.__getattribute__(self, "_resolved"):
+            cp, cpx = guarded_cupy_import()
+            modules = (cp, cpx)
+            idx = object.__getattribute__(self, "_index")
+            mod = modules[idx]
+            if mod is None:
+                raise RuntimeError(
+                    "CuPy / CUDA is required for tensor decomposition but is not "
+                    "available in this environment.  Install cupy and ensure a CUDA "
+                    "device is visible before running decomposition."
+                )
+            object.__setattr__(self, "_module", mod)
+            object.__setattr__(self, "_resolved", True)
+        return object.__getattribute__(self, "_module")
+
+    def __getattr__(self, name: str):
+        return getattr(self._resolve(), name)
+
+    def __call__(self, *args, **kwargs):
+        return self._resolve()(*args, **kwargs)
+
+    def __repr__(self) -> str:
+        return f"<_LazyGPU index={object.__getattribute__(self, '_index')} resolved={object.__getattribute__(self, '_resolved')}>"
+
+
+def make_lazy_cupy_pair() -> Tuple[Any, Any]:
+    """Return lazy proxy objects for (cupy, cupyx.scipy.sparse).
+
+    Drop-in replacement for ``guarded_cupy_import()`` at module level.
+    CUDA is not probed until the first attribute access on either proxy,
+    so importing a tensormet module never triggers GPU initialisation.
+    """
+    return _LazyGPU(0), _LazyGPU(1)
+
+
 def notify_discord(message, job_finished=True):
     try:
 

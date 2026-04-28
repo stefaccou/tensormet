@@ -36,8 +36,8 @@ shard index — no per-iteration resharding is needed.
 
 from __future__ import annotations
 
-from tensormet.utils import guarded_cupy_import
-cp, cpx_sparse = guarded_cupy_import()
+from tensormet.utils import make_lazy_cupy_pair
+cp, cpx_sparse = make_lazy_cupy_pair()
 
 
 

@@ -28,7 +28,8 @@ from tensormet.utils import (DATA_DIR,
                             extract_roles_from_vocab,
                             einsum_letters,
                             SparseCOOTensor,
-                            guarded_cupy_import
+                            guarded_cupy_import,
+                            make_lazy_cupy_pair
                    )
 from tensormet.sparse_ops import initialize_nonnegative_tucker
 from tensormet.similarity import evaluate_sample, get_eval_num_threads
@@ -45,7 +46,7 @@ from tensormet.sharded_sparse import (
         )
 import time
 
-cp, cpx_sparse = guarded_cupy_import()
+cp, cpx_sparse = make_lazy_cupy_pair()
 
 
 
