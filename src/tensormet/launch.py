@@ -258,6 +258,7 @@ def launch_nnt_decomposition(cfg):
     else:
         clean_sample = sentence_sample
 
+    print("loaded sentence sample")
 
     paths = cfg.artifact_paths()
     for p in paths.values():

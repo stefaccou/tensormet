@@ -2,7 +2,8 @@ from math import log, prod
 from collections import Counter, defaultdict
 from pathlib import Path
 import os
-
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 import torch
 from tqdm import tqdm
 from tensormet.utils import DATA_DIR, shared_factor_suffix, linked_factor_groups, SparseCOOTensor, _INT64_MAX
@@ -14,6 +15,71 @@ import pyarrow.dataset as ds
 
 from itertools import combinations
 from functools import reduce
+
+
+
+# ── new top-level worker (must be picklable → module level) ─────
+def _pass2_worker(
+    shard_paths: list[str],
+    cols_to_build: list[str],
+    vocabs_max: dict[str, list],   # col → list of strings (picklable)
+    batch_rows: int,
+    batch_readahead: int,
+    fragment_readahead: int,
+) -> dict:
+    """
+    Process a subset of parquet shards and return partial subset_counters.
+    Runs in a child process – no shared state with the parent.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.dataset as ds
+    from collections import Counter
+    from itertools import combinations
+    from functools import reduce
+
+    # Reconstruct Arrow membership arrays locally (not picklable across processes)
+    max_arrs = {col: pa.array(vocabs_max[col]) for col in cols_to_build}
+
+    subset_counters = {
+        subset: Counter()
+        for r in range(2, len(cols_to_build) + 1)
+        for subset in combinations(cols_to_build, r)
+    }
+
+    dataset = ds.dataset(shard_paths, format="parquet")
+    batches = dataset.to_batches(
+        columns=cols_to_build,
+        batch_size=batch_rows,
+        batch_readahead=batch_readahead,
+        fragment_readahead=fragment_readahead,
+        use_threads=True,
+        cache_metadata=True,
+    )
+
+    for batch in batches:
+        t = pa.table({
+            col: _normalize_str_array(batch.column(i))
+            for i, col in enumerate(cols_to_build)
+        })
+        masks = {col: pc.is_in(t[col], value_set=max_arrs[col]) for col in cols_to_build}
+
+        for r in range(2, len(cols_to_build) + 1):
+            for subset in combinations(cols_to_build, r):
+                subset_mask = reduce(pc.and_, (masks[col] for col in subset))
+                t_subset = t.filter(subset_mask)
+                if t_subset.num_rows:
+                    g_subset = (
+                        t_subset.group_by(list(subset))
+                        .aggregate([(subset[0], "count")])
+                        .rename_columns(list(subset) + ["count"])
+                    )
+                    _update_counter_from_grouped(
+                        subset_counters[subset], g_subset, list(subset), "count"
+                    )
+
+    return subset_counters  # Counter is picklable → returned to parent via pickle
+
 
 def _make_sparse_coo(idx: torch.Tensor, values: torch.Tensor, size: tuple):
     """
@@ -499,55 +565,45 @@ def populate_tensors_parquet(
             counter[k] /= total_len
 
     # -------------------------
-    # PASS 2: restricted joint counts (only keys in max vocab)
+    # PASS 2: restricted joint counts — parallelised across shards
     # -------------------------
-
-    # All subset counters of size >= 2, including the full joint
     subset_counters = {
         subset: Counter()
         for r in range(2, len(cols_to_build) + 1)
         for subset in combinations(cols_to_build, r)
     }
 
-    print("Defining batches for pass 2")
-    batches2 = dataset.to_batches(
-        columns=cols_to_build,
-        batch_size=batch_rows,
-        batch_readahead=batch_readahead,
-        fragment_readahead=fragment_readahead,
-        use_threads=True,
-        cache_metadata=True,
-    )
+    # n_workers = min(multiprocessing.cpu_count(), len(parquet_files))
+    n_workers = min(50, len(parquet_files))
+    print(n_workers)
+    shard_chunks = [
+        [os.fspath(p) for p in parquet_files[i::n_workers]]
+        for i in range(n_workers)
+    ]
 
-    print(f"Pass 2/2: computing joint counts restricted to max_k={max_k} vocab ...")
-    with tqdm(total=total_rows, desc="Pass 2/2", unit="rows") as pbar:
-        for batch in batches2:
-            pbar.update(batch.num_rows)
+    # vocabs_max values are plain lists → picklable
+    vocabs_max_plain = {col: list(vocabs_max[col]) for col in cols_to_build}
 
-            t = pa.table({col:_normalize_str_array(batch.column(i)) for i, col in enumerate(cols_to_build)})
+    print(f"Pass 2/2: computing joint counts restricted to max_k={max_k} vocab "
+          f"[{n_workers} workers, {len(parquet_files)} shards] ...")
 
-
-            masks = {col:pc.is_in(t[col], value_set=max_arrs[col]) for col in cols_to_build}
-
-
-             # Count every subset marginal of size >= 2 restricted to max vocab
-            for r in range(2, len(cols_to_build) + 1):
-                for subset in combinations(cols_to_build, r):
-                    subset_mask = reduce(pc.and_, (masks[col] for col in subset))
-                    t_subset = t.filter(subset_mask)
-                    if t_subset.num_rows:
-                        g_subset = (
-                            t_subset.group_by(list(subset))
-                            .aggregate([(subset[0], "count")])
-                            .rename_columns(list(subset) + ["count"])
-                        )
-                        _update_counter_from_grouped(
-                            subset_counters[subset],
-                            g_subset,
-                            list(subset),
-                            "count",
-                        )
-
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {
+            pool.submit(
+                _pass2_worker,
+                chunk,
+                cols_to_build,
+                vocabs_max_plain,
+                batch_rows,
+                batch_readahead,
+                fragment_readahead,
+            ): i
+            for i, chunk in enumerate(shard_chunks)
+        }
+        for fut in tqdm(as_completed(futures), total=n_workers, desc="Pass 2/2 workers"):
+            partial = fut.result()
+            for subset, counter in partial.items():
+                subset_counters[subset].update(counter)
 
 
 

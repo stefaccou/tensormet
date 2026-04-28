@@ -685,47 +685,65 @@ class TuckerDecomposition:
         ]
         return top_scores
 
-    def get_expected_element(self, target_tuple: Tuple[str, ...], role: str, verbose: bool = True):
+    def get_expected_element(self, target_tuple: Tuple[str, ...], role: str, verbose: bool = True,
+                             method: str="excluded",
+                             metric: str = "dot"):
+        """
+        metric: 'dot' for raw unnormalized dot product (favors frequent/confident words),
+                'cosine' for scale-invariant cosine similarity (often surfaces rare words).
+        """
         index = self.get_role_index(role)
         r2i = voc_index(role)
         latents = self.fetch_latents(target_tuple)
-        G_item = self.excluded_role_vector(target_tuple, role=role)
+        if method == "excluded":
+            G_item = self.excluded_role_vector(target_tuple, role=role)
+        elif method == "included":
+            G_item = self.included_role_vector(target_tuple, role=role)
+        else:
+            raise NotImplementedError
 
         # Safely get the numpy array
         factor = self.factors[index].cpu().numpy() if hasattr(self.factors[index], "cpu") else self.factors[index]
 
-        # Safely calculate norms to prevent division by 0
-        eps = 1e-12
-        factor_norm = np.linalg.norm(factor, axis=1)
-        G_item_norm = np.linalg.norm(G_item)
+        if metric == "cosine":
+            # Safely calculate norms to prevent division by 0
+            eps = 1e-12
+            factor_norm = np.linalg.norm(factor, axis=1)
+            G_item_norm = np.linalg.norm(G_item)
 
-        factor_norm = np.maximum(factor_norm, eps)
-        G_item_norm = max(G_item_norm, eps)
+            factor_norm = np.maximum(factor_norm, eps)
+            G_item_norm = max(G_item_norm, eps)
 
-        similarities = (factor @ G_item) / (factor_norm * G_item_norm)
+            scores = (factor @ G_item) / (factor_norm * G_item_norm)
+        elif metric == "dot":
+            # Raw dot product accounts for vector magnitude (word prominence)
+            scores = factor @ G_item
+        else:
+            raise ValueError("metric must be either 'dot' or 'cosine'")
 
         # we get the top k most similar elements
         k = 5
-        top_k_indices = np.argsort(similarities)[-k:][::-1]
+        top_k_indices = np.argsort(scores)[-k:][::-1]
 
         results = []
         for idx in top_k_indices:
             role_str = next(key for key, v in self.vocab[r2i].items() if v == idx)
 
             role_act = self.factors[index][idx, :].cpu().numpy() if hasattr(self.factors[index], "cpu") else \
-            self.factors[index][idx, :]
+                self.factors[index][idx, :]
+
+            # Keep cosine similarity for the specific target context as an interesting debug metric
             cos_sim = np_sim(role_act, latents[index])
 
             results.append({"token": role_str,
-                            "similarity": float(similarities[idx]),
+                            "score": float(scores[idx]),
                             "activation_cosine": float(cos_sim)})
 
         if verbose:
-            print(f"Top {k} most similar {role}s to the integrated core tensor:")
+            print(f"Top {k} expected {role}s based on the integrated core tensor:")
             for r in results:
-                # Fixed the hardcoded "Subject:" bug here!
                 print(f"{role.capitalize()}: {r['token']}, "
-                      f"Similarity: {r['similarity']:.4f}, "
+                      f"Score ({metric}): {r['score']:.4f}, "
                       f"Cosine sim with target {role} activations: {r['activation_cosine']:.4f}"
                       )
             return None

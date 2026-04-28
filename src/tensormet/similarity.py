@@ -10,6 +10,7 @@ import ast
 from typing import List, Tuple
 from tqdm import tqdm
 import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 import torch
 
 def _to_np(x):
@@ -394,33 +395,26 @@ def load_eval_sentences_cached(
 
     return sampled_sentences
 
-# parquet-based pipeline
 def load_eval_sentences_cached_parquet(
     vector_path: str | os.PathLike,
     *,
     dataset: str,
     roles: List[str] = ("root", "nsubj", "obj"),
-    column_map=None,          # e.g. {"verb": "root", "subject": "nsubj", "object": "obj"}
+    column_map=None,
     cache_dir: str | os.PathLike = DATA_DIR / "vectors" / "cache",
     n_samples: int = 100,
     seed: int = 42,
+    oversample: int = 3,   # collect this many × n_samples before final sampling
 ) -> List[Tuple[str, ...]]:
     """
-    Read unique tuples from a Parquet file or Parquet directory, using the columns
-    specified by `roles`, sample deterministically, and cache the sampled list.
-
-    Supports:
-      - a single .parquet file
-      - a directory containing many parquet parts (recommended)
+    Stream unique tuples from a Parquet file or directory, sampling lazily
+    so we never read more than needed.
     """
-
-    # legacy handling
     vector_path = Path(vector_path)
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build a cache key that invalidates when the parquet changes
-    # - For a directory, use the newest mtime and total size across files.
+    # --- cache fingerprint (unchanged) ---
     if vector_path.is_dir():
         files = sorted(vector_path.rglob("*.parquet"))
         if not files:
@@ -428,15 +422,10 @@ def load_eval_sentences_cached_parquet(
         newest_mtime_ns = max(p.stat().st_mtime_ns for p in files)
         total_bytes = sum(p.stat().st_size for p in files)
         fingerprint = f"dir_mtime_ns={newest_mtime_ns}__bytes={total_bytes}__nfiles={len(files)}"
-
-        # FIX: Create a list of string paths to pass to PyArrow
-        source_for_dataset = [str(f) for f in files]
     else:
         st = vector_path.stat()
         fingerprint = f"file_mtime_ns={st.st_mtime_ns}__bytes={st.st_size}"
-
-        # FIX: Single file path
-        source_for_dataset = str(vector_path)
+        files = [vector_path]
 
     cache_name = (
         f"eval_sentences__dataset={dataset}"
@@ -448,34 +437,54 @@ def load_eval_sentences_cached_parquet(
     )
     cache_file = cache_dir / cache_name
 
-    # Fast path
+    # --- fast path ---
     if cache_file.exists():
         with cache_file.open("rb") as f:
             return pickle.load(f)
 
-    # Slow path: scan parquet
-    # FIX: Pass the explicit list of parquet files (or the single file), NOT the raw directory
-    dataset_obj = ds.dataset(source_for_dataset, format="parquet")
+    # --- slow path: stream row groups until we have enough ---
+    rng = random.Random(seed)
+    roles = list(roles)
 
-    # Pull only the 3 columns we care about; this is the big win vs CSV
-    # table = dataset_obj.to_table(columns=["root", "nsubj", "obj"])
-    # table = table.drop_null()
-    #
-    # triples = list(zip(table["root"].to_pylist(),
-    #                    table["nsubj"].to_pylist(),
-    #                    table["obj"].to_pylist()))
-    table = dataset_obj.to_table(columns=roles)
-    table = table.drop_null()
-    tuples = list(zip(*[table[r].to_pylist() for r in roles]))
+    # Enumerate (file, row_group_index) pairs, then shuffle for an unbiased sample.
+    row_groups = []
+    for fp in files:
+        pf = pq.ParquetFile(fp)
+        for rg_idx in range(pf.num_row_groups):
+            row_groups.append((fp, rg_idx))
+    rng.shuffle(row_groups)
 
-    if n_samples > len(tuples):
+    target = n_samples * oversample
+    seen: set = set()
+    collected: list = []
+
+    # Cache open ParquetFile handles so we don't reopen per row group
+    open_files: dict = {}
+
+    for fp, rg_idx in row_groups:
+        pf = open_files.get(fp)
+        if pf is None:
+            pf = pq.ParquetFile(fp)
+            open_files[fp] = pf
+
+        batch = pf.read_row_group(rg_idx, columns=roles).drop_null()
+        cols = [batch[r].to_pylist() for r in roles]
+
+        for tup in zip(*cols):
+            if tup not in seen:
+                seen.add(tup)
+                collected.append(tup)
+
+        if len(collected) >= target:
+            break
+
+    if len(collected) < n_samples:
         raise ValueError(
-            f"n_samples={n_samples} > number of unique tuples={len(tuples)} "
-            f"parsed from {vector_path}"
+            f"n_samples={n_samples} > number of unique tuples found={len(collected)} "
+            f"after scanning {len(row_groups)} row groups"
         )
 
-    rng = random.Random(seed)
-    sampled = rng.sample(tuples, n_samples)
+    sampled = rng.sample(collected, n_samples)
 
     tmp = cache_file.with_suffix(".tmp")
     with tmp.open("wb") as f:
@@ -483,8 +492,6 @@ def load_eval_sentences_cached_parquet(
     tmp.replace(cache_file)
 
     return sampled
-
-
 
 def ensure_vocab(vocab, sample, roles):
     legacy_map = {"verb": "v", "subject": "s", "object": "o"}
