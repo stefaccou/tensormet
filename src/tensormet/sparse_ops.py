@@ -1,3 +1,4 @@
+from __future__ import annotations
 import tensorly as tl
 import pytensorlab as ptl
 import numpy as np
