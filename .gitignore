@@ -11,8 +11,10 @@
 !8_languages/
 !9_hpc/
 !src/
+!sample_data/
 
 # Allow everything inside those directories
 !8_languages/**
 !9_hpc/**
 !src/**
+!sample_data/**
