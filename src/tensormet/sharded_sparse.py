@@ -45,8 +45,6 @@ import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
-import cupy as cp
-import cupyx.scipy.sparse as cpx_sparse
 import numpy as np
 
 from tensormet.distance import (
@@ -74,7 +72,9 @@ from tensormet.distance import (
     _tucker_gram_ZtZ,                       # distance.py:622
 )
 from tensormet.sparse_ops import compute_Zcols_batch, safe_ravel
+from tensormet.utils import guarded_cupy_import
 
+cp, cpx_sparse = guarded_cupy_import()
 
 # ---------------------------------------------------------------------------
 # Internal utilities

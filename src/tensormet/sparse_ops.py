@@ -2,10 +2,9 @@ import tensorly as tl
 import pytensorlab as ptl
 import numpy as np
 from typing import List, Tuple, Optional, Union
-import cupy as cp
-import cupyx.scipy.sparse as cpx_sparse
 import math
-from tensormet.utils import einsum_letters
+from tensormet.utils import einsum_letters, guarded_cupy_import
+cp, cpx_sparse = guarded_cupy_import()
 
 # -------------------------------------------------------------------
 # Helper functions to strictly enforce int64 bounds, bypassing
