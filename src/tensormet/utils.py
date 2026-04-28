@@ -11,8 +11,9 @@ from contextlib import contextmanager
 from threadpoolctl import threadpool_limits
 import json
 import sys
-from typing import Any, Dict, Optional, Union, IO
+from typing import Any, Dict, Optional, Union, IO, Tuple
 from datetime import datetime, UTC
+import logging
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
