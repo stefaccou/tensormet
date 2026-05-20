@@ -1,11 +1,19 @@
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Union, Set, Any
 import hashlib
 import json
 import re
-from tensormet.utils import DATA_DIR, shared_factor_suffix, nontrivial_linked_groups
+import os
+from tensormet.utils import DATA_DIR, shared_factor_suffix, nontrivial_linked_groups, dim_spec_str
+
+
+def _as_dim_tuple(dim) -> tuple:
+    """Normalise dim to a tuple regardless of whether it is stored as int or list/tuple."""
+    if isinstance(dim, int):
+        return (dim,)
+    return tuple(dim)
 
 
 def parse_ngram_order(type_str: str) -> Optional[int]:
@@ -64,7 +72,6 @@ class EvalConfig:
     sem_error_type: Union[str, Tuple[str, ...]] = "full" # updated 2026-03-04
     sem_softmax_temperature: float = 0.1
     sem_fitness_target: int = 10_000
-    n_sentence_cache: Optional[int] = None  # if we later want to cap loaded sentences
     remove_OOV: bool = False # whether to set OOV in test set to OOV token (false ignores the sentences)
     time_iteration: bool = True # whether to print the time taken by an iteration
     save_intermediate: bool = True # whether to save the current best model (safety for interrupted code)
@@ -76,7 +83,7 @@ class ExperimentConfig:
     dataset: str = "fineweb-en"
     method: str = "siiSoftPlus"
     divergence: str = "fr"
-    dim: int = 1000
+    dim: Union[int, Tuple[int, ...]] = 1000
     order: int=3
     rank: Tuple[int, ...] = (100, 100, 100)
     name: str = None
@@ -86,14 +93,6 @@ class ExperimentConfig:
     overwrite: bool = False
     # paths
     data_dir: Path = DATA_DIR
-
-    def run_id(self) -> str:
-        """Stable-ish identifier based on config content (not timestamp)."""
-        payload = json.dumps(asdict(self), sort_keys=True, default=str).encode("utf-8")
-        return hashlib.sha1(payload).hexdigest()[:10]
-
-    def output_dir(self) -> Path:
-        return self.data_dir / "tensors" / self.dataset / "decomposition"
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -116,7 +115,7 @@ class RunConfig:
         sf_suffix = shared_factor_suffix(linked_nontrivial)
         ss_suffix = f"_{str(self.train.subsample_frac).replace('.', 'p')}ss" if self.train.subsample_frac != 1.0 else ""
         return (f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_"
-                f"{self.exp.dim}d{sf_suffix}_{r0}r{ss_suffix}_{self.train.n_iter_max}i.pt")
+                f"{dim_spec_str(self.exp.dim)}d{sf_suffix}_{r0}r{ss_suffix}_{self.train.n_iter_max}i.pt")
 
     def model_path(self) -> Path:
         return self.output_dir() / self.model_filename()
@@ -173,11 +172,12 @@ class RunConfig:
         linked_nontrivial = nontrivial_linked_groups(self.train.shared_factors, num_factors=self.exp.order)
         sf_suffix = shared_factor_suffix(linked_nontrivial)
         ss_suffix = f"_{str(self.train.subsample_frac).replace('.', 'p')}ss" if self.train.subsample_frac != 1.0 else ""
-        new_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{self.exp.dim}d{sf_suffix}_{r0}r{ss_suffix}_"
-        legacy_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.dim}d_{r0}r_"
+        _ds = dim_spec_str(self.exp.dim)
+        new_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{_ds}d{sf_suffix}_{r0}r{ss_suffix}_"
+        legacy_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{_ds}d_{r0}r_"
 
         # Pattern without shared-factor suffix, for legacy fallback when sf_suffix is set
-        new_pattern_no_sf = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{self.exp.dim}d_{r0}r{ss_suffix}_"
+        new_pattern_no_sf = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{_ds}d_{r0}r{ss_suffix}_"
 
         # Find all JSON config files: new (with sf_suffix) → new (without sf_suffix) → legacy
         candidate_configs = list(out_dir.glob(f"{new_pattern}*i_config.json"))
@@ -217,7 +217,7 @@ class RunConfig:
                     old_exp.get("order") == self.exp.order and # new: order
                     old_exp.get("method") == self.exp.method and
                     old_exp.get("divergence") == self.exp.divergence and
-                    old_exp.get("dim") == self.exp.dim and
+                    _as_dim_tuple(old_exp.get("dim", [])) == _as_dim_tuple(self.exp.dim) and
                     tuple(old_exp.get("rank", [])) == tuple(self.exp.rank) and
                     old_train.get("init") == self.train.init and
                     _canonical_shared_factors(old_train.get("shared_factors")) ==
@@ -328,6 +328,59 @@ class RunConfig:
             "fitness_scores": fitness_scores,
             "checkpoint_tensor": checkpoint_tensor
         }
+
+
+@dataclass
+class InspectionConfig:
+    dim: Union[int, str, Tuple[int, ...]]
+    name: Optional[str] = None
+    dataset: str = "fineweb_english_1B"
+    method: str = "siiSoftPlus"
+    divergence: str = "kl"
+    order: int = 3
+    iters: int = 2000
+    rank: int = 150
+    shared_factors: Set[Tuple[int, int]] = field(default_factory=lambda: {(1, 2)})
+    subsample_frac: float = 0.25
+
+    def _norm_dim(self):
+        return tuple(int(x) for x in self.dim.split("-")) if isinstance(self.dim, str) else self.dim
+
+    def _norm_sf(self):
+        return tuple(tuple(p) for p in self.shared_factors) if self.shared_factors else None
+
+    def _as_run_config(self) -> RunConfig:
+        return RunConfig(
+            exp=ExperimentConfig(
+              dim=self._norm_dim(), name=self.name, dataset=self.dataset,
+              method=self.method, divergence=self.divergence, order=self.order,
+              rank=(self.rank,) * self.order,
+            ),
+            train=TrainingConfig(
+              n_iter_max=self.iters, subsample_frac=self.subsample_frac,
+              shared_factors=self._norm_sf(),
+            ),
+            eval=EvalConfig(),
+        )
+
+    @property
+    def stem(self) -> str:
+        return self._as_run_config().model_filename().removesuffix(".pt")
+
+    @property
+    def log_path(self):
+        return self._as_run_config().artifact_paths()["log"]
+
+    @property
+    def checkpoint_dir(self):
+        return self._as_run_config().artifact_paths()["checkpoint_dir"]
+
+    @property
+    def vocab_path(self):
+        sf = shared_factor_suffix(nontrivial_linked_groups(self._norm_sf(), self.order))
+        return (DATA_DIR / "tensors" / self.dataset /
+              f"vocabularies/{self.order}D_{dim_spec_str(self._norm_dim())}d{sf}.pkl")
+
 @dataclass(frozen=True)
 class VectorExperimentConfig:
 
@@ -360,28 +413,6 @@ class HFStreamConfig:
     split: str = "train"
     text_column: str = "text"
 
-def _default_hf_config_for_dataset(dataset: str) -> HFStreamConfig:
-    """
-    Map your ExperimentConfig.dataset to a HF streaming spec.
-    Keep this small + explicit so downstream code stays consistent.
-    """
-    # Your current default in ExperimentConfig is "fineweb-en".
-    if dataset in {"fineweb-en", "fineweb_en", "fineweb-english"}:
-        return HFStreamConfig(
-            path="HuggingFaceFW/fineweb",
-            config="CC-MAIN-2025-26",
-            split="train",
-            text_column="text",
-        )
-
-    # Fallback: allow passing a HF dataset path directly in cfg.exp.dataset
-    # Optionally support "path:config" form.
-    if ":" in dataset:
-        path, cfg = dataset.split(":", 1)
-        cfg = cfg.strip() or None
-        return HFStreamConfig(path=path.strip(), config=cfg)
-
-    return HFStreamConfig(path=dataset, config=None)
 
 @dataclass(frozen=True)
 class VectorRunConfig:
@@ -413,8 +444,10 @@ class VectorRunConfig:
 class PopulationExperimentConfig:
     dataset: str = "fineweb-en"
     top_ks: Tuple[int, ...] = (1000, 2000, 4000, 6000)
+    top_ks_asymmetric: Optional[Tuple[Tuple[int, ...], ...]] = None
     cols_to_build: Tuple[str, ...] = ("root", "nsubj", "obj")
     shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None
+    min_mode_ks: Optional[Tuple[int, ...]] = None  # per-mode minimum vocab floor, indexed by mode
     # v_col: str = "root"
     # s_col: str = "nsubj"
     # o_col: str = "obj"
@@ -422,6 +455,7 @@ class PopulationExperimentConfig:
     batch_readahead: int = 32
     fragment_readahead: int = 8
     data_dir: Path = DATA_DIR
+    remove_hapax: bool = False
 
     def vectors_dir(self) -> Path:
         return self.data_dir / "vectors" / self.dataset
@@ -432,3 +466,5 @@ class PopulationExperimentConfig:
 @dataclass(frozen=True)
 class PopulationRunConfig:
     exp: PopulationExperimentConfig
+
+

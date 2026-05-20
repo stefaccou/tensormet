@@ -1,4 +1,3 @@
-from tensormet.tucker_tensor import extract_roles_from_vocab
 from tensormet.utils import (select_gpu,
                              ThreadBudget,
                              compute_num_threads,
@@ -10,7 +9,8 @@ from tensormet.utils import (select_gpu,
                              notify_discord,
                              extract_roles_from_vocab,
                              shared_factor_suffix,
-                             linked_factor_groups
+                             linked_factor_groups,
+                             dim_spec_str,
                              )
 import os
 import sys
@@ -147,6 +147,9 @@ def launch_tensor_population(cfg):
     start_time = time.time()
 
     with tee_output(log_path):
+        min_mode_ks = None
+        if cfg.exp.min_mode_ks:
+            min_mode_ks = {i: v for i, v in enumerate(cfg.exp.min_mode_ks) if v > 0}
         results = populate_tensors_parquet(
             path_to_vectors=vectors_dir,
             top_ks=list(cfg.exp.top_ks),
@@ -157,6 +160,9 @@ def launch_tensor_population(cfg):
             batch_rows=cfg.exp.batch_rows,
             batch_readahead=cfg.exp.batch_readahead,
             fragment_readahead=cfg.exp.fragment_readahead,
+            remove_hapax=cfg.exp.remove_hapax,
+            top_ks_asymmetric=list(cfg.exp.top_ks_asymmetric) if cfg.exp.top_ks_asymmetric else None,
+            min_mode_ks=min_mode_ks,
         )
 
     end_time = time.time()
@@ -204,11 +210,12 @@ def launch_nnt_decomposition(cfg):
     suffix = shared_factor_suffix(linked_nontrivial)
 
     # Note the added {cfg.exp.order}D_ to match what population.py writes
+    _ds = dim_spec_str(cfg.exp.dim)
     vocab_path = os.path.join(
         DATA_DIR,
         "tensors",
         cfg.exp.dataset,
-        f"vocabularies/{cfg.exp.order}D_{cfg.exp.dim}d{suffix}.pkl"
+        f"vocabularies/{cfg.exp.order}D_{_ds}d{suffix}.pkl"
     )
     try:
         with open(vocab_path, "rb") as f:
@@ -222,7 +229,7 @@ def launch_nnt_decomposition(cfg):
             DATA_DIR,
             "tensors",
             cfg.exp.dataset,
-            f"vocabularies/{cfg.exp.dim}{suffix}.pkl"
+            f"vocabularies/{_ds}{suffix}.pkl"
         )
         with open(vocab_path, "rb") as f:
             vocab = pickle.load(f)
@@ -253,7 +260,7 @@ def launch_nnt_decomposition(cfg):
                                                          )
     if cfg.eval.remove_OOV:
         start = time.time()
-        clean_sample = ensure_vocab(vocab, sentence_sample)
+        clean_sample = ensure_vocab(vocab, sentence_sample, parquet_roles)
         print("cleaned sample in ", time.time() - start)
     else:
         clean_sample = sentence_sample

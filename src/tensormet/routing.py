@@ -18,12 +18,13 @@ class UpdateRouting:
 
 
 
-def get_update_routing_step(divergence: Divergence, dim: int, log_step:bool, largedim=False) -> UpdateRouting:
+def get_update_routing_step(divergence: Divergence, dim, log_step:bool, largedim=False) -> UpdateRouting:
     """Return the correct update functions for the step if logging is active."""
+    _max_dim = max(dim) if isinstance(dim, (tuple, list)) else dim
     if divergence == "kl":
-        factor_fn = kl_factor_update_largedim if (dim >= 4000 or largedim) else kl_factor_update
-        core_fn = kl_core_update_largedim if (dim >= 3000 or largedim) else kl_core_update
-        error_fn = kl_compute_errors_largedim if (dim >= 3000 or largedim) else kl_compute_errors
+        factor_fn = kl_factor_update_largedim if (_max_dim >= 4000 or largedim) else kl_factor_update
+        core_fn = kl_core_update_largedim if (_max_dim >= 3000 or largedim) else kl_core_update
+        error_fn = kl_compute_errors_largedim if (_max_dim >= 3000 or largedim) else kl_compute_errors
         return UpdateRouting(
             factor_update=factor_fn,
             core_update=core_fn,
@@ -32,7 +33,7 @@ def get_update_routing_step(divergence: Divergence, dim: int, log_step:bool, lar
         )
 
     if divergence == "fr":
-        if dim <= 4000 and not largedim:
+        if _max_dim <= 4000 and not largedim:
             return UpdateRouting(
                     factor_update=fr_factor_update,
                     core_update=fr_combined_core_errors if log_step else fr_core_update,  # returns (core, rel_error)

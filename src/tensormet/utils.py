@@ -22,6 +22,13 @@ if data_path is None:
     raise EnvironmentError("Neither SCRATCH_DATA nor DATA environment variable is set")
 DATA_DIR = Path(data_path)
 
+def np_dispatch(el):
+    try:
+        element = el.get()
+    except AttributeError:
+        element = el
+    return element
+
 
 def guarded_cupy_import(check_cuda: bool = True) -> Tuple[Optional[object], Optional[object]]:
     """
@@ -465,3 +472,49 @@ def shared_factor_suffix(shared_factors) -> str:
         return ""
     parts = ["shared" + "".join(map(str, pair)) for pair in sorted(shared_factors)]
     return "_" + "_".join(parts)
+
+def dim_spec_str(dims: "int | tuple[int, ...]") -> str:
+    """Canonical filename fragment for a vocab-size spec.
+
+    int or uniform tuple → '1000'
+    mixed tuple          → '1000-2000-500'
+    """
+    if isinstance(dims, int):
+        return str(dims)
+    vals = tuple(dims)
+    if len(set(vals)) == 1:
+        return str(vals[0])
+    return "-".join(str(d) for d in vals)
+
+
+def resolve_checkpoint_path(path, decomp_path=None):
+    """Resolve a checkpoint path from a flexible `path` argument.
+
+    Args:
+        path: None (latest checkpoint), int (specific step), or str/Path (direct file).
+        decomp_path: Path to the model file whose sibling *_checkpoints/ dir is used.
+                     Required when path is None or int.
+    """
+    if path is not None and not isinstance(path, int):
+        return Path(path)
+
+    if decomp_path is None:
+        raise ValueError(
+            "decomp_path must be provided (or set on the TuckerDecomposition instance) "
+            "when path is None or an int."
+        )
+    decomp_path = Path(decomp_path)
+    checkpoint_dir = decomp_path.parent / f"{decomp_path.stem}_checkpoints"
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+    if path is None:
+        pts = [p for p in checkpoint_dir.glob("*.pt") if p.stem.isdigit()]
+        if not pts:
+            raise FileNotFoundError(f"No checkpoint files found in {checkpoint_dir}")
+        return max(pts, key=lambda p: int(p.stem))
+    else:
+        ckpt = checkpoint_dir / f"{path}.pt"
+        if not ckpt.exists():
+            raise FileNotFoundError(f"Checkpoint {path} not found at {ckpt}")
+        return ckpt

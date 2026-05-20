@@ -75,7 +75,7 @@ for divergence in divergences:
 
             if remove_OOV:
                 start = time.time()
-                clean_sample = ensure_vocab(vocab, sentence_sample)
+                clean_sample = ensure_vocab(vocab, sentence_sample, ("root", "nsubj", "obj"))
                 print("cleaned sample in ", time.time() - start)
             else:
                 clean_sample = sentence_sample

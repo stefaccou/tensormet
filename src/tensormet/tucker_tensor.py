@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 
 from tensormet.config import RunConfig
+from pathlib import Path
 from tensormet.utils import (DATA_DIR,
                             torch_or_pickle_load,
                             readonly_dispatch,
@@ -30,7 +31,10 @@ from tensormet.utils import (DATA_DIR,
                             einsum_letters,
                             SparseCOOTensor,
                             guarded_cupy_import,
-                            make_lazy_cupy_pair
+                            make_lazy_cupy_pair,
+                            dim_spec_str,
+                            np_dispatch,
+                            resolve_checkpoint_path,
                    )
 from tensormet.sparse_ops import initialize_nonnegative_tucker
 from tensormet.similarity import evaluate_sample, get_eval_num_threads
@@ -108,6 +112,7 @@ class TuckerDecomposition:
         self.shared_factors = shared_factors or set()
         # If roles aren't provided explicitly, parse them from the vocab keys
         self.roles = extract_roles_from_vocab(self.vocab)
+        self.decomp_path = None
 
     def get_role_index(self, role: str) -> int:
         """Helper method to wrap the module-level _role_index using instance roles."""
@@ -122,7 +127,7 @@ class TuckerDecomposition:
                        dataset: str="fineweb-en",
                        method: str="siiSoftPlus",
                        divergence: str="kl",
-                       dims: int=4000,
+                       dims: "int | tuple[int, ...]"=4000,
                        rank: int=100,
                        order: int=3,
                        iterations: int|None=None,
@@ -177,8 +182,9 @@ class TuckerDecomposition:
         # Handle the new {order}D_ naming format vs legacy naming.
         # New format (post N-D migration): {order}D_{dims}d{suffix}.pkl
         # Legacy format (3D only):         {dims}{suffix}.pkl
-        vocab_path_new = os.path.join(base, f"vocabularies/{order}D_{dims}d{suffix}.pkl")
-        vocab_path_old = os.path.join(base, f"vocabularies/{dims}{suffix}.pkl")
+        _ds = dim_spec_str(dims)
+        vocab_path_new = os.path.join(base, f"vocabularies/{order}D_{_ds}d{suffix}.pkl")
+        vocab_path_old = os.path.join(base, f"vocabularies/{_ds}{suffix}.pkl")
 
         if os.path.exists(vocab_path_new):
             vocab_path = vocab_path_new
@@ -196,9 +202,9 @@ class TuckerDecomposition:
         name_prefix = f"{name + '_' if name else ''}"
         ss_suffix = f"_{str(subsample_frac).replace('.', 'p')}ss" if subsample_frac != 1.0 else ""
 
-        new_file_prefix      = f"{name_prefix}{divergence}_{method}_{order}D_{dims}d{suffix}_{rank}r{ss_suffix}_"
-        new_file_prefix_no_sf = f"{name_prefix}{divergence}_{method}_{order}D_{dims}d_{rank}r{ss_suffix}_"
-        legacy_file_prefix   = f"{name_prefix}{divergence}_{method}_{dims}d_{rank}r_"
+        new_file_prefix      = f"{name_prefix}{divergence}_{method}_{order}D_{_ds}d{suffix}_{rank}r{ss_suffix}_"
+        new_file_prefix_no_sf = f"{name_prefix}{divergence}_{method}_{order}D_{_ds}d_{rank}r{ss_suffix}_"
+        legacy_file_prefix   = f"{name_prefix}{divergence}_{method}_{_ds}d_{rank}r_"
 
         def _find_highest_iter(decomp_dir: str, prefix: str) -> int:
             highest = -1
@@ -284,8 +290,16 @@ class TuckerDecomposition:
         else:
             print("Warning: file creation predates logging of runs; no run info available.")
 
-        return cls(core, factors, vocab, shared_factors=parsed_shared, roles=roles)
+        instance = cls(core, factors, vocab, shared_factors=parsed_shared, roles=roles)
+        instance.decomp_path = Path(decomp_path)
+        return instance
 
+    def update_from_path(self, path=None):
+        resolved = resolve_checkpoint_path(path, self.decomp_path)
+        tensor = torch.load(resolved, map_location="cpu", weights_only=False)
+        self.core = np_dispatch(tensor.core)
+        self.factors = np_dispatch(tensor.factors)
+        self.decomp_path = resolved
 
 
     def check_vocab(self, triple: Tuple[str, ...], return_type=bool) -> bool|tuple:
@@ -781,8 +795,10 @@ class TuckerDecomposition:
         elif isinstance(element, str):
             latent = self.fetch_single_latent(element, role=role)
             # print("latent from factor")
+        elif isinstance(element, np.ndarray):
+            latent = element
         else:
-            raise ValueError("Must be tuple or str")
+            raise ValueError("Must be tuple, str or ndarray")
 
         i = self.get_role_index(role)
         F = self.factors[i].cpu().numpy() if hasattr(self.factors[0], "cpu") else self.factors[i]
@@ -1636,7 +1652,7 @@ class SparseTupleTensor:
             dataset: str = "fineweb-en",
             method: str = "siiSoftPlus",
             order: int = 3,
-            dims: int = 1000,
+            dims: "int | tuple[int, ...]" = 1000,
             map_location: str = "cpu",
             tier1: bool = False,
             shared_factors: Optional[Union[Tuple[Tuple[int, int], ...], str]] = None,
@@ -1666,11 +1682,12 @@ class SparseTupleTensor:
 
         linked_nontrivial = nontrivial_linked_groups(shared_factors, num_factors=order)
         suffix = shared_factor_suffix(linked_nontrivial)
-        populated_path = os.path.join(base, "populated", f"{method}_{order}D_{dims}d{suffix}.pt")
+        _ds = dim_spec_str(dims)
+        populated_path = os.path.join(base, "populated", f"{method}_{order}D_{_ds}d{suffix}.pt")
 
         if not os.path.exists(populated_path):
             if order == 3: # legacy naming support
-                populated_path = os.path.join(base, "populated", f"{method}_{dims}{suffix}.pt")
+                populated_path = os.path.join(base, "populated", f"{method}_{_ds}{suffix}.pt")
             else:
                 raise FileNotFoundError(f"Missing populated tensor file: {populated_path}")
 
@@ -1804,11 +1821,12 @@ class SparseTupleTensor:
                                ):
 
         dim = self.shape[0]
+        _max_dim = max(self.shape)
         nnz = self.tensor._nnz()
-        if divergence == "fr" and dim <= 4000:
-            print("fast GPU algorithm, estimated time:", dim/1000)
-        elif divergence == "kl" and dim < 4000:
-            print("fast GPU algorithm, estimated time:", dim/200)
+        if divergence == "fr" and _max_dim <= 4000:
+            print("fast GPU algorithm, estimated time:", _max_dim/1000)
+        elif divergence == "kl" and _max_dim < 4000:
+            print("fast GPU algorithm, estimated time:", _max_dim/200)
         else:
             factor_time = (rank**1.76) * (dim**0.16) * (nnz**0.78) * 1e-9
             print(factor_time, "estimated time per factor update")
@@ -1849,6 +1867,7 @@ class SparseTupleTensor:
             sem_error_type = cfg.eval.sem_error_type
             # logging
             rec_log_every = cfg.eval.rec_log_every
+            rec_log_every = rec_log_every or rec_check_every
             time_iteration = cfg.eval.time_iteration
             # saving
             save_intermediate = cfg.eval.save_intermediate
@@ -1879,6 +1898,7 @@ class SparseTupleTensor:
         shape = tuple(self.shape)
         rank = validate_tucker_rank(shape, rank=rank)
         modes = list(range(len(rank)))
+        _max_dim = max(shape)
         if checkpoint_tensor is not None:
             if isinstance(checkpoint_tensor, tuple):
                 # if TensorLy TuckerTensor
@@ -1897,6 +1917,7 @@ class SparseTupleTensor:
         _n_gpus = getattr(cfg.train, "n_gpus", 1)
         _subsample_frac = getattr(cfg.train, "subsample_frac", 1.0)
         _subsample_warmup = getattr(cfg.train, "subsample_warmup", 0)
+
         if _n_gpus > 1:
             _sst = ShardedSparseTensor.from_coo(
                 self.tensor, shape, device_ids=list(range(_n_gpus)),
@@ -1942,14 +1963,14 @@ class SparseTupleTensor:
             routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step, largedim=largedim)
             # --- multi-GPU routing override (largedim variants only) ---
             if _sst is not None:
-                if divergence == "kl" and (dim >= 4000 or largedim):
+                if divergence == "kl" and (_max_dim >= 4000 or largedim):
                     routing = UpdateRouting(
                         factor_update=make_sharded_kl_factor_update(_sst),
                         core_update=make_sharded_kl_core_update(_sst),
                         error_fn=make_sharded_kl_compute_errors(_sst),
                         core_returns_error=routing.core_returns_error,
                     )
-                elif divergence == "fr" and (dim > 4000 or largedim):
+                elif divergence == "fr" and (_max_dim > 4000 or largedim):
                     routing = UpdateRouting(
                         factor_update=make_sharded_fr_factor_update(_sst),
                         core_update=make_sharded_fr_core_update(_sst),
@@ -2029,7 +2050,7 @@ class SparseTupleTensor:
 
                 # ---- reconstruction + patience ----
                 has_prev_err = len(rec_errors) >= 2
-                if verbose and has_prev_err:
+                if has_prev_err:
                     delta = rec_errors[-2] - rec_errors[-1]
 
 
@@ -2065,7 +2086,7 @@ class SparseTupleTensor:
                                     )
                                 break
                         else:
-                            if verbose and no_rec_improve_steps:
+                            if no_rec_improve_steps:
                                 print(f"Improved (Δ={imp_val:.3e}); resetting patience counter.")
                             no_rec_improve_steps = 0
                         last_err = rel_err
@@ -2153,7 +2174,7 @@ class SparseTupleTensor:
                             )
                         break
                 else:
-                    if verbose and sem_no_rec_improve_steps:
+                    if sem_no_rec_improve_steps:
                         print(f"\tSemantic improvement (Δ={diff:.3e}); resetting patience counter.")
                     sem_no_rec_improve_steps = 0
 

@@ -29,7 +29,6 @@ from tensormet.config import (
     VectorExperimentConfig,
     VectorRunConfig,
     HFStreamConfig,
-    _default_hf_config_for_dataset, #todo Fix this import
     PopulationExperimentConfig,
     PopulationRunConfig,
     parse_ngram_order,
@@ -155,6 +154,47 @@ def _parse_top_ks(s: str) -> Tuple[int, ...]:
         raise argparse.ArgumentTypeError(f"Invalid top-ks specification: {s}")
 
 
+def _parse_top_ks_asymmetric(s: str) -> Tuple[Tuple[int, ...], ...]:
+    """Parse per-mode vocab-size variants separated by '|', modes by ','.
+
+    Example: "1000,2000,1000|2000,4000,2000"
+      → ((1000, 2000, 1000), (2000, 4000, 2000))
+    """
+    if not s:
+        return tuple()
+    variants = []
+    for variant_str in s.split("|"):
+        parts = [p.strip() for p in variant_str.split(",") if p.strip()]
+        if not parts:
+            continue
+        try:
+            variants.append(tuple(int(p) for p in parts))
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"Invalid --top-ks-asymmetric variant {variant_str!r}. "
+                "Expected comma-separated ints, variants separated by '|'."
+            )
+    return tuple(variants)
+
+
+def _parse_dim(s: str) -> "int | Tuple[int, ...]":
+    """Parse --dim as a single int or comma-separated ints (for asymmetric tensors).
+
+    "1000"           → 1000
+    "1000,2000,1000" → (1000, 2000, 1000)  — uniform collapses back to int
+    """
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    try:
+        vals = tuple(int(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid --dim value: {s!r}. Expected int or comma-separated ints.")
+    if len(vals) == 1:
+        return vals[0]
+    if len(set(vals)) == 1:
+        return vals[0]
+    return vals
+
+
 def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     """Parse CLI args and return a RunConfig built from defaults with overrides.
 
@@ -175,7 +215,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--method", type=str, default=None)
     parser.add_argument("--divergence", type=str, default=None)
-    parser.add_argument("--dim", type=int, default=None)
+    parser.add_argument("--dim", type=_parse_dim, default=None)
     parser.add_argument("--order", type=int, default=None) # new: order
     parser.add_argument("--rank", type=str, default=None,
                         help="Comma-separated ranks, e.g. --rank 100,100,100 or single int")
@@ -308,13 +348,28 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     return RunConfig(exp=new_exp, train=new_train, eval=new_eval)
 
 
+def hf_config_for_dataset(dataset: str) -> HFStreamConfig:
+    """Map a dataset label to an HFStreamConfig. Supports 'path:config' shorthand."""
+    if dataset in {"fineweb-en", "fineweb_en", "fineweb-english"}:
+        return HFStreamConfig(
+            path="HuggingFaceFW/fineweb",
+            config="CC-MAIN-2025-26",
+            split="train",
+            text_column="text",
+        )
+    if ":" in dataset:
+        path, cfg = dataset.split(":", 1)
+        return HFStreamConfig(path=path.strip(), config=cfg.strip() or None)
+    return HFStreamConfig(path=dataset, config=None)
+
+
 def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig:
     """
     Parse CLI args and return a VectorRunConfig built from defaults with overrides.
 
     Rules:
     - VectorExperimentConfig defaults come from config.py
-    - HFStreamConfig is derived from --dataset (via _default_hf_config_for_dataset)
+    - HFStreamConfig is derived from --dataset (via hf_config_for_dataset)
       unless overridden by --hf-path/--hf-config/--hf-split/--hf-text-column.
 
     Args:
@@ -414,7 +469,7 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
 
     # ---- hf config: derive from dataset unless overridden ----
     dataset = d.get("dataset") or "fineweb-en"
-    hf_default = _default_hf_config_for_dataset(dataset)
+    hf_default = hf_config_for_dataset(dataset)
 
     hf_path = d.get("hf_path")
     hf_config = d.get("hf_config")
@@ -442,6 +497,9 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
 
     parser.add_argument("--dataset", type=str, default=None, help="Dataset folder name inside vectors/ and tensors/")
     parser.add_argument("--top-ks", type=_parse_top_ks, default=None, help="Comma-separated ints, e.g. --top-ks 1000,2000,5000")
+    parser.add_argument("--top-ks-asymmetric", type=_parse_top_ks_asymmetric, dest="top_ks_asymmetric", default=None,
+                        help="Per-mode vocab sizes. Variants separated by '|', modes by ','. "
+                             "E.g. --top-ks-asymmetric 1000,2000,1000|2000,4000,2000")
     # parser.add_argument("--v-col", type=str, dest="v_col", default=None)
     # parser.add_argument("--s-col", type=str, dest="s_col", default=None)
     # parser.add_argument("--o-col", type=str, dest="o_col", default=None)
@@ -462,9 +520,18 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
     parser.add_argument("--batch-readahead", type=int, dest="batch_readahead", default=None)
     parser.add_argument("--fragment-readahead", type=int, dest="fragment_readahead", default=None)
     parser.add_argument("--data-dir", type=Path, dest="data_dir", default=None)
+    parser.add_argument("--remove-hapax", type=_parse_bool, dest="remove_hapax", default=None,
+                        help="Remove multi-way co-occurrences that appear only once before populating tensors.")
+    parser.add_argument("--min-mode-ks", type=_parse_top_ks, dest="min_mode_ks", default=None,
+                        help="Comma-separated per-mode minimum vocab floor, e.g. --min-mode-ks 5000,0,0 "
+                             "guarantees at least 5K items from mode 0 in any shared vocabulary.")
 
     parsed = parser.parse_args(args=argv)
     d = vars(parsed)
+
+    # If only asymmetric variants were specified, don't pull in the default uniform top_ks.
+    if d.get("top_ks_asymmetric") is not None and d.get("top_ks") is None:
+        d["top_ks"] = ()
 
     # Resolve "all" sentinel for shared_factors using cols_to_build length
     if d.get("shared_factors") == "all":
@@ -476,12 +543,15 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
     for f in (
             "dataset",
             "top_ks",
+            "top_ks_asymmetric",
             "cols_to_build",
             "shared_factors",
             "batch_rows",
             "batch_readahead",
             "fragment_readahead",
             "data_dir",
+            "remove_hapax",
+            "min_mode_ks",
     ):
         if d.get(f) is not None:
             exp_kwargs[f] = d[f]
