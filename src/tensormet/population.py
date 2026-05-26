@@ -2,7 +2,7 @@ from math import log, prod
 from collections import Counter, defaultdict
 from pathlib import Path
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import multiprocessing
 import torch
 from tqdm import tqdm
@@ -306,11 +306,13 @@ def populate_tensors_parquet(
     cols_to_build : list = ["root", "nsubj", "obj"],
     shared_factors=None,
     batch_rows: int = 256_000,
-    batch_readahead: int = 32,
-    fragment_readahead: int = 8,
+    batch_readahead: int = 4,
+    fragment_readahead: int = 2,
     remove_hapax: bool = False,
     top_ks_asymmetric=None,
     min_mode_ks: dict[int, int] | None = None,
+    max_workers: int = 0,
+    shards_per_task: int = 1,
 ):
     path_to_vectors = os.fspath(path_to_vectors)
     n_modes = len(cols_to_build)
@@ -346,7 +348,7 @@ def populate_tensors_parquet(
     print(f"Tensors will be saved to {path_to_tensors}")
 
     vector_dir = Path(path_to_vectors)
-    parquet_files = sorted(vector_dir.glob("part-*.parquet"))
+    parquet_files = sorted(vector_dir.glob("*.parquet"))
 
     if not parquet_files:
         raise FileNotFoundError(f"No parquet shards found in {vector_dir}")
@@ -476,37 +478,78 @@ def populate_tensors_parquet(
         for subset in combinations(cols_to_build, r)
     }
 
-    n_workers = min(multiprocessing.cpu_count(), len(parquet_files))
-    # n_workers = min(50, len(parquet_files))
-    print(f"using {n_workers} workers")
-    shard_chunks = [
-        [os.fspath(p) for p in parquet_files[i::n_workers]]
-        for i in range(n_workers)
+    _cpu = multiprocessing.cpu_count()
+    if max_workers and max_workers > 0:
+        n_workers = min(max_workers, len(parquet_files))
+    else:
+        # ~1 worker per 100 shards; floor 4, cap at cpu_count.
+        # Small shards (many hundreds) get more workers; large shards (tens) stay at 4.
+        n_workers = min(max(4, len(parquet_files) // 100), _cpu, len(parquet_files))
+    shards_per_worker = len(parquet_files) / n_workers
+    print(f"using {n_workers} workers ({shards_per_worker:.0f} shards/worker, {shards_per_task} shard(s)/task)")
+
+    shards_per_task = max(1, shards_per_task)
+    all_shard_paths = [os.fspath(p) for p in parquet_files]
+    task_batches = [
+        all_shard_paths[i : i + shards_per_task]
+        for i in range(0, len(all_shard_paths), shards_per_task)
     ]
+    n_tasks = len(task_batches)
 
     # vocabs_max values are plain lists → picklable
     vocabs_max_plain = {col: list(vocabs_max[col]) for col in cols_to_build}
 
     print(f"Pass 2/2: computing joint counts restricted to max_ks={max_ks} vocab "
-          f"[{n_workers} workers, {len(parquet_files)} shards] ...")
+          f"[{n_workers} workers, {n_tasks} tasks, {len(parquet_files)} shards] ...")
+
+    import time as _time
+
+    # Only keep n_workers + small buffer tasks in-flight at once.
+    # Submitting all tasks upfront causes completed results to pile up as pickled
+    # bytes faster than the main process can merge them, flooding memory.
+    max_in_flight = n_workers + 4
+
+    t_pass2_start = _time.perf_counter()
 
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {
-            pool.submit(
-                _pass2_worker,
-                chunk,
-                cols_to_build,
-                vocabs_max_plain,
-                batch_rows,
-                batch_readahead,
-                fragment_readahead,
-            ): i
-            for i, chunk in enumerate(shard_chunks)
-        }
-        for fut in tqdm(as_completed(futures), total=n_workers, desc="Pass 2/2 workers"):
-            partial = fut.result()
-            for subset, counter in partial.items():
-                subset_counters[subset].update(counter)
+        task_iter = iter(task_batches)
+        pending: dict = {}
+
+        def _submit_one():
+            try:
+                batch = next(task_iter)
+                fut = pool.submit(
+                    _pass2_worker, batch, cols_to_build, vocabs_max_plain,
+                    batch_rows, batch_readahead, fragment_readahead,
+                )
+                pending[fut] = None
+            except StopIteration:
+                pass
+
+        for _ in range(min(max_in_flight, n_tasks)):
+            _submit_one()
+
+        n_done = 0
+        with tqdm(total=n_tasks, desc="Pass 2/2", unit="task") as pbar:
+            while pending:
+                done_futs, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
+                for fut in done_futs:
+                    partial = fut.result()
+                    del pending[fut]
+                    for subset, counter in partial.items():
+                        subset_counters[subset].update(counter)
+                    n_done += 1
+                    elapsed = _time.perf_counter() - t_pass2_start
+                    rate = n_done / elapsed
+                    eta = (n_tasks - n_done) / rate if rate > 0 else float("inf")
+                    pbar.set_postfix(
+                        rate=f"{rate:.1f} t/s",
+                        eta=f"{eta/60:.1f} min",
+                        in_flight=len(pending),
+                        refresh=False,
+                    )
+                    pbar.update()
+                    _submit_one()
 
 
 

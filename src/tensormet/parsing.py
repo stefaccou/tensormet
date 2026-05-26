@@ -32,6 +32,7 @@ from tensormet.config import (
     PopulationExperimentConfig,
     PopulationRunConfig,
     parse_ngram_order,
+    parse_raw_ngram_order,
 )
 
 
@@ -264,6 +265,8 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--rec-log-every", type=int, dest="rec_log_every", default=None)
     parser.add_argument("--sem-check-every", type=int, dest="sem_check_every", default=None)
     parser.add_argument("--sem-error-type", type=str, dest="sem_error_type", default=None)
+    parser.add_argument("--sem-primary-key", type=str, dest="sem_primary_key", default=None,
+                        help="Override the metric used for patience/diff, e.g. simlex_all_rho")
     parser.add_argument("--sem-softmax-temperature", type=float, dest="sem_softmax_temperature", default=None)
     parser.add_argument("--sem-fitness-target", type=int, dest="sem_fitness_target", default=None)
     parser.add_argument("--n-sentence-cache", type=int, dest="n_sentence_cache", default=None)
@@ -331,6 +334,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "rec_log_every",
         "sem_check_every",
         "sem_error_type",
+        "sem_primary_key",
         "sem_softmax_temperature",
         "sem_fitness_target",
         "n_sentence_cache",
@@ -448,21 +452,27 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
             exp_kwargs[f] = d[f]
 
     # Normalise n-gram type strings:
-    #   "3-gram"       → "3gram"
-    #   "4gram,5-gram" → "4gram,5gram"
+    #   "3-gram"         → "3gram"
+    #   "4gram,5-gram"   → "4gram,5gram"
+    #   "raw-3-gram"     → "raw3gram"
+    #   "raw3gram,raw5gram" → "raw3gram,raw5gram"
     if "type" in exp_kwargs:
         raw_type = exp_kwargs["type"]
         parts = [p.strip() for p in raw_type.split(",") if p.strip()]
         normalised = []
-        all_ngram = True
+        all_known = True
         for part in parts:
             n = parse_ngram_order(part)
             if n is not None:
                 normalised.append(f"{n}gram")
-            else:
-                all_ngram = False
-                normalised.append(part)
-        if all_ngram and normalised:
+                continue
+            rn = parse_raw_ngram_order(part)
+            if rn is not None:
+                normalised.append(f"raw{rn}gram")
+                continue
+            all_known = False
+            normalised.append(part)
+        if all_known and normalised:
             exp_kwargs["type"] = ",".join(normalised)
 
     new_exp = replace(default_exp, **exp_kwargs) if exp_kwargs else default_exp
@@ -519,6 +529,12 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
     parser.add_argument("--batch-rows", type=int, dest="batch_rows", default=None)
     parser.add_argument("--batch-readahead", type=int, dest="batch_readahead", default=None)
     parser.add_argument("--fragment-readahead", type=int, dest="fragment_readahead", default=None)
+    parser.add_argument("--max-workers", type=int, dest="max_workers", default=None,
+                        help="Max parallel worker processes for Pass 2. 0 or omit = auto (~1 worker per 100 shards).")
+    parser.add_argument("--shards-per-task", type=int, dest="shards_per_task", default=None,
+                        help="Shards bundled per submitted task. 1 = finest memory/ETA granularity (default).")
+    parser.add_argument("--vectors-dir", type=Path, dest="vectors_dir_override", default=None,
+                        help="Direct path to parquet vectors directory; overrides the dataset-derived path.")
     parser.add_argument("--data-dir", type=Path, dest="data_dir", default=None)
     parser.add_argument("--remove-hapax", type=_parse_bool, dest="remove_hapax", default=None,
                         help="Remove multi-way co-occurrences that appear only once before populating tensors.")
@@ -549,6 +565,9 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
             "batch_rows",
             "batch_readahead",
             "fragment_readahead",
+            "max_workers",
+            "shards_per_task",
+            "vectors_dir_override",
             "data_dir",
             "remove_hapax",
             "min_mode_ks",

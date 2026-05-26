@@ -37,8 +37,9 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
         create_vectors_parquet_sharded,
         create_frame_vectors_parquet_sharded,
         create_ngram_vectors_parquet_sharded,
+        create_raw_ngram_vectors_parquet_sharded,
     )
-    from tensormet.config import parse_ngram_orders
+    from tensormet.config import parse_ngram_orders, parse_raw_ngram_orders
 
     output_dir = cfg.output_dir()
     print("output_dir: ", output_dir)
@@ -72,10 +73,16 @@ def launch_vector_creation(cfg, *, overwrite: bool | None = None):
     start_time = time.time()
 
     _orders = parse_ngram_orders(cfg.exp.type)
+    _raw_orders = parse_raw_ngram_orders(cfg.exp.type)
     if cfg.exp.type == "frames":
         print('Frame-based vector creation')
         with tee_output(log_path):
             summary = create_frame_vectors_parquet_sharded(cfg, overwrite=do_overwrite)
+    elif _raw_orders is not None:
+        orders_str = ", ".join(f"{n}-gram (raw)" for n in _raw_orders)
+        print(f'Raw n-gram vector creation ({orders_str})')
+        with tee_output(log_path):
+            summary = create_raw_ngram_vectors_parquet_sharded(cfg, overwrite=do_overwrite)
     elif _orders is not None:
         orders_str = ", ".join(f"{n}-gram" for n in _orders)
         print(f'N-gram vector creation ({orders_str})')
@@ -163,6 +170,8 @@ def launch_tensor_population(cfg):
             remove_hapax=cfg.exp.remove_hapax,
             top_ks_asymmetric=list(cfg.exp.top_ks_asymmetric) if cfg.exp.top_ks_asymmetric else None,
             min_mode_ks=min_mode_ks,
+            max_workers=cfg.exp.max_workers,
+            shards_per_task=cfg.exp.shards_per_task,
         )
 
     end_time = time.time()

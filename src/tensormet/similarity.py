@@ -11,6 +11,7 @@ from typing import List, Tuple
 from tqdm import tqdm
 import pyarrow.parquet as pq
 import torch
+from scipy.stats import spearmanr
 
 def _to_np(x):
     # Accept NumPy arrays or torch tensors; return NumPy view/copy
@@ -363,6 +364,82 @@ def load_eval_sentences_cached_parquet(
     tmp.replace(cache_file)
 
     return sampled
+
+def load_simlex(path: str | os.PathLike) -> List[Tuple[str, str, str, float]]:
+    """Parse a SimLex-999 TSV file into (w1, w2, pos, score) tuples."""
+    pairs = []
+    with open(path, encoding="utf-8") as f:
+        next(f)
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 4:
+                continue
+            w1, w2, pos, score = parts[0], parts[1], parts[2], float(parts[3])
+            pairs.append((w1, w2, pos, score))
+    return pairs
+
+
+def evaluate_simlex(
+    pairs: List[Tuple[str, str, str, float]],
+    vecs_by_pos: dict,
+    *,
+    verbose: bool = True,
+) -> dict:
+    """
+    Evaluate word embeddings against SimLex-999 using Spearman correlation.
+
+    vecs_by_pos: {"N": {word: vector}, "V": {word: vector}, "A": {word: vector}}
+    Vectors need not be pre-normalised.
+    Returns per-POS and overall rho/pval/pairs/oov counts.
+    """
+    results   = {"N": [], "V": [], "A": []}
+    oov_count = {"N": 0,  "V": 0,  "A": 0}
+
+    for w1, w2, pos, human in pairs:
+        vecs = vecs_by_pos.get(pos, {})
+        if w1 not in vecs or w2 not in vecs:
+            oov_count[pos] += 1
+            continue
+        v1, v2 = _to_np(vecs[w1]), _to_np(vecs[w2])
+        n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+        sim = float(v1 @ v2) / max(n1 * n2, 1e-12)
+        results[pos].append((sim, human))
+
+    scores = {}
+    all_model, all_human = [], []
+
+    if verbose:
+        print(f"{'POS':<6} {'pairs':>6} {'OOV':>6} {'rho':>8}")
+        print("-" * 32)
+
+    for pos in ("N", "V", "A"):
+        data    = results[pos]
+        oov     = oov_count[pos]
+        n_total = len(data) + oov
+        if len(data) < 2:
+            if verbose:
+                print(f"{pos:<6} {n_total:>6} {oov:>6}   n/a (too few in-vocab)")
+            scores[pos] = {"rho": None, "pval": None, "pairs": n_total, "oov": oov}
+            continue
+        model_sims, human_sims = zip(*data)
+        rho, pval = spearmanr(model_sims, human_sims)
+        if verbose:
+            print(f"{pos:<6} {n_total:>6} {oov:>6} {rho:>8.3f}  (p={pval:.3g})")
+        scores[pos] = {"rho": float(rho), "pval": float(pval), "pairs": n_total, "oov": oov}
+        all_model.extend(model_sims)
+        all_human.extend(human_sims)
+
+    if all_model:
+        rho_all, p_all = spearmanr(all_model, all_human)
+        n_all   = sum(len(v) + oov_count[k] for k, v in results.items())
+        oov_all = sum(oov_count.values())
+        if verbose:
+            print("-" * 32)
+            print(f"{'ALL':<6} {n_all:>6} {oov_all:>6} {rho_all:>8.3f}  (p={p_all:.3g})")
+        scores["ALL"] = {"rho": float(rho_all), "pval": float(p_all), "pairs": n_all, "oov": oov_all}
+
+    return scores
+
 
 def ensure_vocab(vocab, sample, roles):
     legacy_map = {"verb": "v", "subject": "s", "object": "o"}

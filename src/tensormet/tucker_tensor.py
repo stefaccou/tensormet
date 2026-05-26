@@ -37,7 +37,7 @@ from tensormet.utils import (DATA_DIR,
                             resolve_checkpoint_path,
                    )
 from tensormet.sparse_ops import initialize_nonnegative_tucker
-from tensormet.similarity import evaluate_sample, get_eval_num_threads
+from tensormet.similarity import evaluate_sample, get_eval_num_threads, load_simlex, evaluate_simlex
 from tensormet.routing import get_update_routing_step, get_log_step, UpdateRouting
 from tensormet.stochastic_sparse import subsample_coo, make_iteration_rng
 from tensormet.sharded_sparse import (
@@ -52,7 +52,12 @@ from tensormet.sharded_sparse import (
 import time
 
 cp, cpx_sparse = make_lazy_cupy_pair()
-
+# Maps tensor role names to SimLex-999 POS tags (first match per POS wins)
+_SIMLEX_POS_MAP = {
+    "root": "V", "verb": "V",
+    "nsubj": "N", "obj": "N", "subject": "N", "object": "N",
+}
+_SIMLEX_PATH = DATA_DIR / "corpora" / "SimLex-999.txt"
 
 
 def _to_np(x):
@@ -1946,8 +1951,11 @@ class SparseTupleTensor:
         best_factors = [f.copy() for f in factors]
         best_sem_iteration = start_iteration if start_iteration > 0 else None
 
-        # Decide once which semantic metric drives patience/diff
-        if sem_error_type == "all":
+        # Decide once which semantic metric drives patience/diff.
+        # cfg.eval.sem_primary_key can override the auto-derived default.
+        if cfg.eval.sem_primary_key is not None:
+            sem_primary_key = cfg.eval.sem_primary_key
+        elif sem_error_type == "all":
             sem_primary_key = "average_rank_score"  # stable default (your dict always includes this)
         elif isinstance(sem_error_type, (list, tuple)):
             if len(sem_error_type) == 0:
@@ -1955,6 +1963,13 @@ class SparseTupleTensor:
             sem_primary_key = sem_error_type[0]
         else:
             sem_primary_key = sem_error_type
+
+        simlex_pairs = None
+        if _SIMLEX_PATH.exists():
+            try:
+                simlex_pairs = load_simlex(_SIMLEX_PATH)
+            except Exception as _e:
+                print(f"Warning: could not load SimLex-999 from {_SIMLEX_PATH}: {_e}")
 
         for iteration in range(start_iteration, n_iter_max):
             if time_iteration:
@@ -2114,10 +2129,55 @@ class SparseTupleTensor:
                     thread_budget=thread_budget,
                     return_type=sem_error_type,
                 )
+
+                if simlex_pairs is not None:
+                    try:
+                        vecs_by_pos = {"N": {}, "V": {}, "A": {}}
+                        for _ri, _role in enumerate(roles):
+                            _pos = _SIMLEX_POS_MAP.get(_role)
+                            if _pos is None or vecs_by_pos[_pos]:
+                                continue
+                            _fmat = tucker_decomp.factors[_ri].detach().cpu().numpy()
+                            _norms = np.maximum(np.linalg.norm(_fmat, axis=1, keepdims=True), 1e-12)
+                            _fmat = _fmat / _norms
+                            _vkey = voc_index(_role)
+                            if _vkey in tucker_decomp.vocab:
+                                vecs_by_pos[_pos] = {w: _fmat[idx] for w, idx in tucker_decomp.vocab[_vkey].items()}
+                        # Fallback for positional/n-gram models: all modes share the same
+                        # vocab, so any role can supply vectors for empty POS slots.
+                        empty_pos = [p for p, v in vecs_by_pos.items() if not v]
+                        if empty_pos:
+                            for _ri, _role in enumerate(roles):
+                                _vkey = voc_index(_role)
+                                if _vkey not in tucker_decomp.vocab:
+                                    continue
+                                _fmat = tucker_decomp.factors[_ri].detach().cpu().numpy()
+                                _norms = np.maximum(np.linalg.norm(_fmat, axis=1, keepdims=True), 1e-12)
+                                _fmat = _fmat / _norms
+                                _vecs = {w: _fmat[idx] for w, idx in tucker_decomp.vocab[_vkey].items()}
+                                for _pos in empty_pos:
+                                    vecs_by_pos[_pos] = _vecs
+                                break
+                        simlex_out = evaluate_simlex(simlex_pairs, vecs_by_pos, verbose=verbose)
+                        if isinstance(sem_out, dict) and isinstance(simlex_out, dict):
+                            flat = {}
+                            all_scores = simlex_out.get("ALL", {})
+                            if isinstance(all_scores, dict):
+                                if all_scores.get("rho") is not None:
+                                    flat["simlex_all_rho"] = all_scores["rho"]
+                                if all_scores.get("pval") is not None:
+                                    flat["simlex_all_pval"] = all_scores["pval"]
+                            sem_out = {**sem_out, **flat}
+                    except Exception as _simlex_err:
+                        print(f"Warning: SimLex evaluation failed ({_simlex_err}); skipping.")
+
                 fitness_scores.append(sem_out)
                 # Primary value used for early stopping / diff
                 if isinstance(sem_out, dict):
                     if sem_primary_key not in sem_out:
+                        if sem_primary_key.startswith("simlex_") and simlex_pairs is not None:
+                            print(f"Warning: '{sem_primary_key}' not available (all SimLex pairs OOV?); skipping sem check.")
+                            continue
                         raise KeyError(f"Primary semantic key '{sem_primary_key}' missing from returned scores.")
                     sem_value = float(sem_out[sem_primary_key])
                     sem_all_dump = json.dumps(sem_out)

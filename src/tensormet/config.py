@@ -44,6 +44,33 @@ def parse_ngram_orders(type_str: str) -> Optional[list]:
         orders.append(n)
     return sorted(set(orders)) if orders else None
 
+
+def parse_raw_ngram_order(type_str: str) -> Optional[int]:
+    """Parse a single raw n-gram type string like 'raw3gram', 'raw-3-gram' → n (int).
+
+    Returns None if the string is not a recognised raw-ngram pattern.
+    """
+    m = re.fullmatch(r"raw-?(\d+)-?gram", type_str.strip().lower())
+    return int(m.group(1)) if m else None
+
+
+def parse_raw_ngram_orders(type_str: str) -> Optional[list]:
+    """Parse single or comma-separated raw-ngram type strings → sorted list of ints.
+
+    Examples:
+        "raw3gram"           → [3]
+        "raw-4-gram"         → [4]
+        "raw3gram,raw5gram"  → [3, 5]
+        "3gram"              → None  (not a raw-ngram string)
+    """
+    orders = []
+    for part in type_str.split(","):
+        n = parse_raw_ngram_order(part.strip())
+        if n is None:
+            return None
+        orders.append(n)
+    return sorted(set(orders)) if orders else None
+
 @dataclass(frozen=True)
 class TrainingConfig:
     n_iter_max: int = 1000
@@ -70,6 +97,7 @@ class EvalConfig:
     rec_log_every: int = 20 # defaults to rec_check_every if not passed
     sem_check_every: int = 20
     sem_error_type: Union[str, Tuple[str, ...]] = "full" # updated 2026-03-04
+    sem_primary_key: Optional[str] = None  # overrides auto-derived primary key for patience/diff/logging
     sem_softmax_temperature: float = 0.1
     sem_fitness_target: int = 10_000
     remove_OOV: bool = False # whether to set OOV in test set to OOV token (false ignores the sentences)
@@ -289,9 +317,12 @@ class RunConfig:
         # 5. Reconstruct the best semantic score
         best_sem_score = 0.0
         if fitness_scores:
-            sem_key = self.eval.sem_error_type
-            if isinstance(sem_key, (list, tuple)):
-                sem_key = sem_key[0]
+            if self.eval.sem_primary_key is not None:
+                sem_key = self.eval.sem_primary_key
+            else:
+                sem_key = self.eval.sem_error_type
+                if isinstance(sem_key, (list, tuple)):
+                    sem_key = sem_key[0]
 
             for score in fitness_scores:
                 if isinstance(score, dict):
@@ -429,15 +460,17 @@ class VectorRunConfig:
 
     def output_dir(self) -> Path:
         label = self._path_label()
+        if parse_raw_ngram_orders(self.exp.type) is not None:
+            return self.exp.output_dir / f"raw_ngrams_{label}_{self.exp.target_vectors}"
         if parse_ngram_orders(self.exp.type) is not None:
-            # shared base dir for all n-gram orders from this run
-            return self.exp.output_dir / f"ngrams_{label}_{self.exp.target_vectors}v"
-        return self.exp.output_dir / f"{label}_{self.exp.target_vectors}v"
+            return self.exp.output_dir / f"ngrams_{label}_{self.exp.target_vectors}"
+        return self.exp.output_dir / f"{label}_{self.exp.target_vectors}"
 
-    def ngram_dir(self, n: int) -> Path:
-        """Per-order n-gram parquet directory: {n}-gram-{label}_{target_vectors}."""
+    def ngram_dir(self, n: int, *, raw: bool = False) -> Path:
+        """Per-order n-gram parquet directory."""
         label = self._path_label()
-        return self.exp.output_dir / f"{n}-gram-{label}_{self.exp.target_vectors}"
+        prefix = f"{n}-gram-raw" if raw else f"{n}-gram"
+        return self.exp.output_dir / f"{prefix}-{label}_{self.exp.target_vectors}"
 
 
 @dataclass(frozen=True)
@@ -448,16 +481,18 @@ class PopulationExperimentConfig:
     cols_to_build: Tuple[str, ...] = ("root", "nsubj", "obj")
     shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None
     min_mode_ks: Optional[Tuple[int, ...]] = None  # per-mode minimum vocab floor, indexed by mode
-    # v_col: str = "root"
-    # s_col: str = "nsubj"
-    # o_col: str = "obj"
     batch_rows: int = 256_000
-    batch_readahead: int = 32
-    fragment_readahead: int = 8
+    batch_readahead: int = 4
+    fragment_readahead: int = 2
+    max_workers: int = 0        # 0 = auto → ~1 worker per 100 shards
+    shards_per_task: int = 1    # shards bundled per worker task; 1 = finest granularity
+    vectors_dir_override: Optional[Path] = None  # bypass dataset-derived path
     data_dir: Path = DATA_DIR
     remove_hapax: bool = False
 
     def vectors_dir(self) -> Path:
+        if self.vectors_dir_override is not None:
+            return Path(self.vectors_dir_override)
         return self.data_dir / "vectors" / self.dataset
 
     def output_dir(self) -> Path:

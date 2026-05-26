@@ -18,7 +18,7 @@ import spacy
 from datasets import load_dataset
 
 from tensormet.utils import DATA_DIR, compute_num_threads
-from tensormet.config import VectorRunConfig, parse_ngram_order, parse_ngram_orders
+from tensormet.config import VectorRunConfig, parse_ngram_order, parse_ngram_orders, parse_raw_ngram_orders
 
 import gc
 
@@ -976,6 +976,220 @@ def create_ngram_vectors_parquet_sharded(
 
     for n in ngram_orders:
         print(f"{n}-gram vectors written: {ns[n]['vector_count']:,} (dir: {ns[n]['output_dir']})")
+
+    return {
+        "output_dir": str(base_dir),
+        "n_gram_orders": ngram_orders,
+        "per_n": {
+            n: {
+                "output_dir": str(ns[n]["output_dir"]),
+                "vectors_written": ns[n]["vector_count"],
+                "part_id": ns[n]["part_id"],
+            }
+            for n in ngram_orders
+        },
+        "total_vectors_written": sum(ns[n]["vector_count"] for n in ngram_orders),
+        "sent_id": int(global_sent_id),
+        "raw_seen": int(raw_seen),
+        "hf_path": cfg.hf.path,
+        "hf_config": cfg.hf.config,
+        "hf_split": cfg.hf.split,
+        "hf_text_column": cfg.hf.text_column,
+    }
+
+
+# ---------------------------------------------------------------------------
+# RAW N-GRAM VECTOR CREATION (no lemmatisation)
+#
+# Identical pipeline to create_ngram_vectors_parquet_sharded but uses raw
+# lowercased tokens instead of lemmas.  No tagger or lemmatiser is loaded
+# (spacy.blank), so this is faster and requires no language-model weights.
+# Output directories follow the same naming convention so the population
+# script can consume them transparently.
+# ---------------------------------------------------------------------------
+
+def create_raw_ngram_vectors_parquet_sharded(
+    cfg: VectorRunConfig,
+    *,
+    overwrite: bool = False,
+) -> dict:
+    """
+    Stream a HF corpus, split into sentences, tokenise with a blank spaCy
+    model, and emit raw (lowercased, non-lemmatised) n-grams for every
+    requested order in a single pass.
+
+    Output layout and resume semantics are identical to
+    create_ngram_vectors_parquet_sharded.
+    """
+    ngram_orders = parse_raw_ngram_orders(cfg.exp.type)
+    if not ngram_orders:
+        raise ValueError(
+            f"create_raw_ngram_vectors_parquet_sharded called with non-raw-ngram type '{cfg.exp.type}'"
+        )
+
+    base_dir = cfg.output_dir()
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    ns: dict[int, dict] = {}
+    for n in ngram_orders:
+        n_dir = cfg.ngram_dir(n, raw=True)
+        n_dir.mkdir(parents=True, exist_ok=True)
+        n_meta_path = n_dir / "_meta.json"
+
+        if overwrite and n_meta_path.exists():
+            n_meta_path.unlink()
+
+        n_meta: dict = {}
+        if n_meta_path.exists():
+            n_meta = json.loads(n_meta_path.read_text(encoding="utf-8"))
+
+        part_id = int(n_meta.get("part_id", 0))
+        part_rows = int(n_meta.get("part_rows", 0))
+        while _part_path(n_dir, part_id).exists():
+            part_id += 1
+            part_rows = 0
+
+        ns[n] = {
+            "output_dir": n_dir,
+            "meta_path": n_meta_path,
+            "schema": _ngram_schema(n),
+            "vector_count": int(n_meta.get("vector_count", 0)),
+            "part_id": part_id,
+            "part_rows": part_rows,
+            "raw_seen": int(n_meta.get("raw_seen", 0)),
+            "sent_id": int(n_meta.get("sent_id", 0)),
+            "buffer": [],
+            "writer": None,
+        }
+
+    raw_seen = min(st["raw_seen"] for st in ns.values())
+    global_sent_id = min(st["sent_id"] for st in ns.values())
+
+    if raw_seen > 0:
+        counts_str = ", ".join(f"{n}gram={ns[n]['vector_count']:,}" for n in ngram_orders)
+        print(f"Resuming: raw_seen={raw_seen:,} | sent_id={global_sent_id:,} | {counts_str}")
+
+    def save_all_metas() -> None:
+        for n in ngram_orders:
+            st = ns[n]
+            st["meta_path"].write_text(
+                json.dumps({
+                    "vector_count": st["vector_count"],
+                    "part_id": st["part_id"],
+                    "part_rows": st["part_rows"],
+                    "raw_seen": raw_seen,
+                    "sent_id": global_sent_id,
+                }),
+                encoding="utf-8",
+            )
+
+    def flush_n(n: int) -> None:
+        st = ns[n]
+        if not st["buffer"]:
+            return
+        if st["writer"] is None:
+            st["writer"], st["part_id"] = _safe_open_part_writer(
+                st["output_dir"], st["part_id"], st["schema"]
+            )
+        wrote = flush_parquet(st["writer"], st["buffer"], SCHEMA=st["schema"])
+        st["buffer"].clear()
+        st["vector_count"] += wrote
+        st["part_rows"] += wrote
+        if st["part_rows"] >= cfg.exp.rows_per_part:
+            st["writer"].close()
+            st["writer"] = None
+            st["part_id"] += 1
+            st["part_rows"] = 0
+
+    # Blank model: tokeniser + rule-based sentenciser only; no tagger or lemmatiser.
+    nlp = spacy.blank("en")
+    nlp.add_pipe("sentencizer")
+    nlp.max_length = 1_000_000
+
+    ds_kwargs = dict(split=cfg.hf.split, streaming=True)
+    ds = (
+        load_dataset(cfg.hf.path, cfg.hf.config, **ds_kwargs)
+        if cfg.hf.config is not None
+        else load_dataset(cfg.hf.path, **ds_kwargs)
+    )
+    if raw_seen > 0:
+        ds = ds.skip(raw_seen)
+
+    def gen_texts() -> Iterator[str]:
+        nonlocal raw_seen
+        for ex in ds:
+            raw_seen += 1
+            txt = ex.get(cfg.hf.text_column)
+            if not txt or len(txt) > cfg.exp.max_text_length:
+                continue
+            yield txt
+
+    def chunked(iterable, size):
+        it = iter(iterable)
+        while True:
+            batch = list(islice(it, size))
+            if not batch:
+                return
+            yield batch
+
+    start_time = time.time()
+    last_log_time = start_time
+
+    try:
+        for text_batch in chunked(gen_texts(), cfg.exp.batch_size * 8):
+            for doc in nlp.pipe(text_batch, batch_size=cfg.exp.batch_size):
+                for sent in doc.sents:
+                    tokens = [
+                        tok.lower_
+                        for tok in sent
+                        if not tok.is_punct and not tok.is_space and tok.text.strip()
+                    ]
+                    for n in ngram_orders:
+                        rows = _extract_ngrams_from_lemmas(tokens, n, global_sent_id)
+                        if rows:
+                            ns[n]["buffer"].extend(rows)
+                    global_sent_id += 1
+
+            flushed = False
+            for n in ngram_orders:
+                if len(ns[n]["buffer"]) >= cfg.exp.rows_per_flush:
+                    flush_n(n)
+                    flushed = True
+            if flushed:
+                save_all_metas()
+
+            now = time.time()
+            if now - last_log_time >= cfg.exp.log_every_s:
+                elapsed = now - start_time
+                tv = sum(ns[n]["vector_count"] for n in ngram_orders)
+                vps = tv / elapsed if elapsed > 0 else 0.0
+                target = cfg.exp.target_vectors * len(ngram_orders)
+                remaining = max(target - tv, 0)
+                eta_seconds = remaining / vps if vps > 0 else float("inf")
+                per_n = " | ".join(f"{n}gram={ns[n]['vector_count']:,}" for n in ngram_orders)
+                print(
+                    f"[{elapsed:,.1f}s] raw_seen={raw_seen:,} | sentences={global_sent_id:,} | "
+                    f"{per_n} | vec/s={vps:,.0f} | "
+                    f"ETA={eta_seconds / 3600:,.2f}h ({eta_seconds / 60:,.1f}m)"
+                )
+                last_log_time = now
+
+            if all(ns[n]["vector_count"] >= cfg.exp.target_vectors for n in ngram_orders):
+                break
+
+    except KeyboardInterrupt:
+        print("\nGracefully interrupting and flushing buffers...")
+    finally:
+        for n in ngram_orders:
+            flush_n(n)
+            if ns[n]["writer"]:
+                ns[n]["writer"].close()
+                ns[n]["writer"] = None
+        save_all_metas()
+        gc.collect()
+
+    for n in ngram_orders:
+        print(f"{n}-gram (raw) vectors written: {ns[n]['vector_count']:,} (dir: {ns[n]['output_dir']})")
 
     return {
         "output_dir": str(base_dir),
