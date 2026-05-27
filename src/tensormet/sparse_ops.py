@@ -4,7 +4,7 @@ import pytensorlab as ptl
 import numpy as np
 from typing import List, Tuple, Optional, Union
 import math
-from tensormet.utils import einsum_letters, make_lazy_cupy_pair
+from tensormet.utils import einsum_letters, cp_einsum_optimize, make_lazy_cupy_pair
 cp, cpx_sparse = make_lazy_cupy_pair()
 
 # -------------------------------------------------------------------
@@ -374,39 +374,33 @@ def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=
         m = len(list(idxs_by_mode.values())[0]) if idxs_by_mode else 1
         return cp.clip(cp.tile(core, (m, 1)), a_min=epsilon, a_max=None)
 
-    # 1. Introduce the batch dimension (m) with the first mode
-    k0 = other_modes[0]
-    M0 = factors[k0][idxs_by_mode[k0]]  # (m, R_k0)
-    m = M0.shape[0]
-
-    # tmp shape: (m, R_0, ..., R_{k0-1}, R_{k0+1}, ...)
-    tmp = cp.tensordot(M0, core, axes=(1, k0))
-
-    # Track the remaining core axes in their current order
-    remaining_axes = [i for i in range(core.ndim) if i != k0]
-
-    # 2. Contract the rest with broadcast+sum to prevent multiplying the 'm' dimension
-    for k in other_modes[1:]:
-        M = factors[k][idxs_by_mode[k]]  # (m, R_k)
-
-        # Find where axis k is currently located in tmp (shifted by +1 because 'm' is at index 0)
-        axis_idx = 1 + remaining_axes.index(k)
-
-        # Reshape M to broadcast across tmp: (m, 1, ..., R_k, ..., 1)
-        bcast_shape = [1] * tmp.ndim
-        bcast_shape[0] = m
-        bcast_shape[axis_idx] = M.shape[1]
-
-        # Multiply and sum over the rank dimension
-        tmp = cp.sum(tmp * M.reshape(bcast_shape), axis=axis_idx)
-
-        # Remove the contracted axis from tracking
-        remaining_axes.remove(k)
-
-    if tmp.ndim != 2:
-        raise RuntimeError(f"Expected 2D result after contractions, got shape {tmp.shape}")
-
+    N = core.ndim
+    letters = einsum_letters(N)
+    core_sub = "".join(letters)                              # e.g. 'abc' for N=3
+    mat_subs = ["i" + letters[k] for k in other_modes]      # batch × rank for each contracted mode
+    out_sub  = "i" + letters[mode]                           # keep batch + target-mode rank
+    eq = core_sub + "," + ",".join(mat_subs) + "->" + out_sub
+    mats = [factors[k][idxs_by_mode[k]] for k in other_modes]
+    tmp = cp.einsum(eq, core, *mats, optimize=cp_einsum_optimize(1 + len(other_modes)))
     return cp.clip(tmp, a_min=epsilon, a_max=None)
+
+    # -- old tensordot+broadcast-sum loop (kept for reference) --
+    # k0 = other_modes[0]
+    # M0 = factors[k0][idxs_by_mode[k0]]  # (m, R_k0)
+    # m = M0.shape[0]
+    # tmp = cp.tensordot(M0, core, axes=(1, k0))
+    # remaining_axes = [i for i in range(core.ndim) if i != k0]
+    # for k in other_modes[1:]:
+    #     M = factors[k][idxs_by_mode[k]]  # (m, R_k)
+    #     axis_idx = 1 + remaining_axes.index(k)
+    #     bcast_shape = [1] * tmp.ndim
+    #     bcast_shape[0] = m
+    #     bcast_shape[axis_idx] = M.shape[1]
+    #     tmp = cp.sum(tmp * M.reshape(bcast_shape), axis=axis_idx)
+    #     remaining_axes.remove(k)
+    # if tmp.ndim != 2:
+    #     raise RuntimeError(f"Expected 2D result after contractions, got shape {tmp.shape}")
+    # return cp.clip(tmp, a_min=epsilon, a_max=None)
 
 
 def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, random_state):

@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -148,8 +148,8 @@ def _apply_subsample(
 
 def _partial_numerator_for_shard(
     shard: cpx_sparse.coo_matrix,
-    core_np: np.ndarray,
-    factors_np: List[np.ndarray],
+    core_np: Union[np.ndarray, Any],
+    factors_np: List[Union[np.ndarray, Any]],
     mode: int,
     shape: Tuple[int, ...],
     divergence: str,
@@ -165,6 +165,10 @@ def _partial_numerator_for_shard(
     Runs entirely inside ``cp.cuda.Device(device_id)``.  When
     ``subsample_frac < 1.0`` the shard's NNZ is subsampled locally before
     accumulation — no resharding is needed.
+
+    ``core_np`` and ``factors_np`` may be NumPy arrays *or* CuPy arrays
+    already resident on ``device_id``.  ``cp.asarray`` is a no-op in the
+    latter case, so no CPU round-trip occurs for the primary shard.
 
     Returns
     -------
@@ -264,8 +268,15 @@ def _sharded_factor_update(
     """
     primary = device_ids[0]
 
-    core_np = cp.asnumpy(core)
-    factors_np = [cp.asnumpy(f) for f in factors]
+    # Serialize to CPU only when non-primary shards need it; for single-GPU
+    # or the primary shard, pass the GPU arrays directly so cp.asarray is a
+    # no-op and the GPU→CPU→GPU round-trip is avoided.
+    if len(device_ids) > 1:
+        core_buf: Any = cp.asnumpy(core)
+        factors_buf: Any = [cp.asnumpy(f) for f in factors]
+    else:
+        core_buf = core
+        factors_buf = factors
     A_primary = factors[mode]
 
     # Denominator — analytical, no NNZ
@@ -285,8 +296,8 @@ def _sharded_factor_update(
             pool.submit(
                 _partial_numerator_for_shard,
                 shard=shards[k],
-                core_np=core_np,
-                factors_np=factors_np,
+                core_np=core if k == 0 else core_buf,
+                factors_np=factors if k == 0 else factors_buf,
                 mode=mode,
                 shape=shape,
                 divergence=divergence,
@@ -319,8 +330,8 @@ def _sharded_factor_update(
 
 def _partial_core_num_for_shard(
     shard: cpx_sparse.coo_matrix,
-    core_np: np.ndarray,
-    factors_np: List[np.ndarray],
+    core_np: Union[np.ndarray, Any],
+    factors_np: List[Union[np.ndarray, Any]],
     shape: Tuple[int, ...],
     divergence: str,
     epsilon: float,
@@ -338,6 +349,10 @@ def _partial_core_num_for_shard(
 
     When ``subsample_frac < 1.0`` the shard's NNZ is subsampled before both
     passes, so the two-pass KL structure operates on the same sampled subset.
+
+    ``core_np`` and ``factors_np`` may be NumPy arrays *or* CuPy arrays
+    already resident on ``device_id``.  ``cp.asarray`` is a no-op in the
+    latter case, so no CPU round-trip occurs for the primary shard.
 
     Returns
     -------
@@ -413,8 +428,14 @@ def _sharded_core_update(
     primary = device_ids[0]
     N = len(shape)
 
-    core_np = cp.asnumpy(core)
-    factors_np = [cp.asnumpy(f) for f in factors]
+    # Serialize to CPU only when non-primary shards need it; pass GPU arrays
+    # for the primary shard (k=0) so cp.asarray is a no-op there.
+    if len(device_ids) > 1:
+        core_buf: Any = cp.asnumpy(core)
+        factors_buf: Any = [cp.asnumpy(f) for f in factors]
+    else:
+        core_buf = core
+        factors_buf = factors
 
     partial_nums: List[Optional[np.ndarray]] = [None] * len(device_ids)
     with ThreadPoolExecutor(max_workers=len(device_ids)) as pool:
@@ -422,8 +443,8 @@ def _sharded_core_update(
             pool.submit(
                 _partial_core_num_for_shard,
                 shard=shards[k],
-                core_np=core_np,
-                factors_np=factors_np,
+                core_np=core if k == 0 else core_buf,
+                factors_np=factors if k == 0 else factors_buf,
                 shape=shape,
                 divergence=divergence,
                 epsilon=epsilon,

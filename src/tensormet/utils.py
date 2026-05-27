@@ -325,6 +325,12 @@ def einsum_letters(n):
         raise ValueError(f"Tensor order {n} too large for einsum-letter helper ({len(letters)} available).")
     return letters[:n]
 
+def cp_einsum_optimize(n_operands: int) -> str:
+    # 'optimal' exhaustively searches all O(3^n * n^2) contraction paths.
+    # For n <= 6 (our typical N+1 with N <= 5 tensor order) this is negligible overhead.
+    # 'greedy' is used above that threshold to avoid exponential path-search cost.
+    return 'optimal' if n_operands <= 6 else 'greedy'
+
 def voc_index(role: str) -> str:
     return f"{role}2i"
 

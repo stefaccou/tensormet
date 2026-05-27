@@ -22,7 +22,7 @@ from tensormet.sparse_ops import (
     safe_ravel,
     compute_Zcols_batch
 )
-from tensormet.utils import ThreadBudget, einsum_letters, make_lazy_cupy_pair
+from tensormet.utils import ThreadBudget, einsum_letters, cp_einsum_optimize, make_lazy_cupy_pair
 
 cp, cpx_sparse = make_lazy_cupy_pair()
 
@@ -443,7 +443,7 @@ def _tucker_den_row_full(core, factors, mode, epsilon=1e-12):
     eq = ",".join(in_terms) + "->" + out_term
 
     operands = [core] + [sums[k] for k in range(N) if k != mode]
-    den_row = cp.einsum(eq, *operands)
+    den_row = cp.einsum(eq, *operands, optimize=cp_einsum_optimize(len(operands)))
     den_row = cp.clip(den_row, a_min=epsilon, a_max=None)
     return den_row
 
@@ -480,21 +480,21 @@ def _rhat_from_factor_rows_sequential(core, mats, epsilon=1e-12):
     r_hat : (b,)
     """
     N = core.ndim
-    b = mats[0].shape[0]
+    letters = einsum_letters(N)
+    core_sub = "".join(letters)                   # e.g. 'abc' for N=3
+    mat_subs = ["i" + l for l in letters]         # e.g. ['ia', 'ib', 'ic']
+    eq = core_sub + "," + ",".join(mat_subs) + "->i"
+    r_hat = cp.einsum(eq, core, *mats, optimize=cp_einsum_optimize(1 + N))
+    return cp.clip(r_hat, a_min=epsilon, a_max=None)
 
-    # Start by contracting mode 0 to introduce batch dimension:
-    # tmp[b, R1, R2, ...] = sum_{r0} mats0[b,r0] * core[r0, R1, ...]
-    tmp = cp.tensordot(mats[0], core, axes=(1, 0))  # (b, R1, R2, ..., R_{N-1})
-
-    # Then fold in remaining modes with multiply+sum over the next rank axis each time.
-    for n in range(1, N):
-        # tmp has shape (b, Rn, R_{n+1}, ...)
-        # multiply by mats[n] broadcasted onto axis=1, then sum over axis=1
-        shp = (b, mats[n].shape[1]) + (1,) * (tmp.ndim - 2)
-        tmp = cp.sum(tmp * mats[n].reshape(shp), axis=1)
-
-    r_hat = cp.clip(tmp, a_min=epsilon, a_max=None)  # (b,)
-    return r_hat
+    # -- old sequential tensordot+loop approach (kept for reference) --
+    # b = mats[0].shape[0]
+    # # tmp[b, R1, R2, ...] = sum_{r0} mats0[b,r0] * core[r0, R1, ...]
+    # tmp = cp.tensordot(mats[0], core, axes=(1, 0))  # (b, R1, R2, ..., R_{N-1})
+    # for n in range(1, N):
+    #     shp = (b, mats[n].shape[1]) + (1,) * (tmp.ndim - 2)
+    #     tmp = cp.sum(tmp * mats[n].reshape(shp), axis=1)
+    # return cp.clip(tmp, a_min=epsilon, a_max=None)
 
 def _accumulate_core_num_outer(Num, w, mats):
     """
@@ -562,30 +562,44 @@ def _accumulate_core_num_outer(Num, w, mats):
         Num += slice_sum.reshape([mats[i].shape[1] for i in left_modes + right_modes])
         return
 
-    loop_ranks = [mats[i].shape[1] for i in loop_modes]
-    for loop_idx in itertools.product(*[range(r) for r in loop_ranks]):
-        v = w.copy()
-        for loop_i, r in zip(loop_modes, loop_idx):
-            v *= mats[loop_i][:, r]
+    # Replace O(R^loop_modes) Python loop with a single einsum over all loop-mode factor matrices.
+    # Edge-case handling above guarantees both KR_L and KR_R are non-None when loop_modes is non-empty.
+    # Subscripts: 'i'=batch/nnz, 'L'=collapsed left ranks, 'R'=collapsed right ranks,
+    #             loop_letters[j] = rank dim of loop_modes[j].
+    n_loop = len(loop_modes)
+    loop_letters = einsum_letters(n_loop)  # 'a', 'b', ... — safe, won't collide with 'i','L','R'
+    KR_Lw = KR_L * w[:, None]             # absorb w here so the einsum has one fewer operand
+    loop_mats_list = [mats[loop_modes[j]] for j in range(n_loop)]
+    eq_lhs = ["iL", "iR"] + ["i" + ll for ll in loop_letters]
+    eq_rhs = "L" + "".join(loop_letters) + "R"
+    eq = ",".join(eq_lhs) + "->" + eq_rhs
+    result = cp.einsum(eq, KR_Lw, KR_R, *loop_mats_list,
+                       optimize=cp_einsum_optimize(2 + n_loop))
+    # result shape: (L_combined, R_loop[0], ..., R_loop[n_loop-1], R_combined)
+    # left + loop + right covers all modes in ascending order, so reshape is axis-aligned with Num
+    target_shape = [mats[i].shape[1] for i in left_modes + loop_modes + right_modes]
+    Num += result.reshape(target_shape)
 
-        if KR_L is not None and KR_R is not None:
-            # Massive Matrix Multiplication
-            slice_sum = (KR_L * v[:, None]).T @ KR_R
-
-            # Auto-align the dimensions
-            full_slice = [slice(None) if i in left_modes + right_modes else loop_idx[loop_modes.index(i)] for i in
-                          range(N)]
-            Num[tuple(full_slice)] += slice_sum.reshape([mats[i].shape[1] for i in left_modes + right_modes])
-
-        elif KR_L is not None:
-            slice_sum = cp.sum(KR_L * v[:, None], axis=0)
-            full_slice = [slice(None) if i in left_modes else loop_idx[loop_modes.index(i)] for i in range(N)]
-            Num[tuple(full_slice)] += slice_sum.reshape([mats[i].shape[1] for i in left_modes])
+    # -- old Python iteration over loop-mode rank combinations (kept for reference) --
+    # loop_ranks = [mats[i].shape[1] for i in loop_modes]
+    # for loop_idx in itertools.product(*[range(r) for r in loop_ranks]):
+    #     v = w.copy()
+    #     for loop_i, r in zip(loop_modes, loop_idx):
+    #         v *= mats[loop_i][:, r]
+    #     if KR_L is not None and KR_R is not None:
+    #         slice_sum = (KR_L * v[:, None]).T @ KR_R
+    #         full_slice = [slice(None) if i in left_modes + right_modes else loop_idx[loop_modes.index(i)]
+    #                       for i in range(N)]
+    #         Num[tuple(full_slice)] += slice_sum.reshape([mats[i].shape[1] for i in left_modes + right_modes])
+    #     elif KR_L is not None:
+    #         slice_sum = cp.sum(KR_L * v[:, None], axis=0)
+    #         full_slice = [slice(None) if i in left_modes else loop_idx[loop_modes.index(i)] for i in range(N)]
+    #         Num[tuple(full_slice)] += slice_sum.reshape([mats[i].shape[1] for i in left_modes])
 
 
 def _blocked_coo_to_flat_indices(vec_tensor, orig_shape):
     orig_shape = tuple(orig_shape)
-    size = int(np.prod(orig_shape))
+    size = math.prod(orig_shape)
     int32_max = np.iinfo(np.int32).max
     block_size = min(size, int32_max)
 
@@ -611,7 +625,7 @@ def _tucker_sum_all_entries(core, factors, epsilon=1e-12):
 
     # eq: "abc,a,b,c->" (for N=3), etc.
     eq = core_subs + "," + ",".join(letters) + "->"
-    sum_R = cp.einsum(eq, core, *sums)
+    sum_R = cp.einsum(eq, core, *sums, optimize=cp_einsum_optimize(1 + N))
     return cp.clip(sum_R, a_min=epsilon, a_max=None)
 
 # FR- specific helpers
@@ -662,7 +676,7 @@ def _tucker_gram_ZtZ(core, factors, mode, epsilon=1e-12):
     gram_terms = [f"{base[k]}{prim[k]}" for k in other_modes]
     eq = core_subs + "," + ",".join(gram_terms) + "->" + out_subs
 
-    Gp = cp.einsum(eq, core, *grams)  # same shape as core, but other modes live in primed space
+    Gp = cp.einsum(eq, core, *grams, optimize=cp_einsum_optimize(1 + len(grams)))  # same shape as core, but other modes live in primed space
 
     G_unf = _core_unfold(core, mode)   # (R_mode, P)
     Gp_unf = _core_unfold(Gp, mode)    # (R_mode, P)
@@ -679,16 +693,26 @@ def _core_multilinear_grams(core, grams, epsilon=1e-12):
 
     Returns D with the same shape as core, without mode_dot / tl overhead.
     """
-    tmp = core
     N = core.ndim
-    for n in range(N):
-        G = grams[n]  # (R_n, R_n)
-        # tensordot over core axis n: (R_n,R_n) x (...,R_n,...) -> (R_n, ..., ...)
-        tmp = cp.tensordot(G, tmp, axes=(1, n))
-        # tensordot brings the new R_n axis to the front; move it back to position n
-        tmp = cp.moveaxis(tmp, 0, n)
-    tmp = cp.clip(tmp, a_min=epsilon, a_max=None)
-    return tmp
+    letters = einsum_letters(2 * N)   # first N: input indices, next N: output indices
+    base = letters[:N]
+    prim = letters[N:2 * N]
+    core_sub  = "".join(base)                              # e.g. 'abc'
+    gram_subs = [base[n] + prim[n] for n in range(N)]     # e.g. ['aA', 'bB', 'cC']
+    out_sub   = "".join(prim)                              # e.g. 'ABC'
+    eq = core_sub + "," + ",".join(gram_subs) + "->" + out_sub
+    tmp = cp.einsum(eq, core, *grams, optimize=cp_einsum_optimize(1 + N))
+    return cp.clip(tmp, a_min=epsilon, a_max=None)
+
+    # -- old sequential tensordot+moveaxis loop (kept for reference) --
+    # tmp = core
+    # for n in range(N):
+    #     G = grams[n]  # (R_n, R_n)
+    #     # tensordot over core axis n: (R_n,R_n) x (...,R_n,...) -> (R_n, ..., ...)
+    #     tmp = cp.tensordot(G, tmp, axes=(1, n))
+    #     # tensordot brings the new R_n axis to the front; move it back to position n
+    #     tmp = cp.moveaxis(tmp, 0, n)
+    # return cp.clip(tmp, a_min=epsilon, a_max=None)
 
 
 # batch estimation helpers
@@ -1205,6 +1229,80 @@ def fr_core_update_largedim(
     # --- MU update ---
     core_new = core * (Num / (Den + epsilon))
     return core_new
+
+def fr_combined_core_errors_largedim(
+    vec_tensor,
+    shape,
+    core,
+    factors,
+    modes=None,
+    thread_budget=None,
+    epsilon=1e-12,
+    batch_num=None,
+    verbose=False,
+):
+    """FR core update + Frobenius error in one pass, sharing Gram matrices.
+
+    Equivalent to calling ``fr_core_update_largedim`` then
+    ``fr_compute_errors_largedim`` back-to-back, but computes
+    ``grams = [A_n^T A_n]`` and ``Den`` only once instead of twice.
+    Mirrors ``fr_combined_core_errors`` for the small-dim path.
+
+    Returns
+    -------
+    (core_new, rel_err)
+    """
+    if verbose:
+        print("  Updating core + computing Frobenius errors...")
+
+    if batch_num is None:
+        batch_num = _estimate_batch_num_for_outer(core, factors)
+    shape = tuple(int(s) for s in shape)
+    N = len(shape)
+
+    if modes is None:
+        modes = list(range(N))
+    if list(modes) != list(range(N)):
+        raise NotImplementedError("This version assumes modes == all modes (0..N-1).")
+
+    flat, xvals = _blocked_coo_to_flat_indices(vec_tensor, shape)
+    nnz = int(flat.size)
+    if nnz == 0:
+        return core, cp.asarray(0.0, dtype=core.dtype)
+
+    idxs = _unravel_flat_indices_C(flat, shape)
+
+    Num = cp.zeros_like(core)
+    num_batches = range(0, nnz, int(batch_num))
+    if verbose:
+        num_batches = tqdm(num_batches, desc="  Core numerator pass", unit="batch", leave=False)
+    for start in num_batches:
+        end = min(start + int(batch_num), nnz)
+        mats = [factors[n][idxs[n][start:end]] for n in range(N)]
+        _accumulate_core_num_outer(Num, xvals[start:end], mats)
+
+    Num = cp.clip(Num, a_min=epsilon, a_max=None)
+
+    # Compute Gram matrices once; reuse for both the MU denominator and ||X̂||^2.
+    grams = [factors[n].T @ factors[n] for n in range(N)]
+    Den = _core_multilinear_grams(core, grams, epsilon=epsilon)
+
+    core_new = core * (Num / (Den + epsilon))
+
+    # Frobenius error terms — consistent with the small-dim fr_combined_core_errors:
+    #   ||X̂||^2 uses the old Den (slight approx); <X, X̂> = <Num, core_new>.
+    x_nz = cp.clip(xvals.astype(core.dtype), a_min=0.0, a_max=None)
+    norm_X_sq = cp.sum(x_nz * x_nz)
+    norm_X = cp.sqrt(cp.maximum(norm_X_sq, epsilon))
+
+    norm_Xhat_sq = cp.sum(core_new * Den)
+    inner_prod = cp.sum(Num * core_new)
+
+    residual_sq = cp.maximum(norm_X_sq + norm_Xhat_sq - 2.0 * inner_prod, 0.0)
+    rel_err = cp.sqrt(residual_sq) / cp.maximum(norm_X, epsilon)
+
+    return core_new, rel_err
+
 
 def fr_compute_errors_largedim(
     vec_tensor,

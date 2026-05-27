@@ -4,6 +4,7 @@ from tensormet.distance import (kl_factor_update, kl_core_update, kl_compute_err
                                 kl_factor_update_largedim, kl_core_update_largedim, kl_compute_errors_largedim,
                                 fr_factor_update, fr_core_update, fr_combined_core_errors,
                                 fr_factor_update_largedim, fr_core_update_largedim, fr_compute_errors_largedim,
+                                fr_combined_core_errors_largedim,
                                 null_compute_errors
                       )
 # -- Routing function --
@@ -41,12 +42,11 @@ def get_update_routing_step(divergence: Divergence, dim, log_step:bool, largedim
                     core_returns_error=True * log_step,
                 )
         else:
-
             return UpdateRouting(
                     factor_update=fr_factor_update_largedim,
-                    core_update=fr_core_update_largedim,  # returns (core, rel_error)
-                    error_fn=fr_compute_errors_largedim if log_step else null_compute_errors,
-                    core_returns_error=False,
+                    core_update=fr_combined_core_errors_largedim if log_step else fr_core_update_largedim,
+                    error_fn=None if log_step else null_compute_errors,
+                    core_returns_error=True * log_step,
                 )
 
     raise ValueError(f"Unknown divergence: {divergence!r}. Expected 'kl' or 'fr'.")
