@@ -412,6 +412,23 @@ class InspectionConfig:
         return (DATA_DIR / "tensors" / self.dataset /
               f"vocabularies/{self.order}D_{dim_spec_str(self._norm_dim())}d{sf}.pkl")
 
+    def load_tucker(self, map_location="cpu", tier1=False):
+        from tensormet.tucker_tensor import TuckerDecomposition
+        return TuckerDecomposition.load_from_disk(
+            name=self.name,
+            dataset=self.dataset,
+            dims=self.dim,
+            method=self.method,
+            divergence=self.divergence,
+            order=self.order,
+            shared_factors=self.shared_factors,
+            subsample_frac=self.subsample_frac,
+            iterations=self.iters,
+            rank=self.rank,
+            map_location=map_location,
+            tier1=tier1,
+        )
+
 @dataclass(frozen=True)
 class VectorExperimentConfig:
 
@@ -481,6 +498,7 @@ class PopulationExperimentConfig:
     cols_to_build: Tuple[str, ...] = ("root", "nsubj", "obj")
     shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None
     min_mode_ks: Optional[Tuple[int, ...]] = None  # per-mode minimum vocab floor, indexed by mode
+    ensured_vocab: Optional[Tuple[str, ...]] = None  # tokens pinned into the shared vocab by name
     batch_rows: int = 256_000
     batch_readahead: int = 4
     fragment_readahead: int = 2

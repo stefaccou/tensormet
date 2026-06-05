@@ -145,6 +145,13 @@ def _parse_gpu_id(s: str):
     return vals[0] if len(vals) == 1 else vals
 
 
+def _parse_ensured_vocab(s: str) -> Tuple[str, ...]:
+    """Parse a comma-separated list of token strings, e.g. '<BOS>,<EOS>'."""
+    if not s:
+        return tuple()
+    return tuple(tok for tok in s.split(",") if tok)
+
+
 def _parse_top_ks(s: str) -> Tuple[int, ...]:
     if not s:
         return tuple()
@@ -541,6 +548,10 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
     parser.add_argument("--min-mode-ks", type=_parse_top_ks, dest="min_mode_ks", default=None,
                         help="Comma-separated per-mode minimum vocab floor, e.g. --min-mode-ks 5000,0,0 "
                              "guarantees at least 5K items from mode 0 in any shared vocabulary.")
+    parser.add_argument("--ensured-vocab", type=_parse_ensured_vocab, dest="ensured_vocab", default=None,
+                        help="Comma-separated token strings pinned into the shared vocabulary by name, "
+                             "regardless of harmonic mean score. E.g. --ensured-vocab '<BOS>,<EOS>'. "
+                             "Tokens absent from all marginals are silently skipped.")
 
     parsed = parser.parse_args(args=argv)
     d = vars(parsed)
@@ -571,6 +582,7 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
             "data_dir",
             "remove_hapax",
             "min_mode_ks",
+            "ensured_vocab",
     ):
         if d.get(f) is not None:
             exp_kwargs[f] = d[f]

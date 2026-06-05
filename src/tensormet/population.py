@@ -248,16 +248,22 @@ def _most_common_keys(counter: Counter, k: int) -> list:
 
 
 def _shared_topk_hmean(counters: list[Counter], k: int, eps: float = 0.0,
-                       min_ks: list[int] | None = None) -> list:
+                       min_ks: list[int] | None = None,
+                       ensured_vocab: list[str] | None = None) -> list:
     """
     Build a shared top-k vocabulary across multiple marginals using
     generalized harmonic mean.
 
-    counters: list of Counter objects containing counts or probabilities
-    min_ks:   optional per-counter floor. min_ks[i] items from counters[i]
-              are guaranteed to be included regardless of their cross-counter
-              harmonic mean score. Useful when one mode (e.g. verbs) would
-              otherwise score 0 because it has no coverage in the other modes.
+    counters:      list of Counter objects containing counts or probabilities
+    min_ks:        optional per-counter floor. min_ks[i] items from counters[i]
+                   are guaranteed to be included regardless of their cross-counter
+                   harmonic mean score. Useful when one mode (e.g. verbs) would
+                   otherwise score 0 because it has no coverage in the other modes.
+    ensured_vocab: optional list of token strings that are pinned into the shared
+                   vocabulary by name, regardless of their harmonic mean score.
+                   Tokens that do not appear in any counter are silently skipped.
+                   Useful for special tokens like <BOS>/<EOS> that only exist in
+                   one mode and would otherwise be zeroed out by the harmonic mean.
     Returns: list of at most k keys.
     """
     if not counters:
@@ -267,12 +273,23 @@ def _shared_topk_hmean(counters: list[Counter], k: int, eps: float = 0.0,
     if min_ks is None:
         min_ks = [0] * n
 
-    # Step 1: guarantee the top min_ks[i] items from each counter
+    # Step 1a: guarantee the top min_ks[i] items from each counter
     guaranteed: set = set()
     for counter, min_k in zip(counters, min_ks):
         if min_k > 0:
             for x, _ in counter.most_common(min_k):
                 guaranteed.add(x)
+
+    # Step 1b: pin explicitly named tokens (ensured_vocab)
+    if ensured_vocab:
+        all_seen: set = set()
+        for counter in counters:
+            all_seen.update(counter.keys())
+        for tok in ensured_vocab:
+            if tok in all_seen:
+                guaranteed.add(tok)
+            else:
+                print(f"  [ensured_vocab] WARNING: token {tok!r} not found in any marginal counter — skipping.")
 
     # Step 2: score all remaining keys by harmonic mean, fill up to k
     all_keys: set = set()
@@ -313,6 +330,7 @@ def populate_tensors_parquet(
     min_mode_ks: dict[int, int] | None = None,
     max_workers: int = 0,
     shards_per_task: int = 1,
+    ensured_vocab: list[str] | None = None,
 ):
     path_to_vectors = os.fspath(path_to_vectors)
     n_modes = len(cols_to_build)
@@ -453,6 +471,7 @@ def populate_tensors_parquet(
             [single_probs[col] for col in group_cols],
             group_max_k,
             min_ks=group_min_ks,
+            ensured_vocab=ensured_vocab,
         )
 
         for col in group_cols:

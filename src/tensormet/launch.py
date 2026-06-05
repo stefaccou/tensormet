@@ -172,6 +172,7 @@ def launch_tensor_population(cfg):
             min_mode_ks=min_mode_ks,
             max_workers=cfg.exp.max_workers,
             shards_per_task=cfg.exp.shards_per_task,
+            ensured_vocab=list(cfg.exp.ensured_vocab) if cfg.exp.ensured_vocab else None,
         )
 
     end_time = time.time()

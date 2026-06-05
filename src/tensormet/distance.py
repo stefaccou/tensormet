@@ -750,12 +750,14 @@ def _estimate_batch_num_for_outer(core, factors, safety=0.80, temp_mult=2.0):
 
     b = max(1, budget_b // max(1, bytes_per_b))
 
-    # Hard cap to prevent grid/memory timeout issues
-    hard_cap = max(1, int(1_000_000_000 // max(1, bytes_per_b)))
+    # OLD SAFE CODE: hard_cap = max(1, int(1_000_000_000 // max(1, bytes_per_b)))
+    # Hard cap: safety rail proportional to free VRAM so it scales with GPU size.
+    # 0.95 > safety (0.80), so this only binds if the budget estimate overshoots.
+    hard_cap = max(1, int(free_b * 0.95 // max(1, bytes_per_b)))
     return min(int(b), hard_cap)
 
 
-def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.60, temp_mult=4.0):  # Increased temp_mult
+def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.75, temp_mult=4.0):  # Increased temp_mult; safety raised from 0.60
     N = core.ndim
     R = [int(factors[n].shape[1]) for n in range(N)]
     dtype = core.dtype
@@ -802,9 +804,11 @@ def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.80, temp_mult=2.0):
 
     b = max(1, budget_b // max(1, bytes_per_b))
 
-    # HARD CAP: Prevent CUDA grid index limits from silently corrupting memory
-    # Cap peak temporary allocation to ~4GB per batch
-    hard_cap = max(1, int(2_000_000_000 // max(1, tmp_bytes_per_b)))
+    # OLD SAFE CODE: hard_cap = max(1, int(2_000_000_000 // max(1, tmp_bytes_per_b)))
+    # Hard cap: anchor to free VRAM so it scales with GPU size.
+    # b = free_b * safety / (tmp * temp_mult) = free_b * 0.40 / tmp;
+    # hard_cap = free_b * 0.50 / tmp = b * 1.25, so it is always above b and normally doesn't bind.
+    hard_cap = max(1, int(free_b * 0.50 // max(1, tmp_bytes_per_b)))
 
     return min(int(b), hard_cap)
 
