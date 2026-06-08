@@ -26,6 +26,7 @@ from tensormet.config import (
     TrainingConfig,
     EvalConfig,
     RunConfig,
+    ClipConfig,
     VectorExperimentConfig,
     VectorRunConfig,
     HFStreamConfig,
@@ -266,6 +267,19 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="Physical GPU(s) to pin, e.g. --gpu-id 0 or --gpu-id 0,1,2")
     parser.add_argument("--subsample-frac", type=float, dest="subsample_frac", default=None)
     parser.add_argument("--subsample-warmup", type=int, dest="subsample_warmup", default=None)
+    # Clip-site toggles — each defaults to None (= unset, use ClipConfig default of True)
+    parser.add_argument("--clip-reconstruction", type=_parse_bool, dest="clip_reconstruction", default=None,
+                        help="Clip Tucker reconstruction R_nz before KL division (most critical).")
+    parser.add_argument("--clip-loss", type=_parse_bool, dest="clip_loss", default=None,
+                        help="Clip x_nz and r_nz inside error-metric functions.")
+    parser.add_argument("--clip-denominator", type=_parse_bool, dest="clip_denominator", default=None,
+                        help="Clip the MU update denominator.")
+    parser.add_argument("--clip-numerator", type=_parse_bool, dest="clip_numerator", default=None,
+                        help="Clip the MU update numerator (factor + core).")
+    parser.add_argument("--clip-factor-floor", type=_parse_bool, dest="clip_factor_floor", default=None,
+                        help="Final clip(A, ε) enforcing non-negativity after each factor update.")
+    parser.add_argument("--clip-gram", type=_parse_bool, dest="clip_gram", default=None,
+                        help="Clip Gram matrices A_n^T A_n in the large-dim streaming path.")
 
     # Eval-level args
     parser.add_argument("--rec-check-every", type=int, dest="rec_check_every", default=None)
@@ -331,6 +345,15 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     for f in train_fields:
         if f in parsed_dict and parsed_dict[f] is not None:
             train_kwargs[f] = parsed_dict[f]
+
+    # Build ClipConfig from individual --clip-* flags; only override if any were provided
+    _clip_fields = ("reconstruction", "loss", "denominator", "numerator", "factor_floor", "gram")
+    _clip_overrides = {f: parsed_dict[f"clip_{f}"] for f in _clip_fields if parsed_dict.get(f"clip_{f}") is not None}
+    if _clip_overrides:
+        base_clip = default_train.clip
+        train_kwargs["clip"] = ClipConfig(**{
+            f: _clip_overrides.get(f, getattr(base_clip, f)) for f in _clip_fields
+        })
 
     new_train = replace(default_train, **train_kwargs) if train_kwargs else default_train
 

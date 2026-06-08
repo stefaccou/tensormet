@@ -4,6 +4,7 @@ import itertools
 
 from tqdm import tqdm
 import numpy as np
+from tensormet.config import ClipConfig
 # import cupy as cp
 # import cupyx.scipy.sparse as cpx_sparse
 
@@ -28,7 +29,7 @@ cp, cpx_sparse = make_lazy_cupy_pair()
 
 # -- Kullback-Leibler Divergence --
 
-def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False):
+def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False, clip_cfg=None):
     """
     One multiplicative KL update for a single factor matrix A_n (for `mode`).
 
@@ -73,7 +74,8 @@ def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None,
     # Z_cols_T: (nnz, R) because Z[:, cols] is (R, nnz)
     Z_cols_T = tl.transpose(Z[:, cols])
     R_nz = tl.sum(A_rows * Z_cols_T, axis=1)
-    R_nz = tl.clip(R_nz, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.reconstruction:
+        R_nz = tl.clip(R_nz, a_min=epsilon, a_max=None)
 
     # W = X / (A Z) at nonzeros
     W_data = vals / R_nz
@@ -85,15 +87,17 @@ def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None,
     # denominator = sum_j Z[r,j] broadcast to (I_mode, R)
     den_row = tl.sum(Z, axis=1)  # (R,)
     denominator = den_row[np.newaxis, :]
-    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.denominator:
+        denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
 
     # Multiplicative update
     A = A * (numerator / (denominator + 1e-12))
-    A = tl.clip(A, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.factor_floor:
+        A = tl.clip(A, a_min=epsilon, a_max=None)
     return A
 
 
-def kl_core_update(vec_tensor, shape, core, factors, modes, thread_budget, epsilon=1e-12, verbose=False):
+def kl_core_update(vec_tensor, shape, core, factors, modes, thread_budget, epsilon=1e-12, verbose=False, clip_cfg=None):
     """
     One multiplicative KL update for the core tensor.
 
@@ -123,7 +127,8 @@ def kl_core_update(vec_tensor, shape, core, factors, modes, thread_budget, epsil
 
     # Gather reconstructed values at nonzero coordinates of vec_tensor
     data = gather_dense_at_block_nz(R, vec_tensor, shape)
-    data = tl.clip(data, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.reconstruction:
+        data = tl.clip(data, a_min=epsilon, a_max=None)
 
     # X/R at nonz
     X_R_data = vec_tensor.data / cp.asarray(data)
@@ -140,7 +145,8 @@ def kl_core_update(vec_tensor, shape, core, factors, modes, thread_budget, epsil
         modes=modes,
         transpose_factors=True,
     )
-    X_R = tl.clip(X_R, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.numerator:
+        X_R = tl.clip(X_R, a_min=epsilon, a_max=None)
 
     # F = outer product of column sums of factors, broadcast to core shape
     col_sums = [tl.sum(A_n, axis=0) for A_n in factors]
@@ -148,7 +154,8 @@ def kl_core_update(vec_tensor, shape, core, factors, modes, thread_budget, epsil
     for n in range(1, core.ndim):
         shape_n = [1] * n + [core.shape[n]] + [1] * (core.ndim - n - 1)
         F = F * col_sums[n].reshape(tuple(shape_n))
-    F = tl.clip(F, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.denominator:
+        F = tl.clip(F, a_min=epsilon, a_max=None)
 
     # Multiplicative core update
     new_core = core * X_R / (F + epsilon)
@@ -162,6 +169,7 @@ def kl_compute_errors(
         thread_budget: ThreadBudget,
         epsilon=1e-12,
         verbose=False,
+        clip_cfg=None,
 ):
 
     """Generalised KL divergence C_KL(X || R) for sparse X.
@@ -193,14 +201,16 @@ def kl_compute_errors(
     # R_flat = R.ravel()                         # length = size
 
     r_nz = gather_dense_at_block_nz(R, vec_tensor, shape)
-    r_nz = tl.clip(r_nz, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.reconstruction:
+        r_nz = tl.clip(r_nz, a_min=epsilon, a_max=None)
     # --- 2) Decode sparse X indices to flat indices ---
     X_coo = vec_tensor.tocoo()
     x_nz = X_coo.data
 
     # --- 3) X_i and R_i at nonzero entries ---
     # the original data can still contain harmful zeros
-    x_nz = tl.clip(x_nz, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.loss:
+        x_nz = tl.clip(x_nz, a_min=epsilon, a_max=None)
     r_nz = cp.asarray(r_nz)
 
     # --- 4) KL contribution from nonzeros ---
@@ -226,7 +236,7 @@ def kl_compute_errors(
 
 
 # -- Frobenius Norm --
-def fr_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False):
+def fr_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False, clip_cfg=None):
     if verbose:
         print(f"  Updating factor {mode}...")
 
@@ -236,16 +246,19 @@ def fr_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None,
     Z = tucker_to_tensor((core, factors), skip_factor=mode)
     Z = tl.transpose(unfold(Z, mode))
     numerator = X @ Z  # cupy sparse @ dense
-    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.numerator:
+        numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
     A = factors[mode]
     denominator = tl.dot(A, tl.dot(tl.transpose(Z), Z))
-    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.denominator:
+        denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
     A *= numerator / denominator
-    A = tl.clip(A, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.factor_floor:
+        A = tl.clip(A, a_min=epsilon, a_max=None)
     return A
 
 
-def fr_core_update(vec_tensor, shape, core, factors, modes, thread_budget=None, epsilon=1e-12, verbose=False):
+def fr_core_update(vec_tensor, shape, core, factors, modes, thread_budget=None, epsilon=1e-12, verbose=False, clip_cfg=None):
     """
     One multiplicative update for the core tensor.
 
@@ -266,15 +279,16 @@ def fr_core_update(vec_tensor, shape, core, factors, modes, thread_budget=None, 
         modes=modes,
         transpose_factors=True,  # X ×_n W_n^T
     )
-    # we clip the numerator
-    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.numerator:
+        numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
     # these operations can again be done with the dense implementation
     for i, f in enumerate(factors):
         if i:
             denominator = mode_dot(denominator, tl.dot(tl.transpose(f), f), i)
         else:
             denominator = mode_dot(core, tl.dot(tl.transpose(f), f), i)
-    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.denominator:
+        denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
 
     new_core = core * numerator / (denominator + epsilon)
     return new_core
@@ -287,6 +301,7 @@ def fr_compute_errors(
         thread_budget: ThreadBudget,
         epsilon=1e-12,
         verbose=False,
+        clip_cfg=None,
 ):
     """Relative Frobenius error ||X - X̂||_F / ||X||_F for sparse X.
 
@@ -304,7 +319,8 @@ def fr_compute_errors(
     # --- ||X||_F ---
     X_coo = vec_tensor.tocoo()
     x_nz = X_coo.data
-    x_nz = tl.clip(x_nz, a_min=0.0, a_max=None)  # Frobenius is fine with zeros; keep nonneg pipeline consistent
+    if clip_cfg is None or clip_cfg.loss:
+        x_nz = tl.clip(x_nz, a_min=0.0, a_max=None)  # Frobenius is fine with zeros; keep nonneg pipeline consistent
     norm_X_sq = cp.sum(x_nz * x_nz)
     norm_X = cp.sqrt(cp.maximum(norm_X_sq, epsilon))
 
@@ -317,7 +333,10 @@ def fr_compute_errors(
         R_cpu = ptl_tucker_to_tensor(tucker)  # dense on CPU
 
     xhat_nz = gather_dense_at_block_nz(R_cpu, vec_tensor, shape)
-    xhat_nz = cp.asarray(tl.clip(xhat_nz, a_min=epsilon, a_max=None))
+    if clip_cfg is None or clip_cfg.reconstruction:
+        xhat_nz = cp.asarray(tl.clip(xhat_nz, a_min=epsilon, a_max=None))
+    else:
+        xhat_nz = cp.asarray(xhat_nz)
 
     inner_prod = cp.sum(x_nz * xhat_nz)
 
@@ -328,7 +347,8 @@ def fr_compute_errors(
         AtA = tl.dot(tl.transpose(A), A)
         denom = mode_dot(denom, AtA, mode)
 
-    denom = tl.clip(denom, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.gram:
+        denom = tl.clip(denom, a_min=epsilon, a_max=None)
     norm_Xhat_sq = cp.sum(core * denom)
 
     # --- ||X - X̂||_F^2 = ||X||_F^2 + ||X̂||_F^2 - 2<X, X̂> ---
@@ -339,7 +359,7 @@ def fr_compute_errors(
     relative_error = residual_norm / norm_X
     return relative_error
 
-def fr_combined_core_errors(vec_tensor, shape, core, factors, modes, thread_budget=None, epsilon=1e-12, verbose=False):
+def fr_combined_core_errors(vec_tensor, shape, core, factors, modes, thread_budget=None, epsilon=1e-12, verbose=False, clip_cfg=None):
     """
         One multiplicative KL update for the core tensor.
 
@@ -360,15 +380,16 @@ def fr_combined_core_errors(vec_tensor, shape, core, factors, modes, thread_budg
         modes=modes,
         transpose_factors=True,  # X ×_n W_n^T
     )
-    # we clip the numerator
-    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.numerator:
+        numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
     # these operations can again be done with the dense implementation
     for i, f in enumerate(factors):
         if i:
             denominator = mode_dot(denominator, tl.dot(tl.transpose(f), f), i)
         else:
             denominator = mode_dot(core, tl.dot(tl.transpose(f), f), i)
-    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.denominator:
+        denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
 
     new_core = core * numerator / (denominator + epsilon)
 
@@ -422,7 +443,7 @@ def _unravel_cols_for_mode(cols, shape, mode):
     idxs = list(reversed(idxs_rev))
     return other_modes, {m: idxs[i] for i, m in enumerate(other_modes)}
 
-def _tucker_den_row_full(core, factors, mode, epsilon=1e-12):
+def _tucker_den_row_full(core, factors, mode, epsilon=1e-12, clip_denominator=True):
     """
     Exact denominator vector for KL MU update:
         den_row[r_mode] = sum_over_all_unfolding_columns Z[r_mode, col]
@@ -444,7 +465,8 @@ def _tucker_den_row_full(core, factors, mode, epsilon=1e-12):
 
     operands = [core] + [sums[k] for k in range(N) if k != mode]
     den_row = cp.einsum(eq, *operands, optimize=cp_einsum_optimize(len(operands)))
-    den_row = cp.clip(den_row, a_min=epsilon, a_max=None)
+    if clip_denominator:
+        den_row = cp.clip(den_row, a_min=epsilon, a_max=None)
     return den_row
 
 
@@ -470,7 +492,7 @@ def _unravel_flat_indices_C(flat, shape):
     return list(reversed(idxs_rev))
 
 
-def _rhat_from_factor_rows_sequential(core, mats, epsilon=1e-12):
+def _rhat_from_factor_rows_sequential(core, mats, epsilon=1e-12, clip_reconstruction=True):
     """
     core: (R0, R1, ..., R_{N-1})
     mats[n]: (b, Rn) factor rows for each mode at the b coordinates
@@ -485,7 +507,7 @@ def _rhat_from_factor_rows_sequential(core, mats, epsilon=1e-12):
     mat_subs = ["i" + l for l in letters]         # e.g. ['ia', 'ib', 'ic']
     eq = core_sub + "," + ",".join(mat_subs) + "->i"
     r_hat = cp.einsum(eq, core, *mats, optimize=cp_einsum_optimize(1 + N))
-    return cp.clip(r_hat, a_min=epsilon, a_max=None)
+    return cp.clip(r_hat, a_min=epsilon, a_max=None) if clip_reconstruction else r_hat
 
     # -- old sequential tensordot+loop approach (kept for reference) --
     # b = mats[0].shape[0]
@@ -637,7 +659,7 @@ def _core_unfold(core, mode):
     G = cp.moveaxis(core, mode, 0)
     return G.reshape(G.shape[0], -1)
 
-def _tucker_gram_ZtZ(core, factors, mode, epsilon=1e-12):
+def _tucker_gram_ZtZ(core, factors, mode, epsilon=1e-12, clip_gram=True):
     """
     Compute Gram = Z^T Z exactly, without forming Z.
 
@@ -682,10 +704,11 @@ def _tucker_gram_ZtZ(core, factors, mode, epsilon=1e-12):
     Gp_unf = _core_unfold(Gp, mode)    # (R_mode, P)
 
     Gram = Gp_unf @ G_unf.T            # (R_mode, R_mode) -> sparse
-    Gram = cp.clip(Gram, a_min=epsilon, a_max=None)
+    if clip_gram:
+        Gram = cp.clip(Gram, a_min=epsilon, a_max=None)
     return Gram
 
-def _core_multilinear_grams(core, grams, epsilon=1e-12):
+def _core_multilinear_grams(core, grams, epsilon=1e-12, clip_gram=True):
     """
     Compute:
         D = core ×_0 grams[0] ×_1 grams[1] × ... ×_{N-1} grams[N-1]
@@ -702,7 +725,7 @@ def _core_multilinear_grams(core, grams, epsilon=1e-12):
     out_sub   = "".join(prim)                              # e.g. 'ABC'
     eq = core_sub + "," + ",".join(gram_subs) + "->" + out_sub
     tmp = cp.einsum(eq, core, *grams, optimize=cp_einsum_optimize(1 + N))
-    return cp.clip(tmp, a_min=epsilon, a_max=None)
+    return cp.clip(tmp, a_min=epsilon, a_max=None) if clip_gram else tmp
 
     # -- old sequential tensordot+moveaxis loop (kept for reference) --
     # tmp = core
@@ -823,6 +846,7 @@ def kl_factor_update_largedim(
     epsilon=1e-12,
     batch_cols=None,
     verbose=False,
+    clip_cfg=None,
 ):
     """
     KL multiplicative update for Tucker factor A^(mode) WITHOUT building dense Z,
@@ -864,7 +888,8 @@ def kl_factor_update_largedim(
     A = factors[mode]  # (I_mode, R_mode)
 
     # Exact denominator over ALL columns (no approximation)
-    den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon)
+    den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon,
+                                   clip_denominator=(clip_cfg is None or clip_cfg.denominator))
     denominator = den_row[None, :]  # (1, R_mode)
 
     # Accumulate numerator = W @ Z.T without building full Z
@@ -893,6 +918,7 @@ def kl_factor_update_largedim(
             other_modes=other_modes,
             idxs_by_mode=idxs_by_mode,
             epsilon=epsilon,
+            clip_reconstruction=(clip_cfg is None or clip_cfg.reconstruction),
         )
 
         # nnz entries belonging to these unique columns
@@ -909,7 +935,8 @@ def kl_factor_update_largedim(
 
         # (A Z)_nz
         R_nz = cp.sum(A_rows * Z_rows, axis=1)
-        R_nz = cp.clip(R_nz, a_min=epsilon, a_max=None)
+        if clip_cfg is None or clip_cfg.reconstruction:
+            R_nz = cp.clip(R_nz, a_min=epsilon, a_max=None)
 
         W_data = v_i / R_nz            # (nnz_b,)
 
@@ -923,7 +950,8 @@ def kl_factor_update_largedim(
 
     # Multiplicative KL update (matching your dense version structure)
     A_new = A * (numerator / (denominator + 1e-12))
-    A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.factor_floor:
+        A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
     return A_new
 
 
@@ -940,6 +968,7 @@ def kl_core_update_largedim(
     batch_rhat=None, # tested, quite efficient up to 8K dims
     batch_num=None, # tested, quite efficient up to 8K dims
     verbose=False,
+    clip_cfg=None,
 ):
     if verbose:
         print("  Updating core...")
@@ -961,7 +990,9 @@ def kl_core_update_largedim(
     idxs = _unravel_flat_indices_C(flat, shape)  # list length N, each (nnz,)
 
     # Denominator is outer product of column sums, but don't materialize F.
-    sums = [cp.clip(cp.sum(factors[n], axis=0), a_min=epsilon, a_max=None) for n in range(N)]
+    _clip_denom = clip_cfg is None or clip_cfg.denominator
+    sums = [cp.clip(cp.sum(factors[n], axis=0), a_min=epsilon, a_max=None) if _clip_denom
+            else cp.sum(factors[n], axis=0) for n in range(N)]
     Num = cp.zeros_like(core)
 
     # --- Pass 1: compute w = x / r_hat in big batches, stash w (or stream into pass 2)
@@ -975,7 +1006,8 @@ def kl_core_update_largedim(
         end = min(start + int(batch_rhat), nnz)
 
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]  # each (b, Rn)
-        r_hat = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon)  # (b,)
+        r_hat = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon,
+                                                  clip_reconstruction=(clip_cfg is None or clip_cfg.reconstruction))
         w_all[start:end] = xvals[start:end] / r_hat
 
     # --- Pass 2: accumulate numerator in tiny batches (controls peak memory)
@@ -997,7 +1029,8 @@ def kl_core_update_largedim(
         shp = [1] * N
         shp[n] = sums[n].shape[0]
         core_new = core_new / sums[n].reshape(tuple(shp))
-    core_new = cp.clip(core_new, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.factor_floor:
+        core_new = cp.clip(core_new, a_min=epsilon, a_max=None)
     return core_new
 
 
@@ -1012,6 +1045,7 @@ def kl_compute_errors_largedim(
     epsilon=1e-12,
     batch_rhat=None, # tested up to 8K
     verbose=False,
+    clip_cfg=None,
 ):
     """
     Relative generalized KL divergence C_KL(X || R) for sparse X,
@@ -1038,7 +1072,8 @@ def kl_compute_errors_largedim(
         return sum_R / cp.maximum(cp.asarray(0.0, dtype=sum_R.dtype), epsilon)
 
     x_nz = cp.asarray(x_nz)
-    x_nz = cp.clip(x_nz, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.loss:
+        x_nz = cp.clip(x_nz, a_min=epsilon, a_max=None)
 
     idxs = _unravel_flat_indices_C(flat, shape)  # list of N arrays, each (nnz,)
 
@@ -1050,9 +1085,11 @@ def kl_compute_errors_largedim(
     for start in rhat_batches:
         end = min(start + int(batch_rhat), nnz)
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]  # each (b, Rn)
-        r_nz[start:end] = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon)
+        r_nz[start:end] = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon,
+                                                             clip_reconstruction=(clip_cfg is None or clip_cfg.reconstruction))
 
-    r_nz = cp.clip(r_nz, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.reconstruction:
+        r_nz = cp.clip(r_nz, a_min=epsilon, a_max=None)
 
     # --- KL contribution from nonzeros ---
     term_pos = x_nz * cp.log(x_nz / r_nz) - x_nz + r_nz
@@ -1080,6 +1117,7 @@ def fr_factor_update_largedim(
     thread_budget=None, # kept for API compatibility; unused
     batch_cols=None,
     verbose=False,
+    clip_cfg=None,
 ):
     """
     Frobenius (Euclidean) multiplicative update for Tucker factor A^(mode)
@@ -1117,9 +1155,11 @@ def fr_factor_update_largedim(
     A = factors[mode]  # (I_mode, R_mode)
 
     # ---- Denominator part: Gram = Z^T Z exactly, no Z materialization
-    Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon)  # (R, R)
+    Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon,
+                            clip_gram=(clip_cfg is None or clip_cfg.gram))  # (R, R)
     denominator = A @ Gram
-    denominator = cp.clip(denominator, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.denominator:
+        denominator = cp.clip(denominator, a_min=epsilon, a_max=None)
 
     # ---- Numerator part: numerator = X @ Z via batching unique columns, no full Z
     numerator = cp.zeros_like(A)
@@ -1144,6 +1184,7 @@ def fr_factor_update_largedim(
             other_modes=other_modes,
             idxs_by_mode=idxs_by_mode,
             epsilon=epsilon,
+            clip_reconstruction=(clip_cfg is None or clip_cfg.reconstruction),
         )
 
         # nnz entries belonging to these unique columns
@@ -1167,7 +1208,8 @@ def fr_factor_update_largedim(
 
     # MU update
     A_new = A * (numerator / (denominator + 1e-12))
-    A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.factor_floor:
+        A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
     return A_new
 
 
@@ -1181,6 +1223,7 @@ def fr_core_update_largedim(
     epsilon=1e-12,
     batch_num=None,
     verbose=False,
+    clip_cfg=None,
 ):
     """
     Frobenius (Euclidean) multiplicative update for the Tucker core WITHOUT dense recon.
@@ -1225,11 +1268,13 @@ def fr_core_update_largedim(
         w = xvals[start:end]  # Frobenius numerator uses X directly (no X/R like KL)
         _accumulate_core_num_outer(Num, w, mats)
 
-    Num = cp.clip(Num, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.numerator:
+        Num = cp.clip(Num, a_min=epsilon, a_max=None)
 
     # --- denominator: rank-space multilinear product with Gram matrices ---
     grams = [factors[n].T @ factors[n] for n in range(N)]  # each (R_n, R_n)
-    Den = _core_multilinear_grams(core, grams, epsilon=epsilon)  # core-shaped
+    Den = _core_multilinear_grams(core, grams, epsilon=epsilon,
+                                  clip_gram=(clip_cfg is None or clip_cfg.gram))  # core-shaped
 
     # --- MU update ---
     core_new = core * (Num / (Den + epsilon))
@@ -1245,6 +1290,7 @@ def fr_combined_core_errors_largedim(
     epsilon=1e-12,
     batch_num=None,
     verbose=False,
+    clip_cfg=None,
 ):
     """FR core update + Frobenius error in one pass, sharing Gram matrices.
 
@@ -1286,17 +1332,21 @@ def fr_combined_core_errors_largedim(
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]
         _accumulate_core_num_outer(Num, xvals[start:end], mats)
 
-    Num = cp.clip(Num, a_min=epsilon, a_max=None)
+    if clip_cfg is None or clip_cfg.numerator:
+        Num = cp.clip(Num, a_min=epsilon, a_max=None)
 
     # Compute Gram matrices once; reuse for both the MU denominator and ||X̂||^2.
     grams = [factors[n].T @ factors[n] for n in range(N)]
-    Den = _core_multilinear_grams(core, grams, epsilon=epsilon)
+    Den = _core_multilinear_grams(core, grams, epsilon=epsilon,
+                                  clip_gram=(clip_cfg is None or clip_cfg.gram))
 
     core_new = core * (Num / (Den + epsilon))
 
     # Frobenius error terms — consistent with the small-dim fr_combined_core_errors:
     #   ||X̂||^2 uses the old Den (slight approx); <X, X̂> = <Num, core_new>.
-    x_nz = cp.clip(xvals.astype(core.dtype), a_min=0.0, a_max=None)
+    x_nz = xvals.astype(core.dtype)
+    if clip_cfg is None or clip_cfg.loss:
+        x_nz = cp.clip(x_nz, a_min=0.0, a_max=None)
     norm_X_sq = cp.sum(x_nz * x_nz)
     norm_X = cp.sqrt(cp.maximum(norm_X_sq, epsilon))
 
@@ -1318,6 +1368,7 @@ def fr_compute_errors_largedim(
     epsilon=1e-12,
     batch_rhat=1000,        # same role as in KL error
     verbose=False,
+    clip_cfg=None,
 ):
     """
     Relative Frobenius error ||X - X̂||_F / ||X||_F for sparse X,
@@ -1344,7 +1395,8 @@ def fr_compute_errors_largedim(
 
     x_nz = cp.asarray(x_nz)
     # Frobenius is fine with zeros, but keep nonneg pipeline consistent
-    x_nz = cp.clip(x_nz, a_min=0.0, a_max=None)
+    if clip_cfg is None or clip_cfg.loss:
+        x_nz = cp.clip(x_nz, a_min=0.0, a_max=None)
 
     # --- ||X||_F ---
     norm_X_sq = cp.sum(x_nz * x_nz)
@@ -1370,13 +1422,15 @@ def fr_compute_errors_largedim(
     for start in rhat_batches:
         end = min(start + int(batch_rhat), nnz)
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]  # (b, Rn)
-        xhat_b = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon)  # (b,)
+        xhat_b = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon,
+                                                   clip_reconstruction=(clip_cfg is None or clip_cfg.reconstruction))
         # <X, X̂> batch contribution
         inner_prod += cp.sum(x_nz[start:end] * xhat_b)
 
     # --- ||X̂||_F^2 exactly (no dense X̂, no mode_dot) ---
     grams = [factors[n].T @ factors[n] for n in range(N)]  # (R_n, R_n)
-    Den = _core_multilinear_grams(core, grams, epsilon=epsilon)  # core-shaped
+    Den = _core_multilinear_grams(core, grams, epsilon=epsilon,
+                                  clip_gram=(clip_cfg is None or clip_cfg.gram))  # core-shaped
     norm_Xhat_sq = cp.sum(core * Den)
 
     # --- ||X - X̂||_F^2 = ||X||^2 + ||X̂||^2 - 2<X, X̂> ---
@@ -1398,6 +1452,7 @@ def fr_factor_update_largedim_tier1(
     thread_budget=None,
     batch_cols=None,
     verbose=False,
+    clip_cfg=None,
 ):
     if verbose:
         print(f"  Updating factor {mode}...")
@@ -1419,8 +1474,11 @@ def fr_factor_update_largedim_tier1(
     I_mode, R = int(A.shape[0]), int(A.shape[1])
 
     # Denominator: exact Gram — unchanged
-    Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon)
-    denominator = cp.clip(A @ Gram, a_min=epsilon, a_max=None)
+    Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon,
+                            clip_gram=(clip_cfg is None or clip_cfg.gram))
+    denominator = A @ Gram
+    if clip_cfg is None or clip_cfg.denominator:
+        denominator = cp.clip(denominator, a_min=epsilon, a_max=None)
 
     # Deduplicate columns for efficient Z computation
     ucols, inv = cp.unique(cols, return_inverse=True)
@@ -1452,9 +1510,13 @@ def fr_factor_update_largedim_tier1(
         (vals, (rows.astype(cp.int32), k_idx)),
         shape=(I_mode, nnz),
     )
-    numerator = cp.clip(S @ Z_nz, a_min=epsilon, a_max=None)
+    numerator = S @ Z_nz
+    if clip_cfg is None or clip_cfg.numerator:
+        numerator = cp.clip(numerator, a_min=epsilon, a_max=None)
 
-    A_new = cp.clip(A * (numerator / (denominator + 1e-12)), a_min=epsilon, a_max=None)
+    A_new = A * (numerator / (denominator + 1e-12))
+    if clip_cfg is None or clip_cfg.factor_floor:
+        A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
     return A_new
 
 
@@ -1468,6 +1530,7 @@ def kl_factor_update_largedim_tier1(
     epsilon=1e-12,
     batch_cols=None,
     verbose=False,
+    clip_cfg=None,
 ):
     if verbose:
         print(f"  Updating factor {mode}...")
@@ -1489,7 +1552,8 @@ def kl_factor_update_largedim_tier1(
     I_mode, R = int(A.shape[0]), int(A.shape[1])
 
     # Exact denominator (no approximation)
-    den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon)
+    den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon,
+                                   clip_denominator=(clip_cfg is None or clip_cfg.denominator))
     denominator = den_row[None, :]  # (1, R)
 
     ucols, inv = cp.unique(cols, return_inverse=True)
@@ -1515,7 +1579,9 @@ def kl_factor_update_largedim_tier1(
 
     # KL weights: w_k = x_k / (A[row_k] · Z_nz[k])
     A_rows = A[rows]                                         # (nnz, R)
-    R_nz = cp.clip(cp.sum(A_rows * Z_nz, axis=1), a_min=epsilon, a_max=None)  # (nnz,)
+    R_nz = cp.sum(A_rows * Z_nz, axis=1)
+    if clip_cfg is None or clip_cfg.reconstruction:
+        R_nz = cp.clip(R_nz, a_min=epsilon, a_max=None)     # (nnz,)
     w = vals / R_nz                                          # (nnz,)
 
     # SpMM: numerator = S_W @ Z_nz  where S_W[row_k, k] = w_k
@@ -1524,7 +1590,11 @@ def kl_factor_update_largedim_tier1(
         (w, (rows.astype(cp.int32), k_idx)),
         shape=(I_mode, nnz),
     )
-    numerator = cp.clip(S_W @ Z_nz, a_min=epsilon, a_max=None)
+    numerator = S_W @ Z_nz
+    if clip_cfg is None or clip_cfg.numerator:
+        numerator = cp.clip(numerator, a_min=epsilon, a_max=None)
 
-    A_new = cp.clip(A * (numerator / (denominator + 1e-12)), a_min=epsilon, a_max=None)
+    A_new = A * (numerator / (denominator + 1e-12))
+    if clip_cfg is None or clip_cfg.factor_floor:
+        A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
     return A_new

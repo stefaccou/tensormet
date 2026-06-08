@@ -72,6 +72,30 @@ def parse_raw_ngram_orders(type_str: str) -> Optional[list]:
     return sorted(set(orders)) if orders else None
 
 @dataclass(frozen=True)
+class ClipConfig:
+    """Controls which numerical-stabilisation clips are active during NNTD.
+
+    All sites default to True (existing behaviour).  Set a field to False to
+    disable that clip — useful for ablation studies and precision experiments.
+
+    Fields
+    ------
+    reconstruction : clips Tucker reconstruction R_nz before X/R division (KL); most critical
+    loss           : clips x_nz / r_nz inside error-metric functions
+    denominator    : clips the MU update denominator
+    numerator      : clips the MU update numerator (factor + core)
+    factor_floor   : final clip(A, ε) enforcing non-negativity after each factor update
+    gram           : clips Gram matrices A_n^T A_n in the large-dim streaming path
+    """
+    reconstruction: bool = True
+    loss: bool = True
+    denominator: bool = True
+    numerator: bool = True
+    factor_floor: bool = True
+    gram: bool = True
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     n_iter_max: int = 1000
     tol: float = 1e-5
@@ -90,6 +114,7 @@ class TrainingConfig:
     gpu_id: Optional[Union[int, Tuple[int, ...]]] = None  # one int or tuple of ints to pin; None = auto-select
     subsample_frac: float = 1.0    # fraction of NNZ per update; 1.0 = exact
     subsample_warmup: int = 0      # iterations using full NNZ before stochastic mode begins
+    clip: ClipConfig = field(default_factory=ClipConfig)
 
 @dataclass(frozen=True)
 class EvalConfig:

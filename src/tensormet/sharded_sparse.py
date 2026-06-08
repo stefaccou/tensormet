@@ -73,6 +73,7 @@ from tensormet.distance import (
 )
 from tensormet.sparse_ops import compute_Zcols_batch, safe_ravel
 from tensormet.utils import make_lazy_cupy_pair
+from tensormet.config import ClipConfig
 
 cp, cpx_sparse = make_lazy_cupy_pair()
 
@@ -158,6 +159,7 @@ def _partial_numerator_for_shard(
     device_id: int,
     subsample_frac: float = 1.0,
     rng_seed: Optional[int] = None,
+    clip_reconstruction: bool = True,
 ) -> np.ndarray:
     """
     Compute the partial factor-numerator contribution from a single NNZ shard.
@@ -233,7 +235,8 @@ def _partial_numerator_for_shard(
         if divergence == "kl":
             A_rows = A_d[r_i]
             R_nz = cp.sum(A_rows * Z_rows, axis=1)
-            R_nz = cp.clip(R_nz, a_min=epsilon, a_max=None)
+            if clip_reconstruction:
+                R_nz = cp.clip(R_nz, a_min=epsilon, a_max=None)
             w = v_i / R_nz
         else:  # "fr"
             w = v_i
@@ -264,6 +267,7 @@ def _sharded_factor_update(
     subsample_frac: float = 1.0,
     iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    clip_cfg: Optional[ClipConfig] = None,
 ) -> cp.ndarray:
     """
     Orchestrate multi-GPU factor numerator computation and reduce on CPU.
@@ -286,14 +290,22 @@ def _sharded_factor_update(
     A_primary = factors[mode]
 
     # Denominator — analytical, no NNZ
+    _clip_denom = clip_cfg is None or clip_cfg.denominator
+    _clip_gram = clip_cfg is None or clip_cfg.gram
+    _clip_recon = clip_cfg is None or clip_cfg.reconstruction
+    _clip_num = clip_cfg is None or clip_cfg.numerator
+    _clip_floor = clip_cfg is None or clip_cfg.factor_floor
     with cp.cuda.Device(primary):
         if divergence == "kl":
-            den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon)
+            den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon,
+                                           clip_denominator=_clip_denom)
             denominator = den_row[None, :]
         else:
-            Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon)
+            Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon,
+                                    clip_gram=_clip_gram)
             denominator = A_primary @ Gram
-            denominator = cp.clip(denominator, a_min=epsilon, a_max=None)
+            if _clip_denom:
+                denominator = cp.clip(denominator, a_min=epsilon, a_max=None)
 
     # Parallel partial numerators
     partial_nums: List[Optional[np.ndarray]] = [None] * len(device_ids)
@@ -314,6 +326,7 @@ def _sharded_factor_update(
                 device_id=device_ids[k],
                 subsample_frac=subsample_frac,
                 rng_seed=(None if iter_seed is None else iter_seed + k),
+                clip_reconstruction=_clip_recon,
             ): k
             for k in range(len(device_ids))
         }
@@ -328,9 +341,11 @@ def _sharded_factor_update(
 
     with cp.cuda.Device(primary):
         numerator = cp.asarray(numerator_np)
-        numerator = cp.clip(numerator, a_min=epsilon, a_max=None)
+        if _clip_num:
+            numerator = cp.clip(numerator, a_min=epsilon, a_max=None)
         A_new = A_primary * (numerator / (denominator + epsilon))
-        A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
+        if _clip_floor:
+            A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
 
     return A_new
 
@@ -430,6 +445,7 @@ def _sharded_core_update(
     subsample_frac: float = 1.0,
     iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    clip_cfg: Optional[ClipConfig] = None,
 ) -> cp.ndarray:
     """
     Orchestrate multi-GPU core numerator computation and reduce on CPU.
@@ -479,12 +495,17 @@ def _sharded_core_update(
 
     Num_np = np.add.reduce(partial_nums)
 
+    _clip_denom = clip_cfg is None or clip_cfg.denominator
+    _clip_num = clip_cfg is None or clip_cfg.numerator
+    _clip_floor = clip_cfg is None or clip_cfg.factor_floor
+    _clip_gram = clip_cfg is None or clip_cfg.gram
     with cp.cuda.Device(primary):
         Num = cp.asarray(Num_np)
 
         if divergence == "kl":
             sums = [
-                cp.clip(cp.sum(factors[n], axis=0), a_min=epsilon, a_max=None)
+                cp.clip(cp.sum(factors[n], axis=0), a_min=epsilon, a_max=None) if _clip_denom
+                else cp.sum(factors[n], axis=0)
                 for n in range(N)
             ]
             core_new = core * (Num + epsilon)
@@ -492,11 +513,13 @@ def _sharded_core_update(
                 shp = [1] * N
                 shp[n] = int(sums[n].shape[0])
                 core_new = core_new / sums[n].reshape(tuple(shp))
-            core_new = cp.clip(core_new, a_min=epsilon, a_max=None)
+            if _clip_floor:
+                core_new = cp.clip(core_new, a_min=epsilon, a_max=None)
         else:  # "fr"
-            Num = cp.clip(Num, a_min=epsilon, a_max=None)
+            if _clip_num:
+                Num = cp.clip(Num, a_min=epsilon, a_max=None)
             grams = [factors[n].T @ factors[n] for n in range(N)]
-            Den = _core_multilinear_grams(core, grams, epsilon=epsilon)
+            Den = _core_multilinear_grams(core, grams, epsilon=epsilon, clip_gram=_clip_gram)
             core_new = core * (Num / (Den + epsilon))
 
     return core_new
@@ -516,7 +539,11 @@ def _partial_kl_error_for_shard(
     device_id: int,
     subsample_frac: float = 1.0,
     rng_seed: Optional[int] = None,
+    clip_reconstruction: bool = True,
+    clip_loss: bool = True,
 ) -> Tuple[float, float, float]:
+    _clip_recon = clip_reconstruction
+    _clip_loss = clip_loss
     """
     Compute partial KL error scalars from a single NNZ shard.
 
@@ -542,15 +569,20 @@ def _partial_kl_error_for_shard(
         flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, rng_seed)
         nnz = int(flat.size)
 
-    x_nz = cp.clip(x_nz.astype(core_d.dtype), a_min=epsilon, a_max=None)
+    x_nz = x_nz.astype(core_d.dtype)
+    # loss clip and reconstruction clip are passed by the orchestrator
+    if _clip_loss:
+        x_nz = cp.clip(x_nz, a_min=epsilon, a_max=None)
     idxs = _unravel_flat_indices_C(flat, shape)
 
     r_nz = cp.empty_like(x_nz)
     for start in range(0, nnz, batch_rhat):
         end = min(start + batch_rhat, nnz)
         mats = [factors_d[n][idxs[n][start:end]] for n in range(N)]
-        r_nz[start:end] = _rhat_from_factor_rows_sequential(core_d, mats, epsilon=epsilon)
-    r_nz = cp.clip(r_nz, a_min=epsilon, a_max=None)
+        r_nz[start:end] = _rhat_from_factor_rows_sequential(core_d, mats, epsilon=epsilon,
+                                                             clip_reconstruction=_clip_recon)
+    if _clip_recon:
+        r_nz = cp.clip(r_nz, a_min=epsilon, a_max=None)
 
     term_pos = x_nz * cp.log(x_nz / r_nz) - x_nz + r_nz
     kl_pos = float(cp.sum(term_pos).get())
@@ -572,6 +604,7 @@ def _sharded_kl_error(
     subsample_frac: float = 1.0,
     iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    clip_cfg: Optional[ClipConfig] = None,
 ) -> cp.ndarray:
     """
     Compute relative KL error with sharded NNZ; returns a scalar CuPy array
@@ -597,6 +630,8 @@ def _sharded_kl_error(
                 device_id=device_ids[k],
                 subsample_frac=subsample_frac,
                 rng_seed=(None if iter_seed is None else iter_seed + k),
+                clip_reconstruction=(clip_cfg is None or clip_cfg.reconstruction),
+                clip_loss=(clip_cfg is None or clip_cfg.loss),
             ): k
             for k in range(len(device_ids))
         }
@@ -631,6 +666,8 @@ def _partial_fr_error_for_shard(
     device_id: int,
     subsample_frac: float = 1.0,
     rng_seed: Optional[int] = None,
+    clip_reconstruction: bool = True,
+    clip_loss: bool = True,
 ) -> Tuple[float, float]:
     """
     Compute partial Frobenius error scalars from a single NNZ shard.
@@ -657,7 +694,9 @@ def _partial_fr_error_for_shard(
         flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, rng_seed)
         nnz = int(flat.size)
 
-    x_nz = cp.clip(x_nz.astype(core_d.dtype), a_min=0.0, a_max=None)
+    x_nz = x_nz.astype(core_d.dtype)
+    if clip_loss:
+        x_nz = cp.clip(x_nz, a_min=0.0, a_max=None)
     idxs = _unravel_flat_indices_C(flat, shape)
 
     norm_X_sq = float(cp.sum(x_nz * x_nz).get())
@@ -666,7 +705,8 @@ def _partial_fr_error_for_shard(
     for start in range(0, nnz, batch_rhat):
         end = min(start + batch_rhat, nnz)
         mats = [factors_d[n][idxs[n][start:end]] for n in range(N)]
-        xhat_b = _rhat_from_factor_rows_sequential(core_d, mats, epsilon=epsilon)
+        xhat_b = _rhat_from_factor_rows_sequential(core_d, mats, epsilon=epsilon,
+                                                   clip_reconstruction=clip_reconstruction)
         inner_prod_d += cp.sum(x_nz[start:end] * xhat_b)
 
     inner_prod = float(inner_prod_d.get())
@@ -685,6 +725,7 @@ def _sharded_fr_error(
     subsample_frac: float = 1.0,
     iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    clip_cfg: Optional[ClipConfig] = None,
 ) -> cp.ndarray:
     """
     Compute relative Frobenius error with sharded NNZ; returns a scalar CuPy
@@ -714,6 +755,8 @@ def _sharded_fr_error(
                 device_id=device_ids[k],
                 subsample_frac=subsample_frac,
                 rng_seed=(None if iter_seed is None else iter_seed + k),
+                clip_reconstruction=(clip_cfg is None or clip_cfg.reconstruction),
+                clip_loss=(clip_cfg is None or clip_cfg.loss),
             ): k
             for k in range(len(device_ids))
         }
@@ -728,7 +771,8 @@ def _sharded_fr_error(
 
     with cp.cuda.Device(primary):
         grams = [factors[n].T @ factors[n] for n in range(N)]
-        Den = _core_multilinear_grams(core, grams, epsilon=epsilon)
+        Den = _core_multilinear_grams(core, grams, epsilon=epsilon,
+                                      clip_gram=(clip_cfg is None or clip_cfg.gram))
         norm_Xhat_sq = float(cp.sum(core * Den).get())
 
     norm_X = math.sqrt(max(norm_X_sq_total, float(epsilon)))
@@ -885,6 +929,7 @@ class ShardedSparseTensor:
         epsilon: float = 1e-12,
         batch_cols: Optional[int] = None,
         verbose: bool = False,
+        clip_cfg=None,
     ) -> cp.ndarray:
         """KL factor update; single-shard delegates to ``kl_factor_update_largedim``."""
         if self.n_shards == 1:
@@ -892,14 +937,14 @@ class ShardedSparseTensor:
                 vec_tensor=self.full_tensor,
                 core=core, factors=factors, mode=mode, shape=shape,
                 thread_budget=thread_budget, epsilon=epsilon,
-                batch_cols=batch_cols, verbose=verbose,
+                batch_cols=batch_cols, verbose=verbose, clip_cfg=clip_cfg,
             )
         return _sharded_factor_update(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, mode=mode, shape=shape,
             divergence="kl", epsilon=epsilon, batch_cols=batch_cols, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, clip_cfg=clip_cfg,
         )
 
     def fr_factor_update(
@@ -912,6 +957,7 @@ class ShardedSparseTensor:
         epsilon: float = 1e-12,
         batch_cols: Optional[int] = None,
         verbose: bool = False,
+        clip_cfg=None,
     ) -> cp.ndarray:
         """FR factor update; single-shard delegates to ``fr_factor_update_largedim``."""
         if self.n_shards == 1:
@@ -919,14 +965,14 @@ class ShardedSparseTensor:
                 vec_tensor=self.full_tensor,
                 core=core, factors=factors, mode=mode, shape=shape,
                 thread_budget=thread_budget, epsilon=epsilon,
-                batch_cols=batch_cols, verbose=verbose,
+                batch_cols=batch_cols, verbose=verbose, clip_cfg=clip_cfg,
             )
         return _sharded_factor_update(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, mode=mode, shape=shape,
             divergence="fr", epsilon=epsilon, batch_cols=batch_cols, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, clip_cfg=clip_cfg,
         )
 
     # ------------------------------------------------------------------
@@ -944,6 +990,7 @@ class ShardedSparseTensor:
         batch_rhat: Optional[int] = None,
         batch_num: Optional[int] = None,
         verbose: bool = False,
+        clip_cfg=None,
     ) -> cp.ndarray:
         """KL core update; single-shard delegates to ``kl_core_update_largedim``."""
         if self.n_shards == 1:
@@ -952,6 +999,7 @@ class ShardedSparseTensor:
                 shape=shape, core=core, factors=factors, modes=modes,
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_rhat=batch_rhat, batch_num=batch_num, verbose=verbose,
+                clip_cfg=clip_cfg,
             )
         return _sharded_core_update(
             shards=self.shards, device_ids=self.device_ids,
@@ -959,7 +1007,7 @@ class ShardedSparseTensor:
             divergence="kl", epsilon=epsilon,
             batch_rhat=batch_rhat, batch_num=batch_num, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, clip_cfg=clip_cfg,
         )
 
     def fr_core_update(
@@ -972,6 +1020,7 @@ class ShardedSparseTensor:
         epsilon: float = 1e-12,
         batch_num: Optional[int] = None,
         verbose: bool = False,
+        clip_cfg=None,
     ) -> cp.ndarray:
         """FR core update; single-shard delegates to ``fr_core_update_largedim``."""
         if self.n_shards == 1:
@@ -979,7 +1028,7 @@ class ShardedSparseTensor:
                 vec_tensor=self.full_tensor,
                 shape=shape, core=core, factors=factors, modes=modes,
                 thread_budget=thread_budget, epsilon=epsilon,
-                batch_num=batch_num, verbose=verbose,
+                batch_num=batch_num, verbose=verbose, clip_cfg=clip_cfg,
             )
         return _sharded_core_update(
             shards=self.shards, device_ids=self.device_ids,
@@ -987,7 +1036,7 @@ class ShardedSparseTensor:
             divergence="fr", epsilon=epsilon,
             batch_rhat=None, batch_num=batch_num, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, clip_cfg=clip_cfg,
         )
 
     # ------------------------------------------------------------------
@@ -1003,6 +1052,7 @@ class ShardedSparseTensor:
         epsilon: float = 1e-12,
         batch_rhat: Optional[int] = None,
         verbose: bool = False,
+        clip_cfg=None,
     ) -> cp.ndarray:
         """KL error; single-shard delegates to ``kl_compute_errors_largedim``."""
         if self.n_shards == 1:
@@ -1010,14 +1060,14 @@ class ShardedSparseTensor:
                 vec_tensor=self.full_tensor,
                 shape=shape, core=core, factors=factors,
                 thread_budget=thread_budget, epsilon=epsilon,
-                batch_rhat=batch_rhat, verbose=verbose,
+                batch_rhat=batch_rhat, verbose=verbose, clip_cfg=clip_cfg,
             )
         return _sharded_kl_error(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, shape=shape,
             epsilon=epsilon, batch_rhat=batch_rhat,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, clip_cfg=clip_cfg,
         )
 
     def fr_compute_errors(
@@ -1029,6 +1079,7 @@ class ShardedSparseTensor:
         epsilon: float = 1e-12,
         batch_rhat: Optional[int] = None,
         verbose: bool = False,
+        clip_cfg=None,
     ) -> cp.ndarray:
         """FR error; single-shard delegates to ``fr_compute_errors_largedim``."""
         if self.n_shards == 1:
@@ -1036,14 +1087,14 @@ class ShardedSparseTensor:
                 vec_tensor=self.full_tensor,
                 shape=shape, core=core, factors=factors,
                 thread_budget=thread_budget, epsilon=epsilon,
-                batch_rhat=batch_rhat, verbose=verbose,
+                batch_rhat=batch_rhat, verbose=verbose, clip_cfg=clip_cfg,
             )
         return _sharded_fr_error(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, shape=shape,
             epsilon=epsilon, batch_rhat=batch_rhat,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, clip_cfg=clip_cfg,
         )
 
 
@@ -1054,11 +1105,11 @@ class ShardedSparseTensor:
 def make_sharded_kl_factor_update(sst: ShardedSparseTensor):
     """Callable matching ``kl_factor_update_largedim`` signature; routes through *sst*."""
     def _fn(vec_tensor, core, factors, mode, shape,
-            thread_budget=None, epsilon=1e-12, batch_cols=None, verbose=False):
+            thread_budget=None, epsilon=1e-12, batch_cols=None, verbose=False, clip_cfg=None):
         return sst.kl_factor_update(
             core=core, factors=factors, mode=mode, shape=shape,
             thread_budget=thread_budget, epsilon=epsilon,
-            batch_cols=batch_cols, verbose=verbose,
+            batch_cols=batch_cols, verbose=verbose, clip_cfg=clip_cfg,
         )
     return _fn
 
@@ -1066,11 +1117,11 @@ def make_sharded_kl_factor_update(sst: ShardedSparseTensor):
 def make_sharded_fr_factor_update(sst: ShardedSparseTensor):
     """Callable matching ``fr_factor_update_largedim`` signature; routes through *sst*."""
     def _fn(vec_tensor, core, factors, mode, shape,
-            thread_budget=None, epsilon=1e-12, batch_cols=None, verbose=False):
+            thread_budget=None, epsilon=1e-12, batch_cols=None, verbose=False, clip_cfg=None):
         return sst.fr_factor_update(
             core=core, factors=factors, mode=mode, shape=shape,
             thread_budget=thread_budget, epsilon=epsilon,
-            batch_cols=batch_cols, verbose=verbose,
+            batch_cols=batch_cols, verbose=verbose, clip_cfg=clip_cfg,
         )
     return _fn
 
@@ -1078,11 +1129,12 @@ def make_sharded_fr_factor_update(sst: ShardedSparseTensor):
 def make_sharded_kl_core_update(sst: ShardedSparseTensor):
     """Callable matching ``kl_core_update_largedim`` signature; routes through *sst*."""
     def _fn(vec_tensor, shape, core, factors, modes=None,
-            thread_budget=None, epsilon=1e-12, batch_rhat=None, batch_num=None, verbose=False):
+            thread_budget=None, epsilon=1e-12, batch_rhat=None, batch_num=None, verbose=False,
+            clip_cfg=None):
         return sst.kl_core_update(
             shape=shape, core=core, factors=factors, modes=modes,
             thread_budget=thread_budget, epsilon=epsilon,
-            batch_rhat=batch_rhat, batch_num=batch_num, verbose=verbose,
+            batch_rhat=batch_rhat, batch_num=batch_num, verbose=verbose, clip_cfg=clip_cfg,
         )
     return _fn
 
@@ -1090,11 +1142,11 @@ def make_sharded_kl_core_update(sst: ShardedSparseTensor):
 def make_sharded_fr_core_update(sst: ShardedSparseTensor):
     """Callable matching ``fr_core_update_largedim`` signature; routes through *sst*."""
     def _fn(vec_tensor, shape, core, factors, modes=None,
-            thread_budget=None, epsilon=1e-12, batch_num=None, verbose=False):
+            thread_budget=None, epsilon=1e-12, batch_num=None, verbose=False, clip_cfg=None):
         return sst.fr_core_update(
             shape=shape, core=core, factors=factors, modes=modes,
             thread_budget=thread_budget, epsilon=epsilon,
-            batch_num=batch_num, verbose=verbose,
+            batch_num=batch_num, verbose=verbose, clip_cfg=clip_cfg,
         )
     return _fn
 
@@ -1102,11 +1154,11 @@ def make_sharded_fr_core_update(sst: ShardedSparseTensor):
 def make_sharded_kl_compute_errors(sst: ShardedSparseTensor):
     """Callable matching ``kl_compute_errors_largedim`` signature; routes through *sst*."""
     def _fn(vec_tensor, shape, core, factors,
-            thread_budget=None, epsilon=1e-12, batch_rhat=None, verbose=False):
+            thread_budget=None, epsilon=1e-12, batch_rhat=None, verbose=False, clip_cfg=None):
         return sst.kl_compute_errors(
             shape=shape, core=core, factors=factors,
             thread_budget=thread_budget, epsilon=epsilon,
-            batch_rhat=batch_rhat, verbose=verbose,
+            batch_rhat=batch_rhat, verbose=verbose, clip_cfg=clip_cfg,
         )
     return _fn
 
@@ -1114,10 +1166,10 @@ def make_sharded_kl_compute_errors(sst: ShardedSparseTensor):
 def make_sharded_fr_compute_errors(sst: ShardedSparseTensor):
     """Callable matching ``fr_compute_errors_largedim`` signature; routes through *sst*."""
     def _fn(vec_tensor, shape, core, factors,
-            thread_budget=None, epsilon=1e-12, batch_rhat=None, verbose=False):
+            thread_budget=None, epsilon=1e-12, batch_rhat=None, verbose=False, clip_cfg=None):
         return sst.fr_compute_errors(
             shape=shape, core=core, factors=factors,
             thread_budget=thread_budget, epsilon=epsilon,
-            batch_rhat=batch_rhat, verbose=verbose,
+            batch_rhat=batch_rhat, verbose=verbose, clip_cfg=clip_cfg,
         )
     return _fn

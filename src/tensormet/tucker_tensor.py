@@ -1144,6 +1144,7 @@ class SparseTupleTensor:
             warmup_steps = cfg.train.warmup_steps
             largedim = cfg.train.largedim
             checkpoint_saving = cfg.train.checkpoint_saving_steps
+            clip_cfg = cfg.train.clip
 
             rec_check_every = cfg.eval.rec_check_every
             sem_check_every = cfg.eval.sem_check_every
@@ -1296,7 +1297,8 @@ class SparseTupleTensor:
                     shape=shape,
                     thread_budget=thread_budget,
                     epsilon=epsilon,
-                    verbose=verbose
+                    verbose=verbose,
+                    clip_cfg=clip_cfg,
                 )
 
                 # new: factor linking
@@ -1315,7 +1317,8 @@ class SparseTupleTensor:
                     modes=modes,
                     thread_budget=thread_budget,  # we always pass it, even if not needed, to ensure consistency
                     epsilon=epsilon,
-                    verbose=verbose
+                    verbose=verbose,
+                    clip_cfg=clip_cfg,
                 )
             else:
                 # KL: core update, then compute error separately
@@ -1327,7 +1330,8 @@ class SparseTupleTensor:
                     modes=modes,
                     thread_budget=thread_budget,
                     epsilon=epsilon,
-                    verbose=verbose
+                    verbose=verbose,
+                    clip_cfg=clip_cfg,
                 )
                 rel_err = routing.error_fn(
                     vec_tensor=_current_tensor,
@@ -1336,7 +1340,8 @@ class SparseTupleTensor:
                     factors=factors,
                     thread_budget=thread_budget,
                     epsilon=epsilon,
-                    verbose=verbose
+                    verbose=verbose,
+                    clip_cfg=clip_cfg,
                 )
             # Normalize if desired
             if normalize_factors:

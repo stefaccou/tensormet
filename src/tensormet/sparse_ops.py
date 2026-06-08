@@ -360,7 +360,7 @@ def gather_dense_at_block_nz(dense_nd: np.ndarray,
 #     Z_u = cp.clip(Z_u, a_min=epsilon, a_max=None)
 #     return Z_u
 
-def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=1e-12):
+def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=1e-12, clip_reconstruction=True):
     """
     Compute Z columns (as rows) for a batch of unfolding columns, without building full Z.
 
@@ -372,7 +372,8 @@ def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=
     """
     if not other_modes:
         m = len(list(idxs_by_mode.values())[0]) if idxs_by_mode else 1
-        return cp.clip(cp.tile(core, (m, 1)), a_min=epsilon, a_max=None)
+        tmp = cp.tile(core, (m, 1))
+        return cp.clip(tmp, a_min=epsilon, a_max=None) if clip_reconstruction else tmp
 
     N = core.ndim
     letters = einsum_letters(N)
@@ -382,7 +383,7 @@ def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=
     eq = core_sub + "," + ",".join(mat_subs) + "->" + out_sub
     mats = [factors[k][idxs_by_mode[k]] for k in other_modes]
     tmp = cp.einsum(eq, core, *mats, optimize=cp_einsum_optimize(1 + len(other_modes)))
-    return cp.clip(tmp, a_min=epsilon, a_max=None)
+    return cp.clip(tmp, a_min=epsilon, a_max=None) if clip_reconstruction else tmp
 
     # -- old tensordot+broadcast-sum loop (kept for reference) --
     # k0 = other_modes[0]
@@ -688,8 +689,8 @@ def _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state):
         factors.append(_nndsvd_factors_gpu(U, s))
 
     core = _compute_tucker_core_batched(sparse_tensor, shape, factors, modes)
-    core = cp.clip(cp.abs(core), a_min=1e-30, a_max=None)
-    factors = [cp.clip(cp.abs(f), a_min=1e-30, a_max=None) for f in factors]
+    core = cp.clip(cp.abs(core), a_min=1e-12, a_max=None)
+    factors = [cp.clip(cp.abs(f), a_min=1e-12, a_max=None) for f in factors]
     return core, factors
 
 
