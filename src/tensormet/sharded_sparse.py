@@ -182,9 +182,6 @@ def _partial_numerator_for_shard(
     factors_d = [cp.asarray(f) for f in factors_np]
     A_d = factors_d[mode]
 
-    if batch_cols is None:
-        batch_cols = int(_estimate_batch_cols_for_Z(core_d, factors_d, mode))
-
     flat, vals = _blocked_coo_to_flat_indices(shard, shape)
 
     if flat.size == 0:
@@ -204,6 +201,11 @@ def _partial_numerator_for_shard(
     numerator = cp.zeros_like(A_d)
     ucols, inv = cp.unique(cols, return_inverse=True)
     n_ucols = int(ucols.size)
+
+    # Estimate AFTER all NNZ bookkeeping is live on the GPU so the free-memory
+    # snapshot reflects the actual headroom available for the einsum temporaries.
+    if batch_cols is None:
+        batch_cols = int(_estimate_batch_cols_for_Z(core_d, factors_d, mode))
 
     for batch_start in range(0, n_ucols, batch_cols):
         batch_end = min(batch_start + batch_cols, n_ucols)
@@ -372,11 +374,6 @@ def _partial_core_num_for_shard(
     factors_d = [cp.asarray(f) for f in factors_np]
     N = len(shape)
 
-    if batch_rhat is None:
-        batch_rhat = int(_estimate_batch_rhat_for_tensordot(core_d, factors_d))
-    if batch_num is None:
-        batch_num = int(_estimate_batch_num_for_outer(core_d, factors_d))
-
     flat, xvals = _blocked_coo_to_flat_indices(shard, shape)
     nnz = int(flat.size)
 
@@ -389,6 +386,12 @@ def _partial_core_num_for_shard(
 
     idxs = _unravel_flat_indices_C(flat, shape)
     Num = cp.zeros_like(core_d)
+
+    # Estimate AFTER NNZ bookkeeping is live so the free-memory snapshot is accurate.
+    if batch_rhat is None:
+        batch_rhat = int(_estimate_batch_rhat_for_tensordot(core_d, factors_d))
+    if batch_num is None:
+        batch_num = int(_estimate_batch_num_for_outer(core_d, factors_d))
 
     if divergence == "kl":
         # Pass 1: w = x / r̂

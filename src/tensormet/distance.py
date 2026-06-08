@@ -728,7 +728,7 @@ def _gpu_free_bytes():
     free_b, total_b = cp.cuda.runtime.memGetInfo()
     return int(free_b)
 
-def _estimate_batch_num_for_outer(core, factors, safety=0.80, temp_mult=2.0):
+def _estimate_batch_num_for_outer(core, factors, safety=0.70, temp_mult=2.0):
     """
     New estimator for the optimized matrix-multiplication accumulator.
     It no longer assumes the materialization of the full core outer product!
@@ -757,7 +757,7 @@ def _estimate_batch_num_for_outer(core, factors, safety=0.80, temp_mult=2.0):
     return min(int(b), hard_cap)
 
 
-def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.75, temp_mult=4.0):  # Increased temp_mult; safety raised from 0.60
+def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.7, temp_mult=4.0):  # Increased temp_mult; safety raised from 0.60
     N = core.ndim
     R = [int(factors[n].shape[1]) for n in range(N)]
     dtype = core.dtype
@@ -778,10 +778,11 @@ def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.75, temp_mult=4.0
     return max(1, int(b))
 
 
-def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.80, temp_mult=2.0):
+def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.8, temp_mult=4.0):
     """
     Estimate safe batch size for compute_Zcols_batch.
     Uses pure Python math to avoid numpy 32-bit overflows and sets a hard cap.
+    temp_mult has to be sufficiently high: 2 massively undershot the temp need
     """
     N = core.ndim
     R = [int(factors[n].shape[1]) for n in range(N)]
@@ -1178,7 +1179,7 @@ def fr_core_update_largedim(
     modes=None,              # assumes all modes (same constraint style as your KL v2)
     thread_budget=None,      # kept for API compatibility
     epsilon=1e-12,
-    batch_num=64,
+    batch_num=None,
     verbose=False,
 ):
     """

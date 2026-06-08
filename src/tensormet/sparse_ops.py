@@ -403,7 +403,298 @@ def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=
     # return cp.clip(tmp, a_min=epsilon, a_max=None)
 
 
-def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, random_state):
+def _nndsvd_factors(U: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """NNDSVD: convert left-singular vectors U (m × k) and singular values s (k,)
+    to a non-negative factor matrix.
+
+    For each column j, selects the positive or negative part of U[:, j] based on
+    which has larger norm, then scales so that column norm equals sqrt(s[j]).
+    """
+    u_pos = np.maximum(U, 0.0)
+    u_neg = np.maximum(-U, 0.0)
+    mp = np.linalg.norm(u_pos, axis=0)   # (k,)
+    mm = np.linalg.norm(u_neg, axis=0)   # (k,)
+    use_pos = mp >= mm
+    scale = np.where(use_pos, mp, mm)
+    direction = np.where(use_pos[np.newaxis, :], u_pos, u_neg)   # (m, k)
+    valid = scale > 0.0
+    sqrt_scale = np.where(valid, np.sqrt(s / np.where(valid, scale, 1.0)), 0.0)
+    return direction * sqrt_scale[np.newaxis, :]
+
+
+def _nndsvd_factors_gpu(U, s):
+    """GPU version of NNDSVD: U (m × k) and s (k,) are CuPy arrays."""
+    u_pos = cp.maximum(U, 0.0)
+    u_neg = cp.maximum(-U, 0.0)
+    mp = cp.linalg.norm(u_pos, axis=0)
+    mm = cp.linalg.norm(u_neg, axis=0)
+    use_pos = mp >= mm
+    scale = cp.where(use_pos, mp, mm)
+    direction = cp.where(use_pos[cp.newaxis, :], u_pos, u_neg)
+    valid = scale > 0.0
+    sqrt_scale = cp.where(valid, cp.sqrt(s / cp.where(valid, scale, 1.0)), 0.0)
+    return direction * sqrt_scale[cp.newaxis, :]
+
+
+def _svd_worker(row_np, col_np, data_np, sp_shape, rank_i, random_state_i, threads_per_mode,
+                write_conn):
+    """Top-level worker for ProcessPoolExecutor: truncated SVD on one mode unfolding.
+
+    Uses eigsh on the Gram operator A @ A.T (shape m × m, always small) instead
+    of svds. svds recovers right singular vectors via A.T @ U, which for a wide
+    unfolding (e.g. 10000 × 100M) produces a 15-billion-element matrix that
+    overflows LAPACK's int32 indexing. We only need left singular vectors, so
+    the Gram approach is both correct and avoids the overflow entirely.
+
+    Each Gram mat-vec calls A.T @ x (producing an n-vector) then A @ y, and
+    sends one increment via write_conn for live tqdm tracking in the main process.
+    Pipe connections clean up with os.close() on exit — no IPC, no hang risk.
+    """
+    import scipy.sparse
+    import scipy.sparse.linalg
+    from contextlib import nullcontext
+    from threadpoolctl import threadpool_limits
+
+    sp_cpu = scipy.sparse.coo_matrix(
+        (data_np, (row_np, col_np)), shape=sp_shape
+    ).tocsr()
+    m = sp_shape[0]
+    k = min(rank_i, m - 1)
+    rng = np.random.RandomState(random_state_i)
+    v0 = rng.standard_normal(m)
+
+    def _gram_mv(x):
+        write_conn.send(1)
+        return sp_cpu @ (sp_cpu.T @ x)   # (m,) → (n,) → (m,)
+
+    gram_op = scipy.sparse.linalg.LinearOperator(
+        shape=(m, m), matvec=_gram_mv, dtype=sp_cpu.dtype,
+    )
+
+    ctx = threadpool_limits(threads_per_mode) if threads_per_mode is not None else nullcontext()
+    with ctx:
+        eigvals, eigvecs = scipy.sparse.linalg.eigsh(gram_op, k=k, which='LM', v0=v0)
+
+    desc = np.argsort(eigvals)[::-1]
+    U = eigvecs[:, desc]                              # (m, k) left singular vectors
+    s = np.sqrt(np.maximum(eigvals[desc], 0.0))       # (k,) singular values
+    return _nndsvd_factors(U, s)
+
+
+def _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state, thread_budget=None):
+    """Tucker init via truncated SVD of each mode unfolding (CPU/scipy path).
+
+    Extracts COO data for all mode unfoldings in the main process (sequential,
+    fast), then dispatches one worker process per mode via ProcessPoolExecutor.
+    Each worker process owns an independent BLAS thread pool sized at
+    n_threads // n_modes, so all CPUs are saturated without oversubscription.
+    A tqdm bar per mode tracks ARPACK mat-vec iterations via a Queue drained by
+    a background thread. Core is computed on GPU after all factors are collected.
+    """
+    import multiprocessing
+    import threading
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from tqdm import tqdm
+
+    n_modes = len(modes)
+    n_threads = thread_budget.n_threads if thread_budget is not None else None
+    threads_per_mode = max(1, n_threads // n_modes) if n_threads is not None else None
+
+    # GPU → CPU transfer happens here, sequentially (PCIe, fast relative to SVD)
+    mode_arrays = []
+    for mode in modes:
+        unfolded = unfold_from_vectorized_sparse(sparse_tensor, shape, mode, to_dense=False)
+        coo = unfolded.tocoo()
+        mode_arrays.append((
+            cp.asnumpy(coo.row).astype(np.int32),
+            cp.asnumpy(coo.col).astype(np.int32),
+            cp.asnumpy(coo.data),
+            unfolded.shape,
+        ))
+
+    def _drain(read_conn, pbar):
+        # Exits when the write end of the pipe is fully closed (worker exits +
+        # main process closes its copy), which raises EOFError on recv().
+        try:
+            while True:
+                read_conn.recv()
+                pbar.update(1)
+        except EOFError:
+            pass
+
+    # One Pipe per mode. write_conn is passed to the worker (picklable Connection).
+    # Cleanup is a plain os.close() — no manager process, no RPC, no hang risk.
+    pipe_pairs = [multiprocessing.Pipe(duplex=False) for _ in range(n_modes)]
+
+    bars = [
+        tqdm(desc=f"SVD mode {i}", position=i, leave=True, unit="mv", dynamic_ncols=True)
+        for i in range(n_modes)
+    ]
+    drain_threads = [
+        threading.Thread(target=_drain, args=(r, b), daemon=True)
+        for (r, _w), b in zip(pipe_pairs, bars)
+    ]
+    for t in drain_threads:
+        t.start()
+
+    factors = [None] * n_modes
+    with ProcessPoolExecutor(max_workers=n_modes) as pool:
+        futures = {
+            pool.submit(
+                _svd_worker,
+                row, col, data, sp_shape,
+                rank[i], random_state + i, threads_per_mode, pipe_pairs[i][1],
+            ): i
+            for i, (row, col, data, sp_shape) in enumerate(mode_arrays)
+        }
+        for fut in as_completed(futures):
+            i = futures[fut]
+            pipe_pairs[i][1].close()      # close main's write end; worker exit closes
+            factors[i] = cp.asarray(fut.result())   # its copy → drain thread gets EOFError
+
+    for t in drain_threads:
+        t.join()
+    for b in bars:
+        b.close()
+
+    core = _compute_tucker_core_batched(sparse_tensor, shape, factors, modes)
+    core = cp.clip(cp.abs(core), a_min=1e-30, a_max=None)
+    factors = [cp.clip(cp.abs(f), a_min=1e-30, a_max=None) for f in factors]
+    return core, factors
+
+
+def _compute_tucker_core_batched(sparse_tensor, shape, factors, modes):
+    """Compute G = X ×_n U_n^T for all modes without materialising any large intermediate.
+
+    Uses the same NNZ-batched outer-product accumulation as kl_core_update_largedim:
+      G = Σ_{nz} X[nz] · outer(U0[i0,:], U1[i1,:], ..., UN[iN,:])
+
+    This avoids the O(R × prod_other) dense allocation that sparse_multi_mode_dot_vec
+    would require for large dimensions (e.g. 60 GB for dim=10000, order=3, rank=150).
+    Batch size is estimated from free GPU memory via _estimate_batch_num_for_outer.
+    """
+    from tensormet.distance import (
+        _blocked_coo_to_flat_indices,
+        _unravel_flat_indices_C,
+        _accumulate_core_num_outer,
+        _estimate_batch_num_for_outer,
+    )
+    N = len(modes)
+    core_shape = tuple(factors[n].shape[1] for n in range(N))
+    core = cp.zeros(core_shape, dtype=factors[0].dtype)
+
+    flat, xvals = _blocked_coo_to_flat_indices(sparse_tensor, shape)
+    nnz = int(flat.size)
+    if nnz == 0:
+        return core
+    idxs = _unravel_flat_indices_C(flat, shape)
+
+    batch_num = _estimate_batch_num_for_outer(core, factors)
+    for start in range(0, nnz, int(batch_num)):
+        end = min(start + int(batch_num), nnz)
+        mats = [factors[n][idxs[n][start:end]] for n in range(N)]
+        _accumulate_core_num_outer(core, xvals[start:end], mats)
+
+    return core
+
+
+def _gpu_top_k_eig(C, k, n_oversampling=10, n_power_iter=3, seed=None):
+    """Top-k eigenpairs of a symmetric PSD matrix C (m × m) using only cuBLAS.
+
+    Algorithm: randomized subspace iteration + CholeskyQR + Rayleigh-Ritz.
+    cuSOLVER is never called. The only CPU work is a (k+p)×(k+p) Cholesky
+    and eigh — matrices of size ~60×60 for typical ranks, negligible cost.
+
+    Steps:
+      1. Y = C @ Ω          random projection           (cuBLAS, float64)
+      2. Y = C @ (C @ Y)    power iterations with column normalisation
+      3. Q = CholeskyQR(Y)  tiny CPU Cholesky on (p×p) + GPU matmul
+      4. B = Q.T @ C @ Q    Rayleigh-Ritz               (cuBLAS, result tiny)
+      5. eigh(B)            on CPU, B is (p×p)
+      6. U = Q @ V          map eigenvectors back         (cuBLAS)
+
+    Column normalisation after each power iteration is essential: without it,
+    the dominant eigenvalue is amplified as λ^(2t+1) per iteration, overflowing
+    float32 (and even float64) for large Gram matrices. Normalisation preserves
+    the column span — which is all that matters — while keeping values finite.
+    All power-iteration arithmetic is done in float64 to prevent cancellation.
+    """
+    import scipy.linalg
+
+    m = C.shape[0]
+    p = k + n_oversampling
+    orig_dtype = C.dtype
+
+    # Upcast to float64 for numerical stability throughout
+    C64 = C.astype(cp.float64)
+
+    rng = cp.random.RandomState(seed)
+    Y = rng.standard_normal((m, p))   # float64
+
+    Y = C64 @ Y
+    for _ in range(n_power_iter):
+        Y = C64 @ (C64 @ Y)
+        # Normalise columns to prevent overflow/underflow across iterations.
+        # The column span of Y is unchanged by this scaling.
+        col_norms = cp.sqrt(cp.sum(Y ** 2, axis=0, keepdims=True))
+        Y /= cp.maximum(col_norms, 1e-100)
+
+    # CholeskyQR: Y.T @ Y is (p×p). After column normalisation the diagonal
+    # is ≈ 1 so G is well-conditioned and Cholesky succeeds reliably.
+    G_cpu = cp.asnumpy(Y.T @ Y)
+    G_cpu = (G_cpu + G_cpu.T) * 0.5                         # symmetrize
+    G_cpu += np.eye(p) * (np.abs(np.diag(G_cpu)).mean() * 1e-10 + 1e-100)
+    L = scipy.linalg.cholesky(G_cpu, lower=True)
+    L_inv = scipy.linalg.solve_triangular(L, np.eye(p), lower=True)
+    Q = Y @ cp.asarray(L_inv)                               # (m, p) float64
+
+    # Rayleigh-Ritz: project C onto the p-dim subspace
+    B_cpu = cp.asnumpy(Q.T @ C64 @ Q)                      # (p, p) — tiny
+    B_cpu = (B_cpu + B_cpu.T) * 0.5
+    eigvals_cpu, eigvecs_cpu = np.linalg.eigh(B_cpu)
+
+    # Top-k in descending order; cast back to original dtype
+    eigvals = eigvals_cpu[-k:][::-1].copy()
+    V = cp.asarray(np.ascontiguousarray(eigvecs_cpu[:, -k:][:, ::-1]))
+    U = (Q @ V).astype(orig_dtype)                          # (m, k)
+    s = cp.sqrt(cp.maximum(cp.asarray(eigvals), 0.0)).astype(orig_dtype)
+    return U, s
+
+
+def _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state):
+    """Tucker init via Gram-matrix eigendecomposition (GPU path).
+
+    Computes A @ A.T for each mode unfolding A via cuSPARSE spgemm, then
+    extracts the top-k eigenpairs with _gpu_top_k_eig (randomized subspace
+    iteration — cuBLAS only, no cuSOLVER). Core is computed via the same
+    NNZ-batched accumulation used by kl_core_update_largedim.
+    """
+    factors = []
+    for i, mode in enumerate(modes):
+        unfolded = unfold_from_vectorized_sparse(sparse_tensor, shape, mode, to_dense=False)
+        A = unfolded.tocsr()
+        del unfolded
+
+        # A @ A.T: (I_mode × I_mode) via cuSPARSE spgemm — never touches prod_other densely
+        C = A @ A.T
+        del A
+        if cpx_sparse.isspmatrix(C):
+            C = C.toarray()
+
+        k = rank[i]
+        U, s = _gpu_top_k_eig(C, k, seed=random_state + i)
+        del C
+
+        factors.append(_nndsvd_factors_gpu(U, s))
+
+    core = _compute_tucker_core_batched(sparse_tensor, shape, factors, modes)
+    core = cp.clip(cp.abs(core), a_min=1e-30, a_max=None)
+    factors = [cp.clip(cp.abs(f), a_min=1e-30, a_max=None) for f in factors]
+    return core, factors
+
+
+def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, random_state,
+                                   thread_budget=None):
     if init == "random":
         rng = tl.check_random_state(random_state)
         core = tl.tensor(
@@ -414,9 +705,13 @@ def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, rando
             tl.tensor(rng.random_sample((shape[mode], rank[i])), **tl.context(sparse_tensor))
             for i, mode in enumerate(modes)
         ]
+    elif init in ("svd", "svd_cpu"):
+        return _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state,
+                                          thread_budget=thread_budget)
+    elif init == "svd_gpu":
+        return _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state)
     else:
         core, factors = init
-
 
     factors = [tl.clip(tl.abs(f), a_min=1e-30, a_max=None) for f in factors]
     core = tl.clip(tl.abs(core), a_min=1e-30, a_max=None)

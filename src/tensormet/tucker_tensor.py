@@ -1193,7 +1193,8 @@ class SparseTupleTensor:
             core = cp.asarray(ckpt_core)
             factors = [cp.asarray(factor) for factor in ckpt_factors]
         else:
-            core, factors = initialize_nonnegative_tucker(self.tensor, shape, rank, modes, init, random_state)
+            core, factors = initialize_nonnegative_tucker(self.tensor, shape, rank, modes, init,
+                                                           random_state, thread_budget=thread_budget)
 
         # --- multi-GPU shard initialisation ---
 
