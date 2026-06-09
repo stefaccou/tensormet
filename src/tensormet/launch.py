@@ -199,7 +199,7 @@ def launch_tensor_population(cfg):
     return results
 
 def launch_nnt_decomposition(cfg):
-    thread_budget = ThreadBudget(n_threads=compute_num_threads(cfg.exp.max_cpu_frac))
+    thread_budget = ThreadBudget(n_threads=compute_num_threads(cfg.train.max_cpu_frac))
     _n_gpus = getattr(cfg.train, "n_gpus", 1)
     _gpu_id = getattr(cfg.train, "gpu_id", None)
     select_gpu(gpu_id=_gpu_id, n_gpus=_n_gpus)
@@ -215,7 +215,7 @@ def launch_nnt_decomposition(cfg):
     # we load the sample sentences only once
 
     # Calculate suffix using the exact same logic as population.py
-    linked_groups = linked_factor_groups(cfg.exp.order, cfg.train.shared_factors)
+    linked_groups = linked_factor_groups(cfg.exp.order, cfg.exp.shared_factors)
     linked_nontrivial = [group for group in linked_groups if len(group) > 1]
     suffix = shared_factor_suffix(linked_nontrivial)
 
@@ -283,7 +283,7 @@ def launch_nnt_decomposition(cfg):
             p.parent.mkdir(parents=True, exist_ok=True)
 
     # If model already exists, skip (optional but recommended)
-    if paths["model"].exists() and not cfg.exp.overwrite and not cfg.train.resume:
+    if paths["model"].exists() and not cfg.train.overwrite and not cfg.train.resume:
         print(f"Decomposition already exists at {paths['model']}, skipping...")
         sys.exit(0)
 
@@ -300,8 +300,8 @@ def launch_nnt_decomposition(cfg):
         method=cfg.exp.method,
         order=cfg.exp.order,
         dims=cfg.exp.dim,
-        tier1=cfg.exp.tier1,
-        shared_factors=cfg.train.shared_factors,
+        tier1=cfg.train.tier1,
+        shared_factors=cfg.exp.shared_factors,
     )
 
 

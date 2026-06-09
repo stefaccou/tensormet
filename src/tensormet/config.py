@@ -75,28 +75,20 @@ def parse_raw_ngram_orders(type_str: str) -> Optional[list]:
 class TrainingConfig:
     n_iter_max: int = 1000
     tol: float = 1e-5
-    epsilon: float = 1e-12
-    init: str = "random"
-    normalize_factors: bool = False
-    shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None
     warmup_steps: int = 1
     patience: int = 5
     verbose: bool = True
     return_errors: str = "full"
     largedim: bool = False
-    checkpoint_saving_steps: int = 0 # defaults to 0 -> Falsy
-    resume: bool = False  # <-- ADDED for checkpoint resumption
-    n_gpus: int = 1  # number of GPUs for NNZ sharding; 1 = single-GPU fallback
-    gpu_id: Optional[Union[int, Tuple[int, ...]]] = None  # one int or tuple of ints to pin; None = auto-select
-    subsample_frac: float = 1.0    # fraction of NNZ per update; 1.0 = exact
-    subsample_warmup: int = 0      # iterations using full NNZ before stochastic mode begins
-    # Optimisation objective:
-    #   "full"   -> fit the entire (zero-filled) tensor; correct/possible for count/co-occurrence
-    #               tensors where an unobserved entry genuinely means 0.
-    #   "masked" -> fit ONLY observed (nonzero) entries; treat the rest as missing
-    #               (weighted/completion objective). Correct for recommendation/generalisation
-    #               data (e.g. Netflix) where "unobserved" != "rated 0".
-    objective: str = "full"
+    checkpoint_saving_steps: int = 0
+    resume: bool = False
+    n_gpus: int = 1
+    gpu_id: Optional[Union[int, Tuple[int, ...]]] = None
+    subsample_warmup: int = 0
+    max_cpu_frac: float = 1
+    tier1: bool = False
+    overwrite: bool = False
+    data_dir: Path = DATA_DIR
 
 @dataclass(frozen=True)
 class EvalConfig:
@@ -119,15 +111,21 @@ class ExperimentConfig:
     method: str = "siiSoftPlus"
     divergence: str = "fr"
     dim: Union[int, Tuple[int, ...]] = 1000
-    order: int=3
+    order: int = 3
     rank: Tuple[int, ...] = (100, 100, 100)
     name: str = None
     random_state: int = 1
-    max_cpu_frac: float = 1
-    tier1: bool = False
-    overwrite: bool = False
-    # paths
-    data_dir: Path = DATA_DIR
+    epsilon: float = 1e-12
+    init: str = "random"
+    normalize_factors: bool = False
+    shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None
+    subsample_frac: float = 1.0
+    # "full"   -> fit the entire (zero-filled) tensor; correct for count/co-occurrence data
+    #             where an unobserved entry genuinely means 0.
+    # "masked" -> fit ONLY observed (nonzero) entries; treat the rest as missing
+    #             (weighted/completion objective). Correct for recommendation/generalisation
+    #             data (e.g. Netflix) where "unobserved" != "rated 0".
+    objective: str = "full"
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -140,15 +138,15 @@ class RunConfig:
         return hashlib.sha1(payload).hexdigest()[:10]
 
     def output_dir(self) -> Path:
-        return self.exp.data_dir / "tensors" / self.exp.dataset / "decomposition"
+        return self.train.data_dir / "tensors" / self.exp.dataset / "decomposition"
 
     def model_filename(self) -> str:
         # deterministic + readable
         r0 = self.exp.rank[0] if len(self.exp.rank) else "r"
         prefix = f"{self.exp.name}_" if self.exp.name else ""
-        linked_nontrivial = nontrivial_linked_groups(self.train.shared_factors, num_factors=self.exp.order)
+        linked_nontrivial = nontrivial_linked_groups(self.exp.shared_factors, num_factors=self.exp.order)
         sf_suffix = shared_factor_suffix(linked_nontrivial)
-        ss_suffix = f"_{str(self.train.subsample_frac).replace('.', 'p')}ss" if self.train.subsample_frac != 1.0 else ""
+        ss_suffix = f"_{str(self.exp.subsample_frac).replace('.', 'p')}ss" if self.exp.subsample_frac != 1.0 else ""
         return (f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_"
                 f"{dim_spec_str(self.exp.dim)}d{sf_suffix}_{r0}r{ss_suffix}_{self.train.n_iter_max}i.pt")
 
@@ -194,7 +192,7 @@ class RunConfig:
         from ANY compatible run (matching structural hyperparameters, ignoring iteration counts).
         Returns a kwargs dict ready to be unpacked into `non_negative_tucker_with_similarity`.
         """
-        if not self.train.resume:
+        if not self.train.resume:  # resume stays in TrainingConfig
             return {}
 
         paths = self.artifact_paths()
@@ -204,9 +202,9 @@ class RunConfig:
         # Try new naming first (includes {order}D_), then fall back to legacy (no order prefix).
         r0 = self.exp.rank[0] if len(self.exp.rank) else "r"
         prefix = f"{self.exp.name}_" if self.exp.name else ""
-        linked_nontrivial = nontrivial_linked_groups(self.train.shared_factors, num_factors=self.exp.order)
+        linked_nontrivial = nontrivial_linked_groups(self.exp.shared_factors, num_factors=self.exp.order)
         sf_suffix = shared_factor_suffix(linked_nontrivial)
-        ss_suffix = f"_{str(self.train.subsample_frac).replace('.', 'p')}ss" if self.train.subsample_frac != 1.0 else ""
+        ss_suffix = f"_{str(self.exp.subsample_frac).replace('.', 'p')}ss" if self.exp.subsample_frac != 1.0 else ""
         _ds = dim_spec_str(self.exp.dim)
         new_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{_ds}d{sf_suffix}_{r0}r{ss_suffix}_"
         legacy_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{_ds}d_{r0}r_"
@@ -249,28 +247,27 @@ class RunConfig:
             # These are the variables that MUST match to safely resume
             is_compatible = (
                     old_exp.get("dataset") == self.exp.dataset and
-                    old_exp.get("order") == self.exp.order and # new: order
+                    old_exp.get("order") == self.exp.order and
                     old_exp.get("method") == self.exp.method and
                     old_exp.get("divergence") == self.exp.divergence and
                     _as_dim_tuple(old_exp.get("dim", [])) == _as_dim_tuple(self.exp.dim) and
                     tuple(old_exp.get("rank", [])) == tuple(self.exp.rank) and
-                    old_train.get("init") == self.train.init and
-                    _canonical_shared_factors(old_train.get("shared_factors")) ==
-                    _canonical_shared_factors(self.train.shared_factors) and
-                    float(old_train.get("subsample_frac", 1.0)) == self.train.subsample_frac
+                    old_exp.get("init") == self.exp.init and
+                    _canonical_shared_factors(old_exp.get("shared_factors")) ==
+                    _canonical_shared_factors(self.exp.shared_factors) and
+                    float(old_exp.get("subsample_frac", 1.0)) == self.exp.subsample_frac
             )
 
             print(old_exp.get("dataset"), self.exp.dataset, "\t",
-            old_exp.get("method"),self.exp.method, "\t",
-            old_exp.get("order"),self.exp.order, "\t", #new: order
+            old_exp.get("method"), self.exp.method, "\t",
+            old_exp.get("order"), self.exp.order, "\t",
             old_exp.get("divergence"), self.exp.divergence, "\t",
             old_exp.get("dim"), self.exp.dim, "\t",
             tuple(old_exp.get("rank", [])), tuple(self.exp.rank), "\t",
-            old_train.get("init"), self.train.init, "\t",
-            # Cast both to string to safely compare parsed JSON strings with Python sets
-            _canonical_shared_factors(old_train.get("shared_factors")),
-            _canonical_shared_factors(self.train.shared_factors), "\t",
-            float(old_train.get("subsample_frac", 1.0)), self.train.subsample_frac)
+            old_exp.get("init"), self.exp.init, "\t",
+            _canonical_shared_factors(old_exp.get("shared_factors")),
+            _canonical_shared_factors(self.exp.shared_factors), "\t",
+            float(old_exp.get("subsample_frac", 1.0)), self.exp.subsample_frac)
 
 
             if is_compatible:
@@ -393,10 +390,11 @@ class InspectionConfig:
               dim=self._norm_dim(), name=self.name, dataset=self.dataset,
               method=self.method, divergence=self.divergence, order=self.order,
               rank=(self.rank,) * self.order,
+              subsample_frac=self.subsample_frac,
+              shared_factors=self._norm_sf(),
             ),
             train=TrainingConfig(
-              n_iter_max=self.iters, subsample_frac=self.subsample_frac,
-              shared_factors=self._norm_sf(),
+              n_iter_max=self.iters,
             ),
             eval=EvalConfig(),
         )

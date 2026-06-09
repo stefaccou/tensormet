@@ -896,7 +896,7 @@ class ShardedSparseTensor:
         self.n_shards = len(device_ids)
         self.subsample_frac = float(subsample_frac)
         # Optimisation objective: when True, fit only observed entries
-        # (weighted/completion objective), mirroring cfg.train.objective="masked".
+        # (weighted/completion objective), mirroring cfg.exp.objective="masked".
         self.masked = bool(masked)
         self._iter_seed: Optional[int] = None
         # Persistent pool: threads (and their cuBLAS handles) live for the

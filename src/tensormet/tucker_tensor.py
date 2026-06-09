@@ -1135,17 +1135,19 @@ class SparseTupleTensor:
 
             # training config
             n_iter_max = cfg.train.n_iter_max
-            init = cfg.train.init
             tol = cfg.train.tol
-            epsilon = cfg.train.epsilon
             verbose = cfg.train.verbose
             return_errors = cfg.train.return_errors
-            normalize_factors = cfg.train.normalize_factors
             patience = cfg.train.patience
             warmup_steps = cfg.train.warmup_steps
             largedim = cfg.train.largedim
-            objective = getattr(cfg.train, "objective", "full")
             checkpoint_saving = cfg.train.checkpoint_saving_steps
+
+            # experiment config (direct result impact)
+            init = cfg.exp.init
+            epsilon = cfg.exp.epsilon
+            normalize_factors = cfg.exp.normalize_factors
+            objective = getattr(cfg.exp, "objective", "full")
 
             rec_check_every = cfg.eval.rec_check_every
             sem_check_every = cfg.eval.sem_check_every
@@ -1156,7 +1158,7 @@ class SparseTupleTensor:
             time_iteration = cfg.eval.time_iteration
             # saving
             save_intermediate = cfg.eval.save_intermediate
-            tier1 = cfg.exp.tier1
+            tier1 = cfg.train.tier1
 
 
         except Exception as e:
@@ -1201,13 +1203,24 @@ class SparseTupleTensor:
         # --- multi-GPU shard initialisation ---
 
         _n_gpus = getattr(cfg.train, "n_gpus", 1)
-        _subsample_frac = getattr(cfg.train, "subsample_frac", 1.0)
+        _subsample_frac = getattr(cfg.exp, "subsample_frac", 1.0)
         _subsample_warmup = getattr(cfg.train, "subsample_warmup", 0)
 
-        # Masked / completion objective: fit only observed entries (see RunConfig.train.objective).
+        # Masked / completion objective: fit only observed entries (see RunConfig.exp.objective).
         if objective not in ("full", "masked"):
-            raise ValueError(f"cfg.train.objective must be 'full' or 'masked', got {objective!r}")
+            raise ValueError(f"cfg.exp.objective must be 'full' or 'masked', got {objective!r}")
         masked = objective == "masked"
+        # SVD init computes a zero-filled HOSVD (it treats unobserved entries as 0),
+        # which is the same "full" assumption the masked objective is meant to avoid.
+        # Masked-aware SVD init is not implemented; warn that this combination is
+        # likely to hurt rather than help and that random init is the safer choice.
+        if masked and isinstance(init, str) and init.startswith("svd"):
+            print(
+                f"WARNING: init={init!r} with objective='masked' is not implemented. "
+                "SVD init fits a zero-filled HOSVD (unobserved entries treated as 0), "
+                "which contradicts the masked/completion objective and will probably "
+                "worsen results. Consider --init random."
+            )
         # Single-GPU stochastic subsampling rescales NNZ values by 1/frac, but the
         # single-GPU masked kernels don't receive `frac` to rescale their (observed-only)
         # denominators to match, which would bias the MU ratio. The multi-GPU sharded

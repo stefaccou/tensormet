@@ -37,6 +37,7 @@ def unfold_from_vectorized_sparse(
     orig_shape,
     mode: int,
     to_dense: bool = False,
+    backend: str = "cupy",
 ):
     """
     Unfold a sparse tensor that is stored as a vectorized CuPy sparse matrix.
@@ -53,6 +54,13 @@ def unfold_from_vectorized_sparse(
     to_dense : bool, default False
         If True, return a dense cupy.ndarray.
         If False, return a cupy sparse COO matrix.
+    backend : {"cupy", "scipy"}, default "cupy"
+        Sparse backend for the (non-dense) output. cupy/cuSPARSE only supports
+        32-bit indices, so a mode whose complementary dimensions multiply to more
+        than int32_max columns (e.g. the "thin" time mode of a large tensor)
+        cannot be represented on the GPU. Pass "scipy" to build a host
+        scipy.sparse.coo_matrix with int64 indices instead. Ignored when
+        ``to_dense=True``.
 
     Returns
     -------
@@ -94,10 +102,29 @@ def unfold_from_vectorized_sparse(
     # new: We now use safe ravelling
     col_unf_np = safe_ravel(other_coords, other_shape, np)
 
+    n_cols = int(math.prod(other_shape))
+    unfolded_shape = (orig_shape[mode], n_cols)
+
+    if backend == "scipy" and not to_dense:
+        # Host path: scipy supports int64 indices, so modes whose complementary
+        # dimensions exceed int32_max columns (impossible to hold on the GPU) are
+        # handled here. No GPU round-trip — data is already host-bound below.
+        import scipy.sparse as sp_sparse
+        return sp_sparse.coo_matrix(
+            (cp.asnumpy(data_cp), (row_unf_np, col_unf_np)),
+            shape=unfolded_shape,
+        )
+
+    if not to_dense and n_cols > int32_max:
+        raise ValueError(
+            f"mode-{mode} unfolding has {n_cols} columns, which exceeds cupy's "
+            f"int32 index limit ({int32_max}); use backend='scipy' for a host "
+            f"scipy.sparse matrix with int64 indices."
+        )
+
     row_unf_cp = cp.asarray(row_unf_np)
     col_unf_cp = cp.asarray(col_unf_np)
 
-    unfolded_shape = (orig_shape[mode], int(math.prod(other_shape)))
     unfolded = cpx_sparse.coo_matrix(
         (data_cp, (row_unf_cp, col_unf_cp)),
         shape=unfolded_shape,
@@ -501,14 +528,24 @@ def _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state, 
     threads_per_mode = max(1, n_threads // n_modes) if n_threads is not None else None
 
     # GPU → CPU transfer happens here, sequentially (PCIe, fast relative to SVD)
+    int32_max = np.iinfo(np.int32).max
     mode_arrays = []
     for mode in modes:
-        unfolded = unfold_from_vectorized_sparse(sparse_tensor, shape, mode, to_dense=False)
+        # backend="scipy": the thin mode's unfolding can have > int32_max columns,
+        # which cupy/cuSPARSE cannot represent (it casts indices to int32 and they
+        # wrap negative). scipy holds them with int64 indices on the host, and the
+        # SVD worker's Gram approach avoids the wide-matrix int32 overflow.
+        unfolded = unfold_from_vectorized_sparse(
+            sparse_tensor, shape, mode, to_dense=False, backend="scipy"
+        )
         coo = unfolded.tocoo()
+        # Keep int32 indices only when both dimensions fit; otherwise int64 to
+        # avoid wrapping the (wide) column indices negative.
+        idx_dtype = np.int32 if max(coo.shape) <= int32_max else np.int64
         mode_arrays.append((
-            cp.asnumpy(coo.row).astype(np.int32),
-            cp.asnumpy(coo.col).astype(np.int32),
-            cp.asnumpy(coo.data),
+            np.asarray(coo.row, dtype=idx_dtype),
+            np.asarray(coo.col, dtype=idx_dtype),
+            np.asarray(coo.data),
             unfolded.shape,
         ))
 

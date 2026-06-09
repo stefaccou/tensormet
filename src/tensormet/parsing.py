@@ -290,10 +290,16 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parsed_dict = vars(parsed)
 
 
+    # Resolve "all" sentinel for shared_factors now that order is known
+    if parsed_dict.get("shared_factors") == "all":
+        n = parsed_dict.get("order") or default_exp.order
+        parsed_dict["shared_factors"] = tuple(sorted((i, j) for i in range(n) for j in range(i + 1, n)))
+
     # Build new ExperimentConfig from defaults, overriding only provided values
     exp_kwargs = {}
     for field in ("dataset", "method", "order", "divergence", "dim", "name",
-                  "random_state", "max_cpu_frac", "data_dir", "overwrite", "tier1" ):
+                  "random_state", "epsilon", "init", "normalize_factors",
+                  "shared_factors", "subsample_frac", "objective"):
         v = parsed_dict.get(field, None)
         if v is not None:
             exp_kwargs[field] = v
@@ -305,20 +311,11 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
 
     new_exp = replace(default_exp, **exp_kwargs) if exp_kwargs else default_exp
 
-    # Resolve "all" sentinel for shared_factors now that order is known
-    if parsed_dict.get("shared_factors") == "all":
-        n = new_exp.order
-        parsed_dict["shared_factors"] = tuple(sorted((i, j) for i in range(n) for j in range(i + 1, n)))
-
     # Training overrides
     train_kwargs = {}
     train_fields = (
         "n_iter_max",
         "tol",
-        "epsilon",
-        "init",
-        "normalize_factors",
-        "shared_factors",
         "warmup_steps",
         "patience",
         "verbose",
@@ -328,9 +325,11 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "resume",
         "n_gpus",
         "gpu_id",
-        "subsample_frac",
         "subsample_warmup",
-        "objective",
+        "max_cpu_frac",
+        "tier1",
+        "overwrite",
+        "data_dir",
     )
     # argparse used dashes -> underscores mapping; check each
     for f in train_fields:
