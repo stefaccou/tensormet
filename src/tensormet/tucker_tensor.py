@@ -40,6 +40,7 @@ from tensormet.utils import (DATA_DIR,
 from tensormet.sparse_ops import initialize_nonnegative_tucker
 from tensormet.similarity import evaluate_sample, get_eval_num_threads, load_simlex, evaluate_simlex
 from tensormet.routing import get_update_routing_step, get_log_step, UpdateRouting
+from tensormet.distance import null_compute_errors
 from tensormet.stochastic_sparse import subsample_coo, make_iteration_rng
 from tensormet.sharded_sparse import (
             ShardedSparseTensor,
@@ -1143,6 +1144,7 @@ class SparseTupleTensor:
             patience = cfg.train.patience
             warmup_steps = cfg.train.warmup_steps
             largedim = cfg.train.largedim
+            objective = getattr(cfg.train, "objective", "full")
             checkpoint_saving = cfg.train.checkpoint_saving_steps
 
             rec_check_every = cfg.eval.rec_check_every
@@ -1202,10 +1204,24 @@ class SparseTupleTensor:
         _subsample_frac = getattr(cfg.train, "subsample_frac", 1.0)
         _subsample_warmup = getattr(cfg.train, "subsample_warmup", 0)
 
+        # Masked / completion objective: fit only observed entries (see RunConfig.train.objective).
+        if objective not in ("full", "masked"):
+            raise ValueError(f"cfg.train.objective must be 'full' or 'masked', got {objective!r}")
+        masked = objective == "masked"
+        # Single-GPU stochastic subsampling rescales NNZ values by 1/frac, but the
+        # single-GPU masked kernels don't receive `frac` to rescale their (observed-only)
+        # denominators to match, which would bias the MU ratio. The multi-GPU sharded
+        # path handles this rescaling internally, so masked+subsample is supported there.
+        if masked and _n_gpus == 1 and _subsample_frac < 1.0:
+            raise NotImplementedError(
+                "objective='masked' with subsample_frac < 1.0 is only supported on the "
+                "multi-GPU sharded path (n_gpus > 1). Use subsample_frac=1.0 on a single GPU."
+            )
+
         if _n_gpus > 1:
             _sst = ShardedSparseTensor.from_coo(
                 self.tensor, shape, device_ids=list(range(_n_gpus)),
-                subsample_frac=_subsample_frac,
+                subsample_frac=_subsample_frac, masked=masked,
             )
         else:
             _sst = None
@@ -1257,7 +1273,8 @@ class SparseTupleTensor:
             if time_iteration:
                 start_time = time.time()
             log_step = get_log_step(iteration, rec_log_every, rec_check_every)
-            routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step, largedim=largedim)
+            routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step,
+                                              largedim=largedim, masked=masked)
             # --- multi-GPU routing override (largedim variants only) ---
             if _sst is not None:
                 if divergence == "kl" and (_max_dim >= 4000 or largedim):
@@ -1271,8 +1288,8 @@ class SparseTupleTensor:
                     routing = UpdateRouting(
                         factor_update=make_sharded_fr_factor_update(_sst),
                         core_update=make_sharded_fr_core_update(_sst),
-                        error_fn=make_sharded_fr_compute_errors(_sst),
-                        core_returns_error=routing.core_returns_error,
+                        error_fn=make_sharded_fr_compute_errors(_sst) if log_step else null_compute_errors,
+                        core_returns_error=False,  # sharded core update never returns (core, error)
                     )
             # --- stochastic tensor selection ---
             if _sst is not None:

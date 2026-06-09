@@ -266,6 +266,10 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="Physical GPU(s) to pin, e.g. --gpu-id 0 or --gpu-id 0,1,2")
     parser.add_argument("--subsample-frac", type=float, dest="subsample_frac", default=None)
     parser.add_argument("--subsample-warmup", type=int, dest="subsample_warmup", default=None)
+    parser.add_argument("--objective", type=str, default=None,
+                        choices=["full", "masked"],
+                        help="'full' fits the zero-filled tensor (count data); "
+                             "'masked' fits only observed entries (completion/rating data).")
 
     # Eval-level args
     parser.add_argument("--rec-check-every", type=int, dest="rec_check_every", default=None)
@@ -326,6 +330,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "gpu_id",
         "subsample_frac",
         "subsample_warmup",
+        "objective",
     )
     # argparse used dashes -> underscores mapping; check each
     for f in train_fields:

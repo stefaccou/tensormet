@@ -544,6 +544,11 @@ def _accumulate_core_num_outer(Num, w, mats):
         if 0 in right_modes: right_modes.remove(0)
     if not right_modes and len(loop_modes) > 0:
         right_modes = [loop_modes.pop()]
+    # When nnz is small the budget can absorb every mode into the left block,
+    # leaving right/loop empty. The `if not loop_modes` contraction below needs a
+    # non-None KR_R, so peel the highest left mode off into the right block.
+    if not right_modes and not loop_modes and len(left_modes) > 1:
+        right_modes = [left_modes.pop()]
 
     # 2. Build Khatri-Rao matrices for Left and Right
     def build_KR(modes):
@@ -823,6 +828,7 @@ def kl_factor_update_largedim(
     epsilon=1e-12,
     batch_cols=None,
     verbose=False,
+    masked=False,
 ):
     """
     KL multiplicative update for Tucker factor A^(mode) WITHOUT building dense Z,
@@ -833,6 +839,12 @@ def kl_factor_update_largedim(
     where W_ij = X_ij / (A Z)_ij at the nonzeros of X_(mode).
 
     Works for N-way tensors (N = len(shape) = core.ndim).
+
+    masked : bool
+        If False (default), the denominator sums Z over ALL unfolding columns
+        (the zero-filled / full-tensor objective). If True, only OBSERVED columns
+        contribute: den[i, r] = sum_{j in Omega_i} Z[r, j]. This is the weighted/
+        completion objective (treat unobserved entries as missing, not zero).
     """
 
     # Sparse unfolding X_(mode)
@@ -863,9 +875,15 @@ def kl_factor_update_largedim(
 
     A = factors[mode]  # (I_mode, R_mode)
 
-    # Exact denominator over ALL columns (no approximation)
-    den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon)
-    denominator = den_row[None, :]  # (1, R_mode)
+    if masked:
+        # Masked objective: denominator is accumulated over observed columns only
+        # (see batch loop below), so no full-column den_row is needed.
+        denominator = None
+        denominator_acc = cp.zeros_like(A)
+    else:
+        # Exact denominator over ALL columns (no approximation)
+        den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon)
+        denominator = den_row[None, :]  # (1, R_mode)
 
     # Accumulate numerator = W @ Z.T without building full Z
     numerator = cp.zeros_like(A)
@@ -915,11 +933,24 @@ def kl_factor_update_largedim(
 
         # numerator[row] += W * Z  — cuSPARSE SpMM (no serialised atomics)
         nnz_b = int(r_i.size)
+        col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
+        row_idx_b = r_i.astype(cp.int32)
         S_b = cpx_sparse.csr_matrix(
-            (W_data, (r_i.astype(cp.int32), cp.arange(nnz_b, dtype=cp.int32))),
+            (W_data, (row_idx_b, col_idx_b)),
             shape=(numerator.shape[0], nnz_b),
         )
         numerator += S_b @ Z_rows
+
+        if masked:
+            # denominator[i, r] += sum_{k: row=i} Z_rows[k, r]  (weight 1 per observed entry)
+            S_one = cpx_sparse.csr_matrix(
+                (cp.ones(nnz_b, dtype=Z_rows.dtype), (row_idx_b, col_idx_b)),
+                shape=(numerator.shape[0], nnz_b),
+            )
+            denominator_acc += S_one @ Z_rows
+
+    if masked:
+        denominator = denominator_acc
 
     # Multiplicative KL update (matching your dense version structure)
     A_new = A * (numerator / (denominator + 1e-12))
@@ -940,6 +971,7 @@ def kl_core_update_largedim(
     batch_rhat=None, # tested, quite efficient up to 8K dims
     batch_num=None, # tested, quite efficient up to 8K dims
     verbose=False,
+    masked=False,
 ):
     if verbose:
         print("  Updating core...")
@@ -960,8 +992,13 @@ def kl_core_update_largedim(
         return core
     idxs = _unravel_flat_indices_C(flat, shape)  # list length N, each (nnz,)
 
-    # Denominator is outer product of column sums, but don't materialize F.
-    sums = [cp.clip(cp.sum(factors[n], axis=0), a_min=epsilon, a_max=None) for n in range(N)]
+    # Full objective: denominator is the outer product of factor column sums
+    # (= sum over ALL tensor entries). Masked objective: denominator is summed
+    # over OBSERVED entries only, accumulated alongside the numerator below.
+    if masked:
+        Den = cp.zeros_like(core)
+    else:
+        sums = [cp.clip(cp.sum(factors[n], axis=0), a_min=epsilon, a_max=None) for n in range(N)]
     Num = cp.zeros_like(core)
 
     # --- Pass 1: compute w = x / r_hat in big batches, stash w (or stream into pass 2)
@@ -988,6 +1025,15 @@ def kl_core_update_largedim(
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]
         w = w_all[start:end]
         _accumulate_core_num_outer(Num, w, mats)
+        if masked:
+            # Den += sum_{k in batch} outer(factor rows)  (weight 1 per observed entry)
+            _accumulate_core_num_outer(Den, cp.ones(end - start, dtype=core.dtype), mats)
+
+    if masked:
+        # --- MU update (masked): core *= Num / Den, both over observed entries
+        core_new = core * (Num / (Den + epsilon))
+        core_new = cp.clip(core_new, a_min=epsilon, a_max=None)
+        return core_new
 
     # --- MU update: core *= Num / (outer product of sums)
     core_new = core * (Num + epsilon)  # keep >0
@@ -1012,6 +1058,7 @@ def kl_compute_errors_largedim(
     epsilon=1e-12,
     batch_rhat=None, # tested up to 8K
     verbose=False,
+    masked=False,
 ):
     """
     Relative generalized KL divergence C_KL(X || R) for sparse X,
@@ -1020,6 +1067,11 @@ def kl_compute_errors_largedim(
     Computes:
       KL = sum_{nz} [x log(x/r) - x + r] + (sum_R - sum_{nz} r)
       rel_KL = KL / sum_{nz} x
+
+    masked : bool
+        If True, the divergence is evaluated over observed (nonzero) entries
+        only; the zero-entry contribution (sum_R - sum_{nz} r) is dropped, so
+        the metric is consistent with the masked/completion objective.
     """
     if verbose:
         print("  Computing KL errors...")
@@ -1058,12 +1110,15 @@ def kl_compute_errors_largedim(
     term_pos = x_nz * cp.log(x_nz / r_nz) - x_nz + r_nz
     kl_pos = cp.sum(term_pos)
 
-    # --- zero contribution: sum_R - sum_{nz} r_nz ---
-    sum_R = _tucker_sum_all_entries(core, factors, epsilon=epsilon)
-    sum_R_nz = cp.sum(r_nz)
-    kl_zero = sum_R - sum_R_nz
-
-    kl_total = kl_pos + kl_zero
+    if masked:
+        # Masked/completion objective: only observed entries contribute.
+        kl_total = kl_pos
+    else:
+        # --- zero contribution: sum_R - sum_{nz} r_nz ---
+        sum_R = _tucker_sum_all_entries(core, factors, epsilon=epsilon)
+        sum_R_nz = cp.sum(r_nz)
+        kl_zero = sum_R - sum_R_nz
+        kl_total = kl_pos + kl_zero
 
     sum_X = cp.sum(x_nz)
     rel_kl = kl_total / cp.maximum(sum_X, epsilon)
@@ -1080,6 +1135,7 @@ def fr_factor_update_largedim(
     thread_budget=None, # kept for API compatibility; unused
     batch_cols=None,
     verbose=False,
+    masked=False,
 ):
     """
     Frobenius (Euclidean) multiplicative update for Tucker factor A^(mode)
@@ -1090,6 +1146,12 @@ def fr_factor_update_largedim(
         A <- A * numerator / denominator
 
     where X is the sparse unfolding and Z = transpose(unfold(tucker_to_tensor(skip_factor=mode), mode)).
+
+    masked : bool
+        If False (default), the denominator A @ (Z^T Z) sums over ALL unfolding
+        columns (zero-filled objective). If True, the denominator is restricted
+        to observed entries: den[i, r] = sum_{j in Omega_i} Xhat[i, j] Z[r, j],
+        accumulated per batch. This is the weighted/completion objective.
     """
     # Sparse unfolding X_(mode)
     # X = unfold_from_vectorized_sparse(vec_tensor, shape, mode).tocoo()
@@ -1116,10 +1178,15 @@ def fr_factor_update_largedim(
 
     A = factors[mode]  # (I_mode, R_mode)
 
-    # ---- Denominator part: Gram = Z^T Z exactly, no Z materialization
-    Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon)  # (R, R)
-    denominator = A @ Gram
-    denominator = cp.clip(denominator, a_min=epsilon, a_max=None)
+    if masked:
+        # Masked objective: denominator is accumulated over observed entries only
+        # (see batch loop below).
+        denominator_acc = cp.zeros_like(A)
+    else:
+        # ---- Denominator part: Gram = Z^T Z exactly, no Z materialization
+        Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon)  # (R, R)
+        denominator = A @ Gram
+        denominator = cp.clip(denominator, a_min=epsilon, a_max=None)
 
     # ---- Numerator part: numerator = X @ Z via batching unique columns, no full Z
     numerator = cp.zeros_like(A)
@@ -1159,11 +1226,25 @@ def fr_factor_update_largedim(
 
         # numerator[row] += X_ij * Z[j,:]  — cuSPARSE SpMM (no serialised atomics)
         nnz_b = int(r_i.size)
+        col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
+        row_idx_b = r_i.astype(cp.int32)
         S_b = cpx_sparse.csr_matrix(
-            (v_i, (r_i.astype(cp.int32), cp.arange(nnz_b, dtype=cp.int32))),
+            (v_i, (row_idx_b, col_idx_b)),
             shape=(numerator.shape[0], nnz_b),
         )
         numerator += S_b @ Z_rows
+
+        if masked:
+            # Xhat at these observed entries = <A[row], Z[col]>
+            xhat_b = cp.sum(A[r_i] * Z_rows, axis=1)  # (nnz_b,)
+            S_den = cpx_sparse.csr_matrix(
+                (xhat_b, (row_idx_b, col_idx_b)),
+                shape=(numerator.shape[0], nnz_b),
+            )
+            denominator_acc += S_den @ Z_rows
+
+    if masked:
+        denominator = cp.clip(denominator_acc, a_min=epsilon, a_max=None)
 
     # MU update
     A_new = A * (numerator / (denominator + 1e-12))
@@ -1181,6 +1262,7 @@ def fr_core_update_largedim(
     epsilon=1e-12,
     batch_num=None,
     verbose=False,
+    masked=False,
 ):
     """
     Frobenius (Euclidean) multiplicative update for the Tucker core WITHOUT dense recon.
@@ -1191,6 +1273,12 @@ def fr_core_update_largedim(
         core *= numerator / denominator
 
     but numerator is accumulated by streaming NNZ and building only core-sized tensors.
+
+    masked : bool
+        If False (default), the denominator core ×_n (A_n^T A_n) sums over ALL
+        entries. If True, the denominator is restricted to observed entries:
+        Den = sum_{k in Omega} Xhat_k * outer(factor rows), accumulated alongside
+        the numerator. This is the weighted/completion objective.
     """
     if verbose:
         print("  Updating core...")
@@ -1215,6 +1303,7 @@ def fr_core_update_largedim(
 
     # --- numerator: core-shaped accumulator, streamed over NNZ ---
     Num = cp.zeros_like(core)
+    Den = cp.zeros_like(core) if masked else None
     # small batches keep peak memory down (like your pass-2 accumulator)
     num_batches = range(0, nnz, int(batch_num))
     if verbose:
@@ -1224,12 +1313,17 @@ def fr_core_update_largedim(
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]  # each (b, Rn)
         w = xvals[start:end]  # Frobenius numerator uses X directly (no X/R like KL)
         _accumulate_core_num_outer(Num, w, mats)
+        if masked:
+            # Xhat at observed entries, then accumulate the X̂-weighted outer products.
+            xhat_b = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon)  # (b,)
+            _accumulate_core_num_outer(Den, xhat_b, mats)
 
     Num = cp.clip(Num, a_min=epsilon, a_max=None)
 
-    # --- denominator: rank-space multilinear product with Gram matrices ---
-    grams = [factors[n].T @ factors[n] for n in range(N)]  # each (R_n, R_n)
-    Den = _core_multilinear_grams(core, grams, epsilon=epsilon)  # core-shaped
+    if not masked:
+        # --- denominator: rank-space multilinear product with Gram matrices ---
+        grams = [factors[n].T @ factors[n] for n in range(N)]  # each (R_n, R_n)
+        Den = _core_multilinear_grams(core, grams, epsilon=epsilon)  # core-shaped
 
     # --- MU update ---
     core_new = core * (Num / (Den + epsilon))
@@ -1245,6 +1339,7 @@ def fr_combined_core_errors_largedim(
     epsilon=1e-12,
     batch_num=None,
     verbose=False,
+    masked=False,
 ):
     """FR core update + Frobenius error in one pass, sharing Gram matrices.
 
@@ -1252,6 +1347,11 @@ def fr_combined_core_errors_largedim(
     ``fr_compute_errors_largedim`` back-to-back, but computes
     ``grams = [A_n^T A_n]`` and ``Den`` only once instead of twice.
     Mirrors ``fr_combined_core_errors`` for the small-dim path.
+
+    masked : bool
+        If True, the core denominator and the reported error are restricted to
+        observed entries (weighted/completion objective): the error is the
+        relative RMSE over observed entries, sqrt(sum_Omega (x - xhat)^2) / ||X||.
 
     Returns
     -------
@@ -1278,15 +1378,33 @@ def fr_combined_core_errors_largedim(
     idxs = _unravel_flat_indices_C(flat, shape)
 
     Num = cp.zeros_like(core)
+    Den_masked = cp.zeros_like(core) if masked else None
+    # Masked error accumulators (observed-only residual).
+    residual_sq = cp.asarray(0.0, dtype=core.dtype)
+    norm_X_sq = cp.asarray(0.0, dtype=core.dtype)
     num_batches = range(0, nnz, int(batch_num))
     if verbose:
         num_batches = tqdm(num_batches, desc="  Core numerator pass", unit="batch", leave=False)
     for start in num_batches:
         end = min(start + int(batch_num), nnz)
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]
-        _accumulate_core_num_outer(Num, xvals[start:end], mats)
+        x_b = xvals[start:end]
+        _accumulate_core_num_outer(Num, x_b, mats)
+        if masked:
+            xhat_b = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon)  # (b,)
+            _accumulate_core_num_outer(Den_masked, xhat_b, mats)
+            x_b_nn = cp.clip(x_b.astype(core.dtype), a_min=0.0, a_max=None)
+            residual_sq += cp.sum((x_b_nn - xhat_b) ** 2)
+            norm_X_sq += cp.sum(x_b_nn * x_b_nn)
 
     Num = cp.clip(Num, a_min=epsilon, a_max=None)
+
+    if masked:
+        # Masked objective: denominator and error restricted to observed entries.
+        core_new = core * (Num / (Den_masked + epsilon))
+        residual_sq = cp.maximum(residual_sq, 0.0)
+        rel_err = cp.sqrt(residual_sq) / cp.maximum(cp.sqrt(cp.maximum(norm_X_sq, epsilon)), epsilon)
+        return core_new, rel_err
 
     # Compute Gram matrices once; reuse for both the MU denominator and ||X̂||^2.
     grams = [factors[n].T @ factors[n] for n in range(N)]
@@ -1318,6 +1436,7 @@ def fr_compute_errors_largedim(
     epsilon=1e-12,
     batch_rhat=1000,        # same role as in KL error
     verbose=False,
+    masked=False,
 ):
     """
     Relative Frobenius error ||X - X̂||_F / ||X||_F for sparse X,
@@ -1329,6 +1448,11 @@ def fr_compute_errors_largedim(
       - ||X||_F^2 = sum_{nz} x^2
       - <X, X̂>   = sum_{nz} x * x̂  where x̂ computed at nz by Tucker contraction
       - ||X̂||_F^2 = <core, core ×_n (A_n^T A_n)> (exact, no dense X̂)
+
+    masked : bool
+        If True, compute the relative RMSE over observed entries only,
+        sqrt(sum_Omega (x - x̂)^2) / ||X||, ignoring the implicit-zero
+        contribution (weighted/completion objective).
     """
     if verbose:
         print("  Computing Frobenius errors...")
@@ -1363,6 +1487,7 @@ def fr_compute_errors_largedim(
 
     # --- compute xhat_nz in batches (same technique as KL error) ---
     inner_prod = cp.asarray(0.0, dtype=core.dtype)
+    masked_residual_sq = cp.asarray(0.0, dtype=core.dtype)
 
     rhat_batches = range(0, nnz, int(batch_rhat))
     if verbose:
@@ -1371,8 +1496,17 @@ def fr_compute_errors_largedim(
         end = min(start + int(batch_rhat), nnz)
         mats = [factors[n][idxs[n][start:end]] for n in range(N)]  # (b, Rn)
         xhat_b = _rhat_from_factor_rows_sequential(core, mats, epsilon=epsilon)  # (b,)
-        # <X, X̂> batch contribution
-        inner_prod += cp.sum(x_nz[start:end] * xhat_b)
+        if masked:
+            # observed-only residual sum of squares
+            masked_residual_sq += cp.sum((x_nz[start:end] - xhat_b) ** 2)
+        else:
+            # <X, X̂> batch contribution
+            inner_prod += cp.sum(x_nz[start:end] * xhat_b)
+
+    if masked:
+        # Masked/completion objective: relative RMSE over observed entries only.
+        residual_norm = cp.sqrt(cp.maximum(masked_residual_sq, 0.0))
+        return residual_norm / cp.maximum(norm_X, epsilon)
 
     # --- ||X̂||_F^2 exactly (no dense X̂, no mode_dot) ---
     grams = [factors[n].T @ factors[n] for n in range(N)]  # (R_n, R_n)
@@ -1398,6 +1532,7 @@ def fr_factor_update_largedim_tier1(
     thread_budget=None,
     batch_cols=None,
     verbose=False,
+    masked=False,
 ):
     if verbose:
         print(f"  Updating factor {mode}...")
@@ -1418,9 +1553,10 @@ def fr_factor_update_largedim_tier1(
     A = factors[mode]
     I_mode, R = int(A.shape[0]), int(A.shape[1])
 
-    # Denominator: exact Gram — unchanged
-    Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon)
-    denominator = cp.clip(A @ Gram, a_min=epsilon, a_max=None)
+    if not masked:
+        # Denominator: exact Gram — full / zero-filled objective
+        Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon)
+        denominator = cp.clip(A @ Gram, a_min=epsilon, a_max=None)
 
     # Deduplicate columns for efficient Z computation
     ucols, inv = cp.unique(cols, return_inverse=True)
@@ -1448,11 +1584,21 @@ def fr_factor_update_largedim_tier1(
     # Build sparse S: shape (I_mode, nnz), S[row_k, k] = val_k
     # Then numerator = S @ Z_nz via cuSPARSE SpMM — replaces cp.add.at
     k_idx = cp.arange(nnz, dtype=cp.int32)
+    row_idx = rows.astype(cp.int32)
     S = cpx_sparse.csr_matrix(
-        (vals, (rows.astype(cp.int32), k_idx)),
+        (vals, (row_idx, k_idx)),
         shape=(I_mode, nnz),
     )
     numerator = cp.clip(S @ Z_nz, a_min=epsilon, a_max=None)
+
+    if masked:
+        # Masked denominator: den[i, r] = sum_{k: row=i} Xhat_k * Z_nz[k, r]
+        xhat = cp.sum(A[rows] * Z_nz, axis=1)  # (nnz,)
+        S_den = cpx_sparse.csr_matrix(
+            (xhat, (row_idx, k_idx)),
+            shape=(I_mode, nnz),
+        )
+        denominator = cp.clip(S_den @ Z_nz, a_min=epsilon, a_max=None)
 
     A_new = cp.clip(A * (numerator / (denominator + 1e-12)), a_min=epsilon, a_max=None)
     return A_new
@@ -1468,6 +1614,7 @@ def kl_factor_update_largedim_tier1(
     epsilon=1e-12,
     batch_cols=None,
     verbose=False,
+    masked=False,
 ):
     if verbose:
         print(f"  Updating factor {mode}...")
@@ -1488,9 +1635,10 @@ def kl_factor_update_largedim_tier1(
     A = factors[mode]
     I_mode, R = int(A.shape[0]), int(A.shape[1])
 
-    # Exact denominator (no approximation)
-    den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon)
-    denominator = den_row[None, :]  # (1, R)
+    if not masked:
+        # Exact denominator over ALL columns (full / zero-filled objective)
+        den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon)
+        denominator = den_row[None, :]  # (1, R)
 
     ucols, inv = cp.unique(cols, return_inverse=True)
     n_ucols = int(ucols.size)
@@ -1520,11 +1668,20 @@ def kl_factor_update_largedim_tier1(
 
     # SpMM: numerator = S_W @ Z_nz  where S_W[row_k, k] = w_k
     k_idx = cp.arange(nnz, dtype=cp.int32)
+    row_idx = rows.astype(cp.int32)
     S_W = cpx_sparse.csr_matrix(
-        (w, (rows.astype(cp.int32), k_idx)),
+        (w, (row_idx, k_idx)),
         shape=(I_mode, nnz),
     )
     numerator = cp.clip(S_W @ Z_nz, a_min=epsilon, a_max=None)
+
+    if masked:
+        # Masked denominator: den[i, r] = sum_{k: row=i} Z_nz[k, r]  (weight 1 per observed entry)
+        S_one = cpx_sparse.csr_matrix(
+            (cp.ones(nnz, dtype=Z_nz.dtype), (row_idx, k_idx)),
+            shape=(I_mode, nnz),
+        )
+        denominator = S_one @ Z_nz
 
     A_new = cp.clip(A * (numerator / (denominator + 1e-12)), a_min=epsilon, a_max=None)
     return A_new

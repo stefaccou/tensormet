@@ -90,6 +90,13 @@ class TrainingConfig:
     gpu_id: Optional[Union[int, Tuple[int, ...]]] = None  # one int or tuple of ints to pin; None = auto-select
     subsample_frac: float = 1.0    # fraction of NNZ per update; 1.0 = exact
     subsample_warmup: int = 0      # iterations using full NNZ before stochastic mode begins
+    # Optimisation objective:
+    #   "full"   -> fit the entire (zero-filled) tensor; correct/possible for count/co-occurrence
+    #               tensors where an unobserved entry genuinely means 0.
+    #   "masked" -> fit ONLY observed (nonzero) entries; treat the rest as missing
+    #               (weighted/completion objective). Correct for recommendation/generalisation
+    #               data (e.g. Netflix) where "unobserved" != "rated 0".
+    objective: str = "full"
 
 @dataclass(frozen=True)
 class EvalConfig:

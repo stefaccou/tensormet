@@ -158,7 +158,8 @@ def _partial_numerator_for_shard(
     device_id: int,
     subsample_frac: float = 1.0,
     rng_seed: Optional[int] = None,
-) -> np.ndarray:
+    masked: bool = False,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Compute the partial factor-numerator contribution from a single NNZ shard.
 
@@ -170,9 +171,14 @@ def _partial_numerator_for_shard(
     already resident on ``device_id``.  ``cp.asarray`` is a no-op in the
     latter case, so no CPU round-trip occurs for the primary shard.
 
+    When ``masked`` is True, the (observed-only) denominator is also accumulated
+    on this shard and returned, since for the masked/completion objective the
+    denominator depends on the NNZ pattern and cannot be computed analytically.
+
     Returns
     -------
-    partial_num : np.ndarray of shape ``(I_mode, R_mode)``
+    (partial_num, partial_den) : np.ndarray of shape ``(I_mode, R_mode)`` each.
+        ``partial_den`` is ``None`` when ``masked`` is False.
     """
     # .use() permanently activates the device for this thread; avoids the
     # cuCtxPushCurrent/Pop cycle of the context manager, which leaves the
@@ -185,10 +191,17 @@ def _partial_numerator_for_shard(
     flat, vals = _blocked_coo_to_flat_indices(shard, shape)
 
     if flat.size == 0:
-        return cp.asnumpy(cp.zeros_like(A_d))
+        zero = cp.asnumpy(cp.zeros_like(A_d))
+        return zero, (zero.copy() if masked else None)
 
     if subsample_frac < 1.0:
         flat, vals = _apply_subsample(flat, vals, subsample_frac, rng_seed)
+
+    # Under subsampling the numerator's `vals` are already rescaled by 1/frac
+    # (see _apply_subsample). The masked denominator weights (unit / x̂) must be
+    # rescaled identically so the MU ratio stays unbiased; the factor cancels in
+    # the ratio but only if both sides carry it.
+    den_scale = (1.0 / subsample_frac) if subsample_frac < 1.0 else 1.0
 
     idxs = _unravel_flat_indices_C(flat, shape)
     rows = idxs[mode]
@@ -199,6 +212,7 @@ def _partial_numerator_for_shard(
     cols = safe_ravel(tuple(other_coords), other_shape, cp)
 
     numerator = cp.zeros_like(A_d)
+    denominator = cp.zeros_like(A_d) if masked else None
     ucols, inv = cp.unique(cols, return_inverse=True)
     n_ucols = int(ucols.size)
 
@@ -240,14 +254,30 @@ def _partial_numerator_for_shard(
 
         # numerator[row] += w * Z  — cuSPARSE SpMM (no serialised atomics)
         nnz_b = int(r_i.size)
+        col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
+        row_idx_b = r_i.astype(cp.int32)
         S_b = cpx_sparse.csr_matrix(
-            (w, (r_i.astype(cp.int32), cp.arange(nnz_b, dtype=cp.int32))),
+            (w, (row_idx_b, col_idx_b)),
             shape=(numerator.shape[0], nnz_b),
         )
         numerator += S_b @ Z_rows
 
+        if masked:
+            # Observed-only denominator weight:
+            #   KL -> 1 (sum of Z over observed columns)
+            #   FR -> Xhat at the observed entry = <A[row], Z[col]>
+            if divergence == "kl":
+                den_w = cp.full(nnz_b, den_scale, dtype=Z_rows.dtype)
+            else:  # "fr"
+                den_w = cp.sum(A_d[r_i] * Z_rows, axis=1) * den_scale
+            S_den = cpx_sparse.csr_matrix(
+                (den_w, (row_idx_b, col_idx_b)),
+                shape=(numerator.shape[0], nnz_b),
+            )
+            denominator += S_den @ Z_rows
+
     cp.cuda.Device(device_id).synchronize()
-    return cp.asnumpy(numerator)
+    return cp.asnumpy(numerator), (cp.asnumpy(denominator) if masked else None)
 
 
 def _sharded_factor_update(
@@ -264,13 +294,15 @@ def _sharded_factor_update(
     subsample_frac: float = 1.0,
     iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    masked: bool = False,
 ) -> cp.ndarray:
     """
     Orchestrate multi-GPU factor numerator computation and reduce on CPU.
 
-    Denominator is computed once on the primary device (no NNZ access).
-    Partial numerators are dispatched in parallel threads, summed on CPU,
-    then the MU update is applied on the primary device.
+    Full objective: the denominator is computed once on the primary device
+    (no NNZ access). Masked/completion objective: the denominator depends on
+    the observed entries, so each shard returns a partial denominator that is
+    reduced on CPU alongside the partial numerators.
     """
     primary = device_ids[0]
 
@@ -285,18 +317,20 @@ def _sharded_factor_update(
         factors_buf = factors
     A_primary = factors[mode]
 
-    # Denominator — analytical, no NNZ
-    with cp.cuda.Device(primary):
-        if divergence == "kl":
-            den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon)
-            denominator = den_row[None, :]
-        else:
-            Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon)
-            denominator = A_primary @ Gram
-            denominator = cp.clip(denominator, a_min=epsilon, a_max=None)
+    # Denominator — analytical (full objective only); masked accumulates per-shard.
+    denominator = None
+    if not masked:
+        with cp.cuda.Device(primary):
+            if divergence == "kl":
+                den_row = _tucker_den_row_full(core, factors, mode, epsilon=epsilon)
+                denominator = den_row[None, :]
+            else:
+                Gram = _tucker_gram_ZtZ(core, factors, mode, epsilon=epsilon)
+                denominator = A_primary @ Gram
+                denominator = cp.clip(denominator, a_min=epsilon, a_max=None)
 
-    # Parallel partial numerators
-    partial_nums: List[Optional[np.ndarray]] = [None] * len(device_ids)
+    # Parallel partial numerators (+ denominators when masked)
+    partials: List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]] = [None] * len(device_ids)
     _own_pool = pool is None
     _pool = ThreadPoolExecutor(max_workers=len(device_ids)) if _own_pool else pool
     try:
@@ -314,21 +348,25 @@ def _sharded_factor_update(
                 device_id=device_ids[k],
                 subsample_frac=subsample_frac,
                 rng_seed=(None if iter_seed is None else iter_seed + k),
+                masked=masked,
             ): k
             for k in range(len(device_ids))
         }
         for fut in as_completed(futures):
-            partial_nums[futures[fut]] = fut.result()
+            partials[futures[fut]] = fut.result()
     finally:
         if _own_pool:
             _pool.shutdown(wait=True)
 
     # CPU reduce + MU update
-    numerator_np = np.add.reduce(partial_nums)
+    numerator_np = np.add.reduce([p[0] for p in partials])
 
     with cp.cuda.Device(primary):
         numerator = cp.asarray(numerator_np)
         numerator = cp.clip(numerator, a_min=epsilon, a_max=None)
+        if masked:
+            denominator_np = np.add.reduce([p[1] for p in partials])
+            denominator = cp.clip(cp.asarray(denominator_np), a_min=epsilon, a_max=None)
         A_new = A_primary * (numerator / (denominator + epsilon))
         A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
 
@@ -351,7 +389,8 @@ def _partial_core_num_for_shard(
     device_id: int,
     subsample_frac: float = 1.0,
     rng_seed: Optional[int] = None,
-) -> np.ndarray:
+    masked: bool = False,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Compute the partial core-numerator contribution from a single NNZ shard.
 
@@ -365,9 +404,15 @@ def _partial_core_num_for_shard(
     already resident on ``device_id``.  ``cp.asarray`` is a no-op in the
     latter case, so no CPU round-trip occurs for the primary shard.
 
+    When ``masked`` is True the (observed-only) denominator accumulator is also
+    returned: KL uses unit weights (sum of outer products over observed entries)
+    and FR uses ``x̂`` weights, since the masked-objective denominator cannot be
+    computed analytically.
+
     Returns
     -------
-    partial_num : np.ndarray of shape ``core.shape``
+    (partial_num, partial_den) : np.ndarray of shape ``core.shape`` each.
+        ``partial_den`` is ``None`` when ``masked`` is False.
     """
     cp.cuda.Device(device_id).use()
     core_d = cp.asarray(core_np)
@@ -378,14 +423,20 @@ def _partial_core_num_for_shard(
     nnz = int(flat.size)
 
     if nnz == 0:
-        return cp.asnumpy(cp.zeros_like(core_d))
+        zero = cp.asnumpy(cp.zeros_like(core_d))
+        return zero, (zero.copy() if masked else None)
 
     if subsample_frac < 1.0:
         flat, xvals = _apply_subsample(flat, xvals, subsample_frac, rng_seed)
         nnz = int(flat.size)
 
+    # Rescale the masked denominator weights to match the 1/frac rescaling that
+    # _apply_subsample applied to xvals (the numerator), so the MU ratio is unbiased.
+    den_scale = (1.0 / subsample_frac) if subsample_frac < 1.0 else 1.0
+
     idxs = _unravel_flat_indices_C(flat, shape)
     Num = cp.zeros_like(core_d)
+    Den = cp.zeros_like(core_d) if masked else None
 
     # Estimate AFTER NNZ bookkeeping is live so the free-memory snapshot is accurate.
     if batch_rhat is None:
@@ -406,14 +457,21 @@ def _partial_core_num_for_shard(
             end = min(start + batch_num, nnz)
             mats = [factors_d[n][idxs[n][start:end]] for n in range(N)]
             _accumulate_core_num_outer(Num, w_all[start:end], mats)
+            if masked:
+                # KL masked denominator: unit-weighted outer products over observed entries.
+                _accumulate_core_num_outer(Den, cp.full(end - start, den_scale, dtype=core_d.dtype), mats)
     else:  # "fr" — single pass
         for start in range(0, nnz, batch_num):
             end = min(start + batch_num, nnz)
             mats = [factors_d[n][idxs[n][start:end]] for n in range(N)]
             _accumulate_core_num_outer(Num, xvals[start:end], mats)
+            if masked:
+                # FR masked denominator: x̂-weighted outer products over observed entries.
+                xhat_b = _rhat_from_factor_rows_sequential(core_d, mats, epsilon=epsilon)
+                _accumulate_core_num_outer(Den, xhat_b * den_scale, mats)
 
     cp.cuda.Device(device_id).synchronize()
-    return cp.asnumpy(Num)
+    return cp.asnumpy(Num), (cp.asnumpy(Den) if masked else None)
 
 
 def _sharded_core_update(
@@ -430,13 +488,15 @@ def _sharded_core_update(
     subsample_frac: float = 1.0,
     iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    masked: bool = False,
 ) -> cp.ndarray:
     """
     Orchestrate multi-GPU core numerator computation and reduce on CPU.
 
-    Denominator (KL: column-sum outer product; FR: Gram contractions) is
-    computed once on the primary device.  Partial ``Num`` arrays are summed
-    on CPU, then the MU update is applied on the primary device.
+    Full objective: the denominator (KL: column-sum outer product; FR: Gram
+    contractions) is computed once on the primary device. Masked/completion
+    objective: each shard returns a partial denominator (observed-only) that is
+    reduced on CPU alongside the partial numerators.
     """
     primary = device_ids[0]
     N = len(shape)
@@ -450,7 +510,7 @@ def _sharded_core_update(
         core_buf = core
         factors_buf = factors
 
-    partial_nums: List[Optional[np.ndarray]] = [None] * len(device_ids)
+    partials: List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]] = [None] * len(device_ids)
     _own_pool = pool is None
     _pool = ThreadPoolExecutor(max_workers=len(device_ids)) if _own_pool else pool
     try:
@@ -468,21 +528,30 @@ def _sharded_core_update(
                 device_id=device_ids[k],
                 subsample_frac=subsample_frac,
                 rng_seed=(None if iter_seed is None else iter_seed + k),
+                masked=masked,
             ): k
             for k in range(len(device_ids))
         }
         for fut in as_completed(futures):
-            partial_nums[futures[fut]] = fut.result()
+            partials[futures[fut]] = fut.result()
     finally:
         if _own_pool:
             _pool.shutdown(wait=True)
 
-    Num_np = np.add.reduce(partial_nums)
+    Num_np = np.add.reduce([p[0] for p in partials])
 
     with cp.cuda.Device(primary):
         Num = cp.asarray(Num_np)
 
-        if divergence == "kl":
+        if masked:
+            # Masked objective: denominator is the reduced observed-only accumulator
+            # (Num/Den both summed over observed entries), for both KL and FR.
+            Den_np = np.add.reduce([p[1] for p in partials])
+            Num = cp.clip(Num, a_min=epsilon, a_max=None)
+            Den = cp.asarray(Den_np)
+            core_new = core * (Num / (Den + epsilon))
+            core_new = cp.clip(core_new, a_min=epsilon, a_max=None)
+        elif divergence == "kl":
             sums = [
                 cp.clip(cp.sum(factors[n], axis=0), a_min=epsilon, a_max=None)
                 for n in range(N)
@@ -572,10 +641,14 @@ def _sharded_kl_error(
     subsample_frac: float = 1.0,
     iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    masked: bool = False,
 ) -> cp.ndarray:
     """
     Compute relative KL error with sharded NNZ; returns a scalar CuPy array
     on the primary device matching the return type of ``kl_compute_errors_largedim``.
+
+    When ``masked`` is True the zero-entry contribution (sum_R - sum_R_nz) is
+    dropped, so the metric reflects the observed-only / completion objective.
     """
     primary = device_ids[0]
     core_np = cp.asnumpy(core)
@@ -610,11 +683,14 @@ def _sharded_kl_error(
     sum_R_nz_total = sum(r[1] for r in results)
     sum_X_total = sum(r[2] for r in results)
 
-    with cp.cuda.Device(primary):
-        sum_R = float(_tucker_sum_all_entries(core, factors, epsilon=epsilon).get())
-
-    kl_zero = sum_R - sum_R_nz_total
-    kl_total = kl_pos_total + kl_zero
+    if masked:
+        # Observed-only objective: drop the implicit-zero contribution.
+        kl_total = kl_pos_total
+    else:
+        with cp.cuda.Device(primary):
+            sum_R = float(_tucker_sum_all_entries(core, factors, epsilon=epsilon).get())
+        kl_zero = sum_R - sum_R_nz_total
+        kl_total = kl_pos_total + kl_zero
     rel_kl = kl_total / max(sum_X_total, float(epsilon))
 
     with cp.cuda.Device(primary):
@@ -631,13 +707,16 @@ def _partial_fr_error_for_shard(
     device_id: int,
     subsample_frac: float = 1.0,
     rng_seed: Optional[int] = None,
-) -> Tuple[float, float]:
+    masked: bool = False,
+) -> Tuple[float, float, float]:
     """
     Compute partial Frobenius error scalars from a single NNZ shard.
 
     Returns
     -------
-    (norm_X_sq, inner_prod) from this shard's NNZ contribution.
+    (norm_X_sq, inner_prod, residual_sq) from this shard's NNZ contribution.
+    ``inner_prod`` is 0 when ``masked`` (the full ‖X̂‖² term is not used);
+    ``residual_sq`` (= sum (x - x̂)²) is 0 when not ``masked``.
     """
     cp.cuda.Device(device_id).use()
     core_d = cp.asarray(core_np)
@@ -651,7 +730,7 @@ def _partial_fr_error_for_shard(
     nnz = int(flat.size)
 
     if nnz == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     if subsample_frac < 1.0:
         flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, rng_seed)
@@ -663,15 +742,20 @@ def _partial_fr_error_for_shard(
     norm_X_sq = float(cp.sum(x_nz * x_nz).get())
 
     inner_prod_d = cp.asarray(0.0, dtype=core_d.dtype)
+    residual_sq_d = cp.asarray(0.0, dtype=core_d.dtype)
     for start in range(0, nnz, batch_rhat):
         end = min(start + batch_rhat, nnz)
         mats = [factors_d[n][idxs[n][start:end]] for n in range(N)]
         xhat_b = _rhat_from_factor_rows_sequential(core_d, mats, epsilon=epsilon)
-        inner_prod_d += cp.sum(x_nz[start:end] * xhat_b)
+        if masked:
+            residual_sq_d += cp.sum((x_nz[start:end] - xhat_b) ** 2)
+        else:
+            inner_prod_d += cp.sum(x_nz[start:end] * xhat_b)
 
     inner_prod = float(inner_prod_d.get())
+    residual_sq = float(residual_sq_d.get())
     cp.cuda.Device(device_id).synchronize()
-    return norm_X_sq, inner_prod
+    return norm_X_sq, inner_prod, residual_sq
 
 
 def _sharded_fr_error(
@@ -685,20 +769,22 @@ def _sharded_fr_error(
     subsample_frac: float = 1.0,
     iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    masked: bool = False,
 ) -> cp.ndarray:
     """
     Compute relative Frobenius error with sharded NNZ; returns a scalar CuPy
     array on the primary device.
 
-    Uses ‖X - X̂‖²_F = ‖X‖² + ‖X̂‖² - 2⟨X, X̂⟩.
-    ‖X̂‖² is computed analytically on the primary device (no NNZ).
+    Full objective uses ‖X - X̂‖²_F = ‖X‖² + ‖X̂‖² - 2⟨X, X̂⟩, with ‖X̂‖²
+    computed analytically on the primary device (no NNZ). The masked/completion
+    objective uses the observed-only relative RMSE sqrt(sum_Ω (x - x̂)²) / ‖X‖.
     """
     primary = device_ids[0]
     N = len(factors)
     core_np = cp.asnumpy(core)
     factors_np = [cp.asnumpy(f) for f in factors]
 
-    results: List[Optional[Tuple[float, float]]] = [None] * len(device_ids)
+    results: List[Optional[Tuple[float, float, float]]] = [None] * len(device_ids)
     _own_pool = pool is None
     _pool = ThreadPoolExecutor(max_workers=len(device_ids)) if _own_pool else pool
     try:
@@ -714,6 +800,7 @@ def _sharded_fr_error(
                 device_id=device_ids[k],
                 subsample_frac=subsample_frac,
                 rng_seed=(None if iter_seed is None else iter_seed + k),
+                masked=masked,
             ): k
             for k in range(len(device_ids))
         }
@@ -725,19 +812,24 @@ def _sharded_fr_error(
 
     norm_X_sq_total = sum(r[0] for r in results)
     inner_prod_total = sum(r[1] for r in results)
-
-    with cp.cuda.Device(primary):
-        grams = [factors[n].T @ factors[n] for n in range(N)]
-        Den = _core_multilinear_grams(core, grams, epsilon=epsilon)
-        norm_Xhat_sq = float(cp.sum(core * Den).get())
+    residual_sq_total = sum(r[2] for r in results)
 
     norm_X = math.sqrt(max(norm_X_sq_total, float(epsilon)))
 
-    if norm_X_sq_total == 0.0:
-        result = math.sqrt(max(norm_Xhat_sq, float(epsilon))) / norm_X
+    if masked:
+        # Observed-only relative RMSE.
+        result = math.sqrt(max(residual_sq_total, 0.0)) / norm_X
     else:
-        residual_sq = max(norm_X_sq_total + norm_Xhat_sq - 2.0 * inner_prod_total, 0.0)
-        result = math.sqrt(residual_sq) / norm_X
+        with cp.cuda.Device(primary):
+            grams = [factors[n].T @ factors[n] for n in range(N)]
+            Den = _core_multilinear_grams(core, grams, epsilon=epsilon)
+            norm_Xhat_sq = float(cp.sum(core * Den).get())
+
+        if norm_X_sq_total == 0.0:
+            result = math.sqrt(max(norm_Xhat_sq, float(epsilon))) / norm_X
+        else:
+            residual_sq = max(norm_X_sq_total + norm_Xhat_sq - 2.0 * inner_prod_total, 0.0)
+            result = math.sqrt(residual_sq) / norm_X
 
     with cp.cuda.Device(primary):
         return cp.asarray(result, dtype=core.dtype)
@@ -795,6 +887,7 @@ class ShardedSparseTensor:
         device_ids: List[int],
         shards: List[cpx_sparse.coo_matrix],
         subsample_frac: float = 1.0,
+        masked: bool = False,
     ) -> None:
         self.full_tensor = full_tensor
         self.orig_shape = orig_shape
@@ -802,6 +895,9 @@ class ShardedSparseTensor:
         self.shards = shards
         self.n_shards = len(device_ids)
         self.subsample_frac = float(subsample_frac)
+        # Optimisation objective: when True, fit only observed entries
+        # (weighted/completion objective), mirroring cfg.train.objective="masked".
+        self.masked = bool(masked)
         self._iter_seed: Optional[int] = None
         # Persistent pool: threads (and their cuBLAS handles) live for the
         # lifetime of this object.  Re-creating a pool each call causes
@@ -838,6 +934,7 @@ class ShardedSparseTensor:
         orig_shape: Tuple[int, ...],
         device_ids: Optional[List[int]] = None,
         subsample_frac: float = 1.0,
+        masked: bool = False,
     ) -> "ShardedSparseTensor":
         """
         Build a ``ShardedSparseTensor`` from an existing CuPy COO matrix.
@@ -851,13 +948,14 @@ class ShardedSparseTensor:
         orig_shape     : original N-D tensor shape
         device_ids     : CUDA ordinals; ``None`` → single-GPU fallback
         subsample_frac : NNZ fraction for stochastic updates (multi-GPU only)
+        masked         : fit only observed entries (completion objective)
         """
         coo_coo = coo.tocoo()
 
         if device_ids is None or len(device_ids) <= 1:
             primary = int(coo_coo.row.device) if hasattr(coo_coo.row, "device") else 0
             return cls(coo_coo, orig_shape, [primary], [coo_coo],
-                       subsample_frac=subsample_frac)
+                       subsample_frac=subsample_frac, masked=masked)
 
         nnz = int(coo_coo.row.size)
         n = len(device_ids)
@@ -869,7 +967,7 @@ class ShardedSparseTensor:
         ]
 
         return cls(coo_coo, orig_shape, list(device_ids), shards,
-                   subsample_frac=subsample_frac)
+                   subsample_frac=subsample_frac, masked=masked)
 
     # ------------------------------------------------------------------
     # Factor update methods
@@ -892,14 +990,14 @@ class ShardedSparseTensor:
                 vec_tensor=self.full_tensor,
                 core=core, factors=factors, mode=mode, shape=shape,
                 thread_budget=thread_budget, epsilon=epsilon,
-                batch_cols=batch_cols, verbose=verbose,
+                batch_cols=batch_cols, verbose=verbose, masked=self.masked,
             )
         return _sharded_factor_update(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, mode=mode, shape=shape,
             divergence="kl", epsilon=epsilon, batch_cols=batch_cols, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, masked=self.masked,
         )
 
     def fr_factor_update(
@@ -919,14 +1017,14 @@ class ShardedSparseTensor:
                 vec_tensor=self.full_tensor,
                 core=core, factors=factors, mode=mode, shape=shape,
                 thread_budget=thread_budget, epsilon=epsilon,
-                batch_cols=batch_cols, verbose=verbose,
+                batch_cols=batch_cols, verbose=verbose, masked=self.masked,
             )
         return _sharded_factor_update(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, mode=mode, shape=shape,
             divergence="fr", epsilon=epsilon, batch_cols=batch_cols, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, masked=self.masked,
         )
 
     # ------------------------------------------------------------------
@@ -952,6 +1050,7 @@ class ShardedSparseTensor:
                 shape=shape, core=core, factors=factors, modes=modes,
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_rhat=batch_rhat, batch_num=batch_num, verbose=verbose,
+                masked=self.masked,
             )
         return _sharded_core_update(
             shards=self.shards, device_ids=self.device_ids,
@@ -959,7 +1058,7 @@ class ShardedSparseTensor:
             divergence="kl", epsilon=epsilon,
             batch_rhat=batch_rhat, batch_num=batch_num, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, masked=self.masked,
         )
 
     def fr_core_update(
@@ -979,7 +1078,7 @@ class ShardedSparseTensor:
                 vec_tensor=self.full_tensor,
                 shape=shape, core=core, factors=factors, modes=modes,
                 thread_budget=thread_budget, epsilon=epsilon,
-                batch_num=batch_num, verbose=verbose,
+                batch_num=batch_num, verbose=verbose, masked=self.masked,
             )
         return _sharded_core_update(
             shards=self.shards, device_ids=self.device_ids,
@@ -987,7 +1086,7 @@ class ShardedSparseTensor:
             divergence="fr", epsilon=epsilon,
             batch_rhat=None, batch_num=batch_num, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, masked=self.masked,
         )
 
     # ------------------------------------------------------------------
@@ -1010,14 +1109,14 @@ class ShardedSparseTensor:
                 vec_tensor=self.full_tensor,
                 shape=shape, core=core, factors=factors,
                 thread_budget=thread_budget, epsilon=epsilon,
-                batch_rhat=batch_rhat, verbose=verbose,
+                batch_rhat=batch_rhat, verbose=verbose, masked=self.masked,
             )
         return _sharded_kl_error(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, shape=shape,
             epsilon=epsilon, batch_rhat=batch_rhat,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, masked=self.masked,
         )
 
     def fr_compute_errors(
@@ -1036,14 +1135,14 @@ class ShardedSparseTensor:
                 vec_tensor=self.full_tensor,
                 shape=shape, core=core, factors=factors,
                 thread_budget=thread_budget, epsilon=epsilon,
-                batch_rhat=batch_rhat, verbose=verbose,
+                batch_rhat=batch_rhat, verbose=verbose, masked=self.masked,
             )
         return _sharded_fr_error(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, shape=shape,
             epsilon=epsilon, batch_rhat=batch_rhat,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
-            pool=self._pool,
+            pool=self._pool, masked=self.masked,
         )
 
 
