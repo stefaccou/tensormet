@@ -17,6 +17,12 @@ from itertools import combinations
 from functools import reduce
 import hashlib, json
 
+_ALL_TENSORS = [
+    "counting", "countingLog", "countingLogSoftPlus", "countingLogShifted",
+    "sii", "siiSoftPlus", "siiShifted",
+    "sc",  "scSoftPlus",  "scShifted",
+]
+
 
 # ── new top-level worker (must be picklable → module level) ─────
 def _pass2_worker(
@@ -331,7 +337,21 @@ def populate_tensors_parquet(
     max_workers: int = 0,
     shards_per_task: int = 1,
     ensured_vocab: list[str] | None = None,
+    tensors_to_build: list[str] | None = None,
 ):
+    if tensors_to_build is not None:
+        unknown = [t for t in tensors_to_build if t not in _ALL_TENSORS]
+        if unknown:
+            raise ValueError(f"Unknown tensor names: {unknown}. Valid: {_ALL_TENSORS}")
+        want = list(tensors_to_build)
+    else:
+        want = _ALL_TENSORS
+
+    need_count     = "counting"    in want
+    need_count_log = any(t in want for t in ("countingLog", "countingLogSoftPlus", "countingLogShifted"))
+    need_sii       = any(t in want for t in ("sii", "siiSoftPlus", "siiShifted"))
+    need_sc        = any(t in want for t in ("sc",  "scSoftPlus",  "scShifted"))
+
     path_to_vectors = os.fspath(path_to_vectors)
     n_modes = len(cols_to_build)
 
@@ -678,7 +698,11 @@ def populate_tensors_parquet(
             )
 
         # filter tuples from max counter
-        indices, count_values, sii_values, sc_values = [], [], [], []
+        indices = []
+        count_values     = [] if need_count     else None
+        count_log_values = [] if need_count_log else None
+        sii_values       = [] if need_sii       else None
+        sc_values        = [] if need_sc        else None
 
         full_counter = subset_counters[tuple(cols_to_build)]
 
@@ -686,77 +710,125 @@ def populate_tensors_parquet(
             if not in_k(els_to_check):
                 continue
             indices.append([col2i[cols_to_build[i]][el] for i, el in enumerate(els_to_check)])
-            count_values.append(float(cnt))
-
+            if need_count:
+                count_values.append(float(cnt))
+            if need_count_log:
+                count_log_values.append(log(cnt / total_len))
             # Use finite values instead of -inf to prevent coalesce/sorting issues
-            sii_val = specific_interaction_information(els_to_check)
-            sii_values.append(float(sii_val) if sii_val != float("-inf") else -1e38)
-
-            sc_val = specific_correlation(els_to_check)
-            sc_values.append(float(sc_val) if sc_val != float("-inf") else -1e38)
+            if need_sii:
+                sii_val = specific_interaction_information(els_to_check)
+                sii_values.append(float(sii_val) if sii_val != float("-inf") else -1e38)
+            if need_sc:
+                sc_val = specific_correlation(els_to_check)
+                sc_values.append(float(sc_val) if sc_val != float("-inf") else -1e38)
 
         size = tuple(len(vocabs[col]) for col in cols_to_build)
 
         if len(indices) == 0:
             idx = torch.empty((order, 0), dtype=torch.long)
             empty = torch.empty((0,), dtype=torch.float32)
-            count_tensor = _make_sparse_coo(idx, empty, size).coalesce()
-            sii_tensor = _make_sparse_coo(idx, empty, size).coalesce()
-            sc_tensor = _make_sparse_coo(idx, empty, size).coalesce()
+            if need_count:
+                count_tensor = _make_sparse_coo(idx, empty, size).coalesce()
+            if need_count_log:
+                count_log_tensor = _make_sparse_coo(idx, empty, size).coalesce()
+            if need_sii:
+                sii_tensor = _make_sparse_coo(idx, empty, size).coalesce()
+            if need_sc:
+                sc_tensor = _make_sparse_coo(idx, empty, size).coalesce()
         else:
             # Convert to tensors and explicitly cast to long
             idx = torch.tensor(indices, dtype=torch.long).t().contiguous()
 
             # Create tensors
-            count_tensor = _make_sparse_coo(idx, torch.tensor(count_values, dtype=torch.float32), size)
-            sii_tensor = _make_sparse_coo(idx, torch.tensor(sii_values, dtype=torch.float32), size)
-            sc_tensor = _make_sparse_coo(idx, torch.tensor(sc_values, dtype=torch.float32), size)
+            if need_count:
+                count_tensor = _make_sparse_coo(idx, torch.tensor(count_values, dtype=torch.float32), size)
+            if need_count_log:
+                count_log_tensor = _make_sparse_coo(idx, torch.tensor(count_log_values, dtype=torch.float32), size)
+            if need_sii:
+                sii_tensor = _make_sparse_coo(idx, torch.tensor(sii_values, dtype=torch.float32), size)
+            if need_sc:
+                sc_tensor = _make_sparse_coo(idx, torch.tensor(sc_values, dtype=torch.float32), size)
 
             # CRITICAL: Clear Python lists from memory before coalescing
             del indices
-            del count_values
-            del sii_values
-            del sc_values
+            if need_count:     del count_values
+            if need_count_log: del count_log_values
+            if need_sii:       del sii_values
+            if need_sc:        del sc_values
 
             # Coalesce (this is the memory-intensive part)
-            count_tensor = count_tensor.coalesce()
-            sii_tensor = sii_tensor.coalesce()
-            sc_tensor = sc_tensor.coalesce()
+            if need_count:     count_tensor     = count_tensor.coalesce()
+            if need_count_log: count_log_tensor = count_log_tensor.coalesce()
+            if need_sii:       sii_tensor       = sii_tensor.coalesce()
+            if need_sc:        sc_tensor        = sc_tensor.coalesce()
 
         # normalized variants
         eps = 1e-8
-        if sii_tensor._nnz():
-            vvals = sii_tensor.values()
-            sii_shifted = _make_sparse_coo(sii_tensor.indices(), vvals - vvals.min() + eps, size).coalesce()
-            sii_softplus = _make_sparse_coo(sii_tensor.indices(), torch.nn.functional.softplus(vvals), size).coalesce()
-        else:
-            sii_shifted = sii_tensor
-            sii_softplus = sii_tensor
+        if need_count_log:
+            if count_log_tensor._nnz():
+                vvals = count_log_tensor.values()
+                if "countingLogShifted" in want: # This is normalised, raw didn't work for our usecase
+                    _v = vvals - vvals.min()
+                    count_log_shifted  = _make_sparse_coo(count_log_tensor.indices(), _v / (_v.max() + eps), size).coalesce()
+                if "countingLogSoftPlus" in want:
+                    count_log_softplus = _make_sparse_coo(count_log_tensor.indices(), torch.nn.functional.softplus(vvals), size).coalesce()
+            else:
+                if "countingLogShifted"  in want: count_log_shifted  = count_log_tensor
+                if "countingLogSoftPlus" in want: count_log_softplus = count_log_tensor
 
-        if sc_tensor._nnz():
-            vvals = sc_tensor.values()
-            sc_shifted = _make_sparse_coo(sc_tensor.indices(), vvals - vvals.min() + eps, size).coalesce()
-            sc_softplus = _make_sparse_coo(sc_tensor.indices(), torch.nn.functional.softplus(vvals), size).coalesce()
-        else:
-            sc_shifted = sc_tensor
-            sc_softplus = sc_tensor
+        if need_sii:
+            if sii_tensor._nnz():
+                vvals = sii_tensor.values()
+                if "siiShifted" in want:
+                    sii_shifted  = _make_sparse_coo(sii_tensor.indices(), vvals - vvals.min() + eps, size).coalesce()
+                if "siiSoftPlus" in want:
+                    sii_softplus = _make_sparse_coo(sii_tensor.indices(), torch.nn.functional.softplus(vvals), size).coalesce()
+            else:
+                if "siiShifted"  in want: sii_shifted  = sii_tensor
+                if "siiSoftPlus" in want: sii_softplus = sii_tensor
+
+        if need_sc:
+            if sc_tensor._nnz():
+                vvals = sc_tensor.values()
+                if "scShifted" in want:
+                    sc_shifted  = _make_sparse_coo(sc_tensor.indices(), vvals - vvals.min() + eps, size).coalesce()
+                if "scSoftPlus" in want:
+                    sc_softplus = _make_sparse_coo(sc_tensor.indices(), torch.nn.functional.softplus(vvals), size).coalesce()
+            else:
+                if "scShifted"  in want: sc_shifted  = sc_tensor
+                if "scSoftPlus" in want: sc_softplus = sc_tensor
 
         vocab = {}
         for col in cols_to_build:
             vocab[f"vocab_{col}"] = vocabs[col]
             vocab[f"{col}2i"] = col2i[col]
 
+        p = f"{path_to_tensors}/populated"
         if save:
-            torch.save(count_tensor, f"{path_to_tensors}/populated/counting_{order}D_{dim_str}d{suffix}.pt")
-            torch.save(sii_tensor,   f"{path_to_tensors}/populated/sii_{order}D_{dim_str}d{suffix}.pt")
-            torch.save(sc_tensor,    f"{path_to_tensors}/populated/sc_{order}D_{dim_str}d{suffix}.pt")
-            torch.save(sc_softplus,  f"{path_to_tensors}/populated/scSoftPlus_{order}D_{dim_str}d{suffix}.pt")
-            torch.save(sii_softplus, f"{path_to_tensors}/populated/siiSoftPlus_{order}D_{dim_str}d{suffix}.pt")
-            torch.save(sc_shifted,   f"{path_to_tensors}/populated/scShifted_{order}D_{dim_str}d{suffix}.pt")
-            torch.save(sii_shifted,  f"{path_to_tensors}/populated/siiShifted_{order}D_{dim_str}d{suffix}.pt")
+            if "counting"           in want: torch.save(count_tensor,      f"{p}/counting_{order}D_{dim_str}d{suffix}.pt")
+            if "countingLog"        in want: torch.save(count_log_tensor,  f"{p}/countingLog_{order}D_{dim_str}d{suffix}.pt")
+            if "countingLogShifted" in want: torch.save(count_log_shifted, f"{p}/countingLogShifted_{order}D_{dim_str}d{suffix}.pt")
+            if "countingLogSoftPlus" in want: torch.save(count_log_softplus, f"{p}/countingLogSoftPlus_{order}D_{dim_str}d{suffix}.pt")
+            if "sii"         in want: torch.save(sii_tensor,       f"{p}/sii_{order}D_{dim_str}d{suffix}.pt")
+            if "sc"          in want: torch.save(sc_tensor,        f"{p}/sc_{order}D_{dim_str}d{suffix}.pt")
+            if "scSoftPlus"  in want: torch.save(sc_softplus,      f"{p}/scSoftPlus_{order}D_{dim_str}d{suffix}.pt")
+            if "siiSoftPlus" in want: torch.save(sii_softplus,     f"{p}/siiSoftPlus_{order}D_{dim_str}d{suffix}.pt")
+            if "scShifted"   in want: torch.save(sc_shifted,       f"{p}/scShifted_{order}D_{dim_str}d{suffix}.pt")
+            if "siiShifted"  in want: torch.save(sii_shifted,      f"{p}/siiShifted_{order}D_{dim_str}d{suffix}.pt")
             with open(f"{path_to_tensors}/vocabularies/{order}D_{dim_str}d{suffix}.pkl", "wb") as f:
                 pickle.dump(vocab, f)
         else:
-            results[variant] = (count_tensor, sii_tensor, sc_tensor, vocab)
+            built = {}
+            if "counting"            in want: built["counting"]            = count_tensor
+            if "countingLog"         in want: built["countingLog"]         = count_log_tensor
+            if "countingLogShifted"  in want: built["countingLogShifted"]  = count_log_shifted
+            if "countingLogSoftPlus" in want: built["countingLogSoftPlus"] = count_log_softplus
+            if "sii"         in want: built["sii"]         = sii_tensor
+            if "sc"          in want: built["sc"]          = sc_tensor
+            if "siiSoftPlus" in want: built["siiSoftPlus"] = sii_softplus
+            if "siiShifted"  in want: built["siiShifted"]  = sii_shifted
+            if "scSoftPlus"  in want: built["scSoftPlus"]  = sc_softplus
+            if "scShifted"   in want: built["scShifted"]   = sc_shifted
+            results[variant] = (built, vocab)
 
     return results

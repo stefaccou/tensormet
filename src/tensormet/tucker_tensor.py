@@ -2,12 +2,10 @@ from __future__ import annotations
 import os
 import pickle
 
-import sparse
 import torch
 import json
 import math
 import numpy as np
-import matplotlib.pyplot as plt
 import tensorly as tl
 from tensorly.tucker_tensor import validate_tucker_rank, tucker_normalize, TuckerTensor
 from tensorly.tenalg import mode_dot
@@ -35,6 +33,7 @@ from tensormet.utils import (DATA_DIR,
                             make_lazy_cupy_pair,
                             dim_spec_str,
                             np_dispatch,
+                            np_sim,
                             resolve_checkpoint_path,
                    )
 from tensormet.sparse_ops import initialize_nonnegative_tucker
@@ -99,13 +98,6 @@ def _role_index(role: str, role_names: list[str]) -> int:
 def _voc_list_key(role: str) -> str:
     return f"vocab_{role}"
 
-
-
-def np_sim(a: np.ndarray, b: np.ndarray) -> float:
-    """Computes cosine similarity between two numpy vectors."""
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-
 class TuckerDecomposition:
     """Encapsulating the tucker decomposition (core and factors) and the vocabulary,
     providing methods for scoring, slicing, visualisation, etc."""
@@ -162,7 +154,9 @@ class TuckerDecomposition:
                     vocab: dict with keys 'vocab_v','vocab_s','vocab_o','v2i','s2i','o2i'
         """
         if method not in {"counting", "sc", "sii",
-                          "scSoftPlus", "scShifted", "siiSoftPlus", "siiShifted"}:
+                          "countingLog", "countingLogSoftPlus", "countingLogShifted",
+                          "scSoftPlus", "scShifted",
+                          "siiSoftPlus", "siiShifted"}:
             raise ValueError("method must be one of {'counting','sc','sii'}")
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
@@ -949,12 +943,15 @@ class SparseTupleTensor:
         """
         if method not in {
             "counting", "sc", "sii",
+            "countingLog", "countingLogSoftPlus", "countingLogShifted",
             "siiSoftPlus", "siiShifted",
             "scSoftPlus", "scShifted",
         }:
             raise ValueError(
                 "method must be one of "
-                "{'counting','sc','sii','siiSoftPlus','siiShifted','scSoftPlus','scShifted'}"
+                "{'counting','sc','sii', \n"
+                "'countingLog', 'countingLogSoftPlus', 'countingLogShifted'\n"
+                "'siiSoftPlus','siiShifted','scSoftPlus','scShifted'}"
             )
 
         base = os.path.join(DATA_DIR, "tensors", dataset)
@@ -1038,6 +1035,7 @@ class SparseTupleTensor:
             coords = self.tensor.indices().numpy()       # shape (nnz, ndim)
             data   = self.tensor.values().numpy()        # shape (nnz,)
             shape  = tuple(self.tensor.size())  # e.g. (d0, d1, ..., d_{n-1})
+            import sparse  # lazy: pulls in numba; only needed for the "sparse" branch
             sparse_tensor = sparse.COO(coords, data, shape=shape)
             return sparse_tensor
 
@@ -1280,8 +1278,8 @@ class SparseTupleTensor:
                 print(f"Warning: could not load SimLex-999 from {_SIMLEX_PATH}: {_e}")
 
         print(divergence, rank, _subsample_frac)
-        est_iter_time = self.estimate_training_time(rank=rank[0], subsample=_subsample_frac)
-        print(f"estimated training time: {est_iter_time}*{n_iter_max}={est_iter_time*n_iter_max}")
+        # est_iter_time = self.estimate_training_time(rank=rank[0], subsample=_subsample_frac)
+        # print(f"estimated training time: {est_iter_time}*{n_iter_max}={est_iter_time*n_iter_max}")
         for iteration in range(start_iteration, n_iter_max):
             if time_iteration:
                 start_time = time.time()

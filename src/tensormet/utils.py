@@ -14,12 +14,14 @@ import sys
 from typing import Any, Dict, Optional, Union, IO, Tuple
 from datetime import datetime, UTC
 import logging
+import numpy as np
 
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 data_path = os.getenv("SCRATCH_DATA") or os.getenv("DATA")
 if data_path is None:
-    raise EnvironmentError("Neither SCRATCH_DATA nor DATA environment variable is set")
+    raise EnvironmentError("Neither SCRATCH_DATA nor DATA environment variable is set:\n"
+                           "Point this to your desired tensor data directory")
 DATA_DIR = Path(data_path)
 
 def np_dispatch(el):
@@ -28,6 +30,10 @@ def np_dispatch(el):
     except AttributeError:
         element = el
     return element
+
+def np_sim(a: np.ndarray, b: np.ndarray) -> float:
+    """Computes cosine similarity between two numpy vectors."""
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
 def guarded_cupy_import(check_cuda: bool = True) -> Tuple[Optional[object], Optional[object]]:

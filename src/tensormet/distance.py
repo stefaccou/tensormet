@@ -567,21 +567,46 @@ def _accumulate_core_num_outer(Num, w, mats):
         Num += slice_sum.reshape([mats[i].shape[1] for i in left_modes + right_modes])
         return
 
-    # Replace O(R^loop_modes) Python loop with a single einsum over all loop-mode factor matrices.
-    # Edge-case handling above guarantees both KR_L and KR_R are non-None when loop_modes is non-empty.
-    # Subscripts: 'i'=batch/nnz, 'L'=collapsed left ranks, 'R'=collapsed right ranks,
-    #             loop_letters[j] = rank dim of loop_modes[j].
+    # Absorb loop modes into the left/right KR blocks (ceil/floor split) then do a
+    # single matmul.  The multi-operand einsum used previously let CuPy's path
+    # optimizer produce gigantic intermediates of shape (nnz, L, R, a) or larger —
+    # the same 1.45 TB OOM seen for order-4 tensors with high ranks.
+    # After absorption the peak intermediate is (L_ext, R_ext) = core-sized,
+    # matching what _estimate_batch_num_for_outer already budgets for.
     n_loop = len(loop_modes)
-    loop_letters = einsum_letters(n_loop)  # 'a', 'b', ... — safe, won't collide with 'i','L','R'
-    KR_Lw = KR_L * w[:, None]             # absorb w here so the einsum has one fewer operand
-    loop_mats_list = [mats[loop_modes[j]] for j in range(n_loop)]
-    eq_lhs = ["iL", "iR"] + ["i" + ll for ll in loop_letters]
-    eq_rhs = "L" + "".join(loop_letters) + "R"
-    eq = ",".join(eq_lhs) + "->" + eq_rhs
-    result = cp.einsum(eq, KR_Lw, KR_R, *loop_mats_list,
-                       optimize=cp_einsum_optimize(2 + n_loop))
-    # result shape: (L_combined, R_loop[0], ..., R_loop[n_loop-1], R_combined)
-    # left + loop + right covers all modes in ascending order, so reshape is axis-aligned with Num
+    n_left_loop  = (n_loop + 1) // 2   # ceil — absorbed into left KR
+    n_right_loop = n_loop // 2          # floor — absorbed into right KR
+    left_loop_modes  = loop_modes[:n_left_loop]
+    right_loop_modes = loop_modes[n_left_loop:]
+
+    KR_Lw = KR_L * w[:, None]
+    KR_Lw_ext = KR_Lw
+    for lm in left_loop_modes:
+        KR_Lw_ext = (KR_Lw_ext[:, :, None] * mats[lm][:, None, :]).reshape(nnz, -1)
+
+    KR_R_ext = KR_R
+    for rm in right_loop_modes:
+        KR_R_ext = (KR_R_ext[:, :, None] * mats[rm][:, None, :]).reshape(nnz, -1)
+
+    # Matmul sums over nnz; output shape: (L_ext, R_ext)
+    result = KR_Lw_ext.T @ KR_R_ext
+
+    # Reshape then permute axes to (left_modes | left_loop | right_loop | right_modes),
+    # which is the order expected by target_shape = left_modes + loop_modes + right_modes.
+    n_left  = len(left_modes)
+    n_right = len(right_modes)
+    left_ext_dims  = [mats[i].shape[1] for i in left_modes] + [mats[i].shape[1] for i in left_loop_modes]
+    right_ext_dims = [mats[i].shape[1] for i in right_modes] + [mats[i].shape[1] for i in right_loop_modes]
+    result = result.reshape(left_ext_dims + right_ext_dims)
+    # Current axis order: left_modes | left_loop | right_modes | right_loop
+    # Target axis order:  left_modes | left_loop | right_loop  | right_modes
+    if n_right_loop:
+        perm = (list(range(n_left + n_left_loop)) +
+                list(range(n_left + n_left_loop + n_right,
+                           n_left + n_left_loop + n_right + n_right_loop)) +
+                list(range(n_left + n_left_loop, n_left + n_left_loop + n_right)))
+        result = result.transpose(perm)
+
     target_shape = [mats[i].shape[1] for i in left_modes + loop_modes + right_modes]
     Num += result.reshape(target_shape)
 

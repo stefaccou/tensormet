@@ -173,6 +173,7 @@ def launch_tensor_population(cfg):
             max_workers=cfg.exp.max_workers,
             shards_per_task=cfg.exp.shards_per_task,
             ensured_vocab=list(cfg.exp.ensured_vocab) if cfg.exp.ensured_vocab else None,
+            tensors_to_build=list(cfg.exp.tensors_to_build) if cfg.exp.tensors_to_build else None,
         )
 
     end_time = time.time()
@@ -206,9 +207,13 @@ def launch_nnt_decomposition(cfg):
 
     # load in GPU sensitive modules only AFTER device has been set!
     import torch
+    print(f"[{time.strftime('%H:%M:%S')}] importing cupy...", flush=True)
     import cupy as cp
+    print(f"[{time.strftime('%H:%M:%S')}] importing tucker_tensor...", flush=True)
     from tensormet.tucker_tensor import SparseTupleTensor
+    print(f"[{time.strftime('%H:%M:%S')}] importing similarity...", flush=True)
     from tensormet.similarity import load_eval_sentences_cached_parquet, ensure_vocab
+    print(f"[{time.strftime('%H:%M:%S')}] all deferred imports done", flush=True)
 
     tl.set_backend("cupy")
 
@@ -230,11 +235,11 @@ def launch_nnt_decomposition(cfg):
     try:
         with open(vocab_path, "rb") as f:
             vocab = pickle.load(f)
-        print("loaded vocab")
+        # print("loaded vocab")
         roles = extract_roles_from_vocab(vocab)
-        print("roles:", roles)
+        # print("roles:", roles)
     except FileNotFoundError:
-        print(vocab_path, "not found")
+        # print(vocab_path, "not found")
         vocab_path = os.path.join(
             DATA_DIR,
             "tensors",
@@ -243,7 +248,7 @@ def launch_nnt_decomposition(cfg):
         )
         with open(vocab_path, "rb") as f:
             vocab = pickle.load(f)
-        print("legacy role definition")
+        # print("legacy role definition")
         roles = None
 
         # Map vocab role names -> actual parquet column names
@@ -271,11 +276,11 @@ def launch_nnt_decomposition(cfg):
     if cfg.eval.remove_OOV:
         start = time.time()
         clean_sample = ensure_vocab(vocab, sentence_sample, parquet_roles)
-        print("cleaned sample in ", time.time() - start)
+        # print("cleaned sample in ", time.time() - start)
     else:
         clean_sample = sentence_sample
 
-    print("loaded sentence sample")
+    # print("loaded sentence sample")
 
     paths = cfg.artifact_paths()
     for p in paths.values():
@@ -365,10 +370,11 @@ def launch_nnt_decomposition(cfg):
             },
         },
     )
-    notify_discord(
-        f"Saved Tucker decomposition {cfg.exp.method} - {cfg.exp.dim}/{cfg.exp.rank[0]} to {paths['model']}"
-        f" in {end_time - start_time:.2f} seconds."
-    )
+    if not "bench" in cfg.exp.name:
+        notify_discord(
+            f"Saved Tucker decomposition {cfg.exp.method} - {cfg.exp.dim}/{cfg.exp.rank[0]} to {paths['model']}"
+            f" in {end_time - start_time:.2f} seconds."
+        )
     print("model, errors and config saved")
 
     return tucker_decomp_torch

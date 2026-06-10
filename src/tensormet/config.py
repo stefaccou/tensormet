@@ -512,6 +512,7 @@ class PopulationExperimentConfig:
     vectors_dir_override: Optional[Path] = None  # bypass dataset-derived path
     data_dir: Path = DATA_DIR
     remove_hapax: bool = False
+    tensors_to_build: Optional[Tuple[str, ...]] = None  # None = all tensors
 
     def vectors_dir(self) -> Path:
         if self.vectors_dir_override is not None:

@@ -556,6 +556,10 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
                         help="Comma-separated token strings pinned into the shared vocabulary by name, "
                              "regardless of harmonic mean score. E.g. --ensured-vocab '<BOS>,<EOS>'. "
                              "Tokens absent from all marginals are silently skipped.")
+    parser.add_argument("--tensors-to-build", type=_parse_cols_to_build, dest="tensors_to_build", default=None,
+                        help="Comma-separated list of tensor names to build. Omit to build all. "
+                             "Valid: counting,countingLog,sii,siiSoftPlus,siiShifted,sc,scSoftPlus,scShifted. "
+                             "E.g. --tensors-to-build counting,countingLog,sc")
 
     parsed = parser.parse_args(args=argv)
     d = vars(parsed)
@@ -587,6 +591,7 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
             "remove_hapax",
             "min_mode_ks",
             "ensured_vocab",
+            "tensors_to_build",
     ):
         if d.get(f) is not None:
             exp_kwargs[f] = d[f]
