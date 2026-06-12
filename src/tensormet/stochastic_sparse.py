@@ -13,105 +13,129 @@ estimator of the full numerator:
 The denominator is analytical (depends only on core and factors) and is
 always kept exact.
 
+CHANGED (2026-06-12 review, Task 2): sampling no longer draws a fresh
+``rng.permutation(nnz)`` per iteration (an 8·nnz-byte device allocation plus a
+full sort — at nnz = 10⁸–10⁹ that is 0.8–8 GB per iteration on the very GPU
+subsampling is meant to relieve).  Instead, ``CooSubsampler`` fixes one
+uniform permutation of the NNZ at construction and takes a contiguous rotating
+window of it per iteration:
+
+    window(t) = perm[(t·n_sample) % nnz : +n_sample]    (wrapping)
+
+Estimator argument: a contiguous window of a uniformly shuffled sequence is a
+uniform sample without replacement, so linear accumulations over the rescaled
+window remain unbiased; successive windows tile the NNZ like an epoch (every
+entry visited once per ⌈nnz/n_sample⌉ iterations).  The sample is a pure
+function of (base_seed, iteration) — no RNG state advances between calls, so
+a resumed run draws exactly the same windows as an uninterrupted one (this
+also fixes review finding I-3).
+
 Wall-clock time per iteration scales as O(p) on the NNZ-bound operations.
 Typical useful range: p = 0.1–0.3 for large NNZ counts.
 
 Usage
 -----
-In the main decomposition loop (tucker_tensor.py), replace ``self.tensor``
-with the output of ``subsample_coo`` when stochastic mode is active:
+In the main decomposition loop (tucker_tensor.py), build the sampler once
+before the loop and draw from it per iteration:
 
+    _iter_sampler = CooSubsampler(self.tensor, shape, subsample_frac,
+                                  cfg.exp.random_state)
+    ...
     _current_tensor = (
-        subsample_coo(self.tensor, shape, subsample_frac, _iter_rng)
-        if _use_subsample else self.tensor
+        _iter_sampler.sample(iteration) if _use_subsample else self.tensor
     )
 
 The returned COO has the same ``(block_size, n_blocks)`` shape and rescaled
 values, so all existing update functions work without modification.
 
-For multi-GPU (ShardedSparseTensor), sampling happens inside each per-shard
-function using a deterministic seed derived from the iteration number and
-shard index — no per-iteration resharding is needed.
+For multi-GPU (ShardedSparseTensor), the same pattern lives shard-side: each
+shard's NNZ arrays are shuffled once at construction and the per-shard
+functions take contiguous windows — see ``sharded_sparse._apply_subsample``.
 """
 
 from __future__ import annotations
+
+from typing import Optional
+
+import numpy as np
 
 from tensormet.utils import make_lazy_cupy_pair
 cp, cpx_sparse = make_lazy_cupy_pair()
 
 
-
-def subsample_coo(
-    coo: cpx_sparse.coo_matrix,
-    shape: tuple,
-    frac: float,
-    rng: cp.random.RandomState,
-) -> cpx_sparse.coo_matrix:
+class CooSubsampler:
     """
-    Return a rescaled random subsample of *coo* with the same shape.
+    Owns a one-time shuffled ordering of a COO matrix's NNZ and yields
+    per-iteration contiguous-window subsamples.
 
-    NNZ entries are sampled uniformly without replacement.  Their values are
-    multiplied by ``1/frac`` so that any downstream accumulation over the
-    returned matrix is an unbiased estimator of the same accumulation over
-    the full matrix.
+    CHANGED (Task 2): replaces the former ``subsample_coo(coo, shape, frac,
+    rng)`` + ``make_iteration_rng(seed)`` pair, which permuted the full NNZ on
+    the GPU every iteration with a stateful RNG (not checkpoint-safe).
 
-    The returned matrix preserves the ``(block_size, n_blocks)`` shape of
-    the input so it is a drop-in replacement wherever ``vec_tensor`` is
-    expected (all largedim update functions, error functions, etc.).
+    Memory: one persistent int64 index array of 8·nnz bytes on the device
+    (built from a host-side ``np.random.default_rng`` permutation, so no GPU
+    sort ever runs); per-iteration allocations are O(n_sample) — the gathered
+    row/col/data of the window — never O(nnz).
 
     Parameters
     ----------
     coo :
-        Full COO matrix on the primary CUDA device.
+        Full COO matrix on the primary CUDA device, in the package's blocked
+        ``(block_size, n_blocks)`` shape.
     shape :
         Original N-D tensor shape.  Kept for API symmetry; not used here.
     frac :
-        Sampling fraction in (0, 1].  ``frac=1.0`` returns an equivalent
-        view of the original matrix (still rescaled by 1.0, so values are
-        unchanged).
-    rng :
-        ``cp.random.RandomState`` instance, advanced in-place by this call.
-        Use ``make_iteration_rng`` to create one before the training loop.
-
-    Returns
-    -------
-    cpx_sparse.coo_matrix
-        Subsampled COO with ``⌈frac · nnz⌉`` entries and the same shape.
-    """
-    coo_c = coo.tocoo()
-    nnz = int(coo_c.row.size)
-
-    if nnz == 0:
-        return coo_c
-
-    n_sample = max(1, int(round(frac * nnz)))
-
-    # Sample without replacement on GPU, then sort to restore row-major order
-    # (better cache locality in downstream index arithmetic).
-    idx = rng.permutation(nnz)[:n_sample]
-    idx = cp.sort(idx)
-
-    scale = coo_c.data.dtype.type(1.0 / frac)
-
-    return cpx_sparse.coo_matrix(
-        (coo_c.data[idx] * scale,
-         (coo_c.row[idx], coo_c.col[idx])),
-        shape=coo_c.shape,
-    )
-
-
-def make_iteration_rng(base_seed: int) -> cp.random.RandomState:
-    """
-    Create a ``cp.random.RandomState`` seeded from *base_seed*.
-
-    Call this once before the training loop.  Pass the returned object to
-    ``subsample_coo`` on each iteration; the state advances automatically so
-    each iteration draws a different sample while the full run is reproducible
-    given the same ``base_seed``.
-
-    Parameters
-    ----------
+        Sampling fraction in (0, 1].  ``frac=1.0`` disables sampling:
+        ``sample()`` returns the original matrix and no permutation is stored.
     base_seed :
-        Integer seed, typically ``cfg.exp.random_state``.
+        Integer seed for the one-time shuffle, typically
+        ``cfg.exp.random_state``.  Together with the iteration number it fully
+        determines every sample (resume-safe).
     """
-    return cp.random.RandomState(seed=int(base_seed))
+
+    def __init__(
+        self,
+        coo: cpx_sparse.coo_matrix,
+        shape: tuple,
+        frac: float,
+        base_seed: Optional[int] = 0,
+    ) -> None:
+        self.coo = coo.tocoo()
+        self.frac = float(frac)
+        self.nnz = int(self.coo.row.size)
+        self.n_sample = max(1, int(round(self.frac * self.nnz))) if self.nnz else 0
+        if self.nnz > 0 and self.frac < 1.0:
+            # Host-side permutation transferred once; cheaper and more
+            # deterministic across CuPy versions than a device-side shuffle.
+            perm_np = np.random.default_rng(int(base_seed or 0)).permutation(self.nnz)
+            self._perm = cp.asarray(perm_np)
+        else:
+            self._perm = None
+
+    def sample(self, iteration: int) -> cpx_sparse.coo_matrix:
+        """
+        Return iteration *t*'s rescaled subsample of the wrapped COO.
+
+        The window is ``perm[(t·n_sample) % nnz : +n_sample]`` (wrapping), and
+        values are multiplied by ``1/frac`` so any downstream accumulation is
+        an unbiased estimator of the same accumulation over the full matrix.
+        The returned matrix preserves the input's ``(block_size, n_blocks)``
+        shape, so it is a drop-in replacement wherever ``vec_tensor`` is
+        expected.
+        """
+        if self._perm is None:
+            return self.coo
+
+        start = (int(iteration) * self.n_sample) % self.nnz
+        end = start + self.n_sample
+        if end <= self.nnz:
+            idx = self._perm[start:end]
+        else:  # wrap around the end of the shuffled sequence
+            idx = cp.concatenate((self._perm[start:], self._perm[: end - self.nnz]))
+
+        scale = self.coo.data.dtype.type(1.0 / self.frac)
+        return cpx_sparse.coo_matrix(
+            (self.coo.data[idx] * scale,
+             (self.coo.row[idx], self.coo.col[idx])),
+            shape=self.coo.shape,
+        )

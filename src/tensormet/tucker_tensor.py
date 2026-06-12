@@ -47,7 +47,7 @@ from tensormet.naming import (
 from tensormet.similarity import evaluate_sample, get_eval_num_threads, load_simlex, evaluate_simlex
 from tensormet.routing import get_update_routing_step, get_log_step, UpdateRouting
 from tensormet.distance import null_compute_errors
-from tensormet.stochastic_sparse import subsample_coo, make_iteration_rng
+from tensormet.stochastic_sparse import CooSubsampler
 from tensormet.sharded_sparse import (
             ShardedSparseTensor,
             make_sharded_kl_factor_update,
@@ -1382,12 +1382,23 @@ class SparseTupleTensor:
             _sst = ShardedSparseTensor.from_coo(
                 self.tensor, shape, device_ids=list(range(_n_gpus)),
                 subsample_frac=_subsample_frac, masked=masked,
+                # CHANGED (2026-06-12 review, Task 2): seeds the one-time per-shard
+                # NNZ shuffle that backs contiguous-window subsampling.
+                subsample_seed=int(cfg.exp.random_state or 0),
             )
         else:
             _sst = None
 
-        # --- stochastic subsampling RNG (single-GPU path) ---
-        _iter_rng = make_iteration_rng(cfg.exp.random_state) if _subsample_frac < 1.0 else None
+        # --- stochastic subsampling (single-GPU path) ---
+        # CHANGED (2026-06-12 review, Task 2): CooSubsampler shuffles the NNZ once
+        # here and serves contiguous rotating windows per iteration, replacing the
+        # stateful RNG + per-iteration full permutation of subsample_coo. Samples
+        # are now a pure function of (random_state, iteration), so resumed runs
+        # draw the same sequence as uninterrupted ones (review finding I-3).
+        _iter_sampler = (
+            CooSubsampler(self.tensor, shape, _subsample_frac, cfg.exp.random_state)
+            if (_subsample_frac < 1.0 and _sst is None) else None
+        )
 
         linked_factors = defaultdict(set)
         if self.shared_factors:
@@ -1460,7 +1471,7 @@ class SparseTupleTensor:
                 and _sst is None   # multi-GPU handles sampling internally
             )
             _current_tensor = (
-                subsample_coo(self.tensor, shape, _subsample_frac, _iter_rng)
+                _iter_sampler.sample(iteration)
                 if _use_subsample else self.tensor
             )
             # --- factors ---

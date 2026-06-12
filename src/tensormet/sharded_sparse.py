@@ -15,13 +15,18 @@ required.
 
 Stochastic subsampling (multi-GPU path)
 ----------------------------------------
-When ``subsample_frac < 1.0``, each per-shard function samples a random
-fraction of its local NNZ and rescales values by ``1/subsample_frac``,
-giving an unbiased estimator of the full numerator without any per-iteration
-resharding.  Seeds are deterministic: ``iter_seed + shard_k`` per shard.
+When ``subsample_frac < 1.0``, each shard's NNZ arrays are shuffled **once**
+at construction (host-side, seeded per shard), and each per-shard function
+takes a contiguous rotating window of its local NNZ per iteration, rescaling
+values by ``1/subsample_frac``.  A contiguous window of a uniformly shuffled
+sequence is a uniform sample without replacement, so the estimator is
+unbiased — and successive windows tile the shard like an epoch, with zero
+per-iteration index allocation (the old per-iteration ``rng.permutation(nnz)``
+allocated and sorted 8·nnz bytes on the GPU every call).  Samples are a pure
+function of (construction seed, iteration): deterministic and resume-safe.
 
 Call ``sst.set_iter_seed(iteration)`` once at the top of each iteration so
-the SST's internal seed advances — wrapper function signatures are unchanged.
+the SST knows which window to take — wrapper function signatures are unchanged.
 
 Reduction strategies
 --------------------
@@ -93,6 +98,7 @@ def _build_shard(
     start: int,
     end: int,
     target_device: int,
+    shuffle_seed: Optional[int] = None,
 ) -> cpx_sparse.coo_matrix:
     """
     Extract NNZ slice [start, end) from *coo* and place it on *target_device*.
@@ -101,10 +107,25 @@ def _build_shard(
     ``_blocked_coo_to_flat_indices`` works identically on shards.
     Routes through CPU because CuPy does not support direct cross-device
     tensor slicing.  One-time cost at initialisation.
+
+    When *shuffle_seed* is given (subsampling enabled), the slice is uniformly
+    shuffled on the host before transfer, so that the contiguous windows taken
+    by ``_apply_subsample`` are uniform samples without replacement.  COO entry
+    order carries no meaning for any downstream accumulation (sums are
+    order-invariant; ``cp.unique`` re-sorts its input), so the shuffle is
+    content-preserving.
     """
     row_np = cp.asnumpy(coo.row[start:end])
     col_np = cp.asnumpy(coo.col[start:end])
     data_np = cp.asnumpy(coo.data[start:end])
+
+    # CHANGED (2026-06-12 review, Task 2): one-time host-side shuffle replaces the
+    # per-iteration cp.random.permutation in _apply_subsample. Done here because the
+    # NNZ slice already round-trips through the CPU, so the shuffle costs no GPU
+    # memory and no extra transfer.
+    if shuffle_seed is not None:
+        perm = np.random.default_rng(int(shuffle_seed)).permutation(row_np.size)
+        row_np, col_np, data_np = row_np[perm], col_np[perm], data_np[perm]
 
     with cp.cuda.Device(target_device):
         shard = cpx_sparse.coo_matrix(
@@ -118,36 +139,58 @@ def _apply_subsample(
     flat: cp.ndarray,
     vals: cp.ndarray,
     subsample_frac: float,
-    rng_seed: int,
+    iteration: Optional[int],
 ) -> Tuple[cp.ndarray, cp.ndarray]:
     """
-    Randomly subsample NNZ on the current GPU device.
+    Take this iteration's contiguous NNZ window from pre-shuffled storage.
 
-    Samples ``max(1, round(subsample_frac * nnz))`` entries without
-    replacement, rescaling values by ``1/subsample_frac`` to preserve
-    the expectation of any downstream accumulation.
+    CHANGED (2026-06-12 review, Task 2): previously this drew
+    ``cp.sort(rng.permutation(nnz)[:n_sample])`` — an 8·nnz-byte int64
+    allocation plus a full device sort, *per shard per call*, on exactly the
+    GPUs subsampling is meant to relieve.  The shard's NNZ arrays are now
+    shuffled once at construction (``_build_shard(shuffle_seed=...)``), so a
+    contiguous window ``[(iteration·n_sample) % nnz : +n_sample)`` (wrapping)
+    is a uniform sample without replacement.
+
+    Estimator argument: the construction shuffle makes every length-n_sample
+    contiguous window a uniformly distributed size-n_sample subset, so any
+    linear accumulation over the rescaled window is unbiased
+    (``E[sum_S x/frac] = sum x``).  Successive windows tile the shard like an
+    epoch: every entry is visited once per ⌈nnz/n_sample⌉ iterations.
+
+    Memory: slicing is O(1) (CuPy views); only the value rescale and the rare
+    wrap-around concatenation allocate, both O(n_sample) — never O(nnz).
 
     Parameters
     ----------
     flat, vals :
-        Flat indices and values from ``_blocked_coo_to_flat_indices``.
+        Flat indices and values from ``_blocked_coo_to_flat_indices`` on a
+        shard built with ``shuffle_seed`` set (i.e. already in shuffled order).
     subsample_frac :
         Fraction of NNZ to retain.  Must be < 1.0 (caller is responsible
         for not calling this at 1.0).
-    rng_seed :
-        Integer seed for ``cp.random.RandomState`` — deterministic and
-        distinct per shard per iteration.
+    iteration :
+        Training-loop iteration number; selects the window.  ``None`` is
+        treated as 0 (deterministic given (construction seed, iteration) —
+        no RNG state survives between calls, so resumed runs draw the same
+        windows as uninterrupted ones).
 
     Returns
     -------
-    flat_s, vals_s : subsampled and rescaled arrays.
+    flat_s, vals_s : windowed and rescaled arrays.
     """
     nnz = int(flat.size)
     n_sample = max(1, int(round(subsample_frac * nnz)))
-    rng = cp.random.RandomState(rng_seed)
-    idx = cp.sort(rng.permutation(nnz)[:n_sample])
+    start = (int(iteration or 0) * n_sample) % nnz
+    end = start + n_sample
+    if end <= nnz:
+        flat_s = flat[start:end]
+        vals_s = vals[start:end]
+    else:  # wrap around the end of the shuffled sequence
+        flat_s = cp.concatenate((flat[start:], flat[: end - nnz]))
+        vals_s = cp.concatenate((vals[start:], vals[: end - nnz]))
     scale = vals.dtype.type(1.0 / subsample_frac)
-    return flat[idx], vals[idx] * scale
+    return flat_s, vals_s * scale
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +208,7 @@ def _partial_numerator_for_shard(
     batch_cols: Optional[int],
     device_id: int,
     subsample_frac: float = 1.0,
-    rng_seed: Optional[int] = None,
+    iteration: Optional[int] = None,
     masked: bool = False,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
@@ -173,7 +216,8 @@ def _partial_numerator_for_shard(
 
     Runs entirely inside ``cp.cuda.Device(device_id)``.  When
     ``subsample_frac < 1.0`` the shard's NNZ is subsampled locally before
-    accumulation — no resharding is needed.
+    accumulation — no resharding is needed.  *iteration* selects the
+    contiguous window of the pre-shuffled shard (see ``_apply_subsample``).
 
     ``core_np`` and ``factors_np`` may be NumPy arrays *or* CuPy arrays
     already resident on ``device_id``.  ``cp.asarray`` is a no-op in the
@@ -203,7 +247,7 @@ def _partial_numerator_for_shard(
         return zero, (zero.copy() if masked else None)
 
     if subsample_frac < 1.0:
-        flat, vals = _apply_subsample(flat, vals, subsample_frac, rng_seed)
+        flat, vals = _apply_subsample(flat, vals, subsample_frac, iteration)
 
     # Under subsampling the numerator's `vals` are already rescaled by 1/frac
     # (see _apply_subsample). The masked denominator weights (unit / x̂) must be
@@ -426,7 +470,10 @@ def _sharded_factor_update(
                 batch_cols=batch_cols,
                 device_id=device_ids[k],
                 subsample_frac=subsample_frac,
-                rng_seed=(None if iter_seed is None else iter_seed + k),
+                # CHANGED (Task 2): shards no longer need distinct per-shard seeds
+                # (each shard has its own construction-time shuffle); the raw
+                # iteration number selects the rotating window on every shard.
+                iteration=iter_seed,
                 masked=masked,
             ): k
             for k in range(len(device_ids))
@@ -467,7 +514,7 @@ def _partial_core_num_for_shard(
     batch_num: Optional[int],
     device_id: int,
     subsample_frac: float = 1.0,
-    rng_seed: Optional[int] = None,
+    iteration: Optional[int] = None,
     masked: bool = False,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
@@ -477,7 +524,8 @@ def _partial_core_num_for_shard(
     FR path: Single pass with ``w = x`` directly.
 
     When ``subsample_frac < 1.0`` the shard's NNZ is subsampled before both
-    passes, so the two-pass KL structure operates on the same sampled subset.
+    passes, so the two-pass KL structure operates on the same sampled subset
+    (the window selected by *iteration*; see ``_apply_subsample``).
 
     ``core_np`` and ``factors_np`` may be NumPy arrays *or* CuPy arrays
     already resident on ``device_id``.  ``cp.asarray`` is a no-op in the
@@ -506,7 +554,7 @@ def _partial_core_num_for_shard(
         return zero, (zero.copy() if masked else None)
 
     if subsample_frac < 1.0:
-        flat, xvals = _apply_subsample(flat, xvals, subsample_frac, rng_seed)
+        flat, xvals = _apply_subsample(flat, xvals, subsample_frac, iteration)
         nnz = int(flat.size)
 
     # Rescale the masked denominator weights to match the 1/frac rescaling that
@@ -606,7 +654,7 @@ def _sharded_core_update(
                 batch_num=batch_num,
                 device_id=device_ids[k],
                 subsample_frac=subsample_frac,
-                rng_seed=(None if iter_seed is None else iter_seed + k),
+                iteration=iter_seed,  # CHANGED (Task 2): window index, not a per-shard seed
                 masked=masked,
             ): k
             for k in range(len(device_ids))
@@ -663,7 +711,7 @@ def _partial_kl_error_for_shard(
     batch_rhat: Optional[int],
     device_id: int,
     subsample_frac: float = 1.0,
-    rng_seed: Optional[int] = None,
+    iteration: Optional[int] = None,
 ) -> Tuple[float, float, float]:
     """
     Compute partial KL error scalars from a single NNZ shard.
@@ -687,7 +735,7 @@ def _partial_kl_error_for_shard(
         return 0.0, 0.0, 0.0
 
     if subsample_frac < 1.0:
-        flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, rng_seed)
+        flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, iteration)
         nnz = int(flat.size)
 
     x_nz = cp.clip(x_nz.astype(core_d.dtype), a_min=epsilon, a_max=None)
@@ -748,7 +796,7 @@ def _sharded_kl_error(
                 batch_rhat=batch_rhat,
                 device_id=device_ids[k],
                 subsample_frac=subsample_frac,
-                rng_seed=(None if iter_seed is None else iter_seed + k),
+                iteration=iter_seed,  # CHANGED (Task 2): window index, not a per-shard seed
             ): k
             for k in range(len(device_ids))
         }
@@ -785,7 +833,7 @@ def _partial_fr_error_for_shard(
     batch_rhat: Optional[int],
     device_id: int,
     subsample_frac: float = 1.0,
-    rng_seed: Optional[int] = None,
+    iteration: Optional[int] = None,
     masked: bool = False,
 ) -> Tuple[float, float, float]:
     """
@@ -812,7 +860,7 @@ def _partial_fr_error_for_shard(
         return 0.0, 0.0, 0.0
 
     if subsample_frac < 1.0:
-        flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, rng_seed)
+        flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, iteration)
         nnz = int(flat.size)
 
     x_nz = cp.clip(x_nz.astype(core_d.dtype), a_min=0.0, a_max=None)
@@ -878,7 +926,7 @@ def _sharded_fr_error(
                 batch_rhat=batch_rhat,
                 device_id=device_ids[k],
                 subsample_frac=subsample_frac,
-                rng_seed=(None if iter_seed is None else iter_seed + k),
+                iteration=iter_seed,  # CHANGED (Task 2): window index, not a per-shard seed
                 masked=masked,
             ): k
             for k in range(len(device_ids))
@@ -928,10 +976,13 @@ class ShardedSparseTensor:
     Stochastic subsampling
     ----------------------
     Set ``subsample_frac < 1.0`` at construction time to enable per-iteration
-    NNZ sampling on the multi-GPU path.  Call ``set_iter_seed(iteration)``
-    once at the start of each training loop iteration so seeds advance
-    deterministically.  The wrapper functions (``make_sharded_*``) require
-    no changes.
+    NNZ sampling on the multi-GPU path.  Each shard's NNZ arrays are shuffled
+    once at construction (seeded with ``subsample_seed + shard_k``); each
+    iteration then samples by taking a contiguous rotating window — zero
+    per-iteration index allocation and deterministic given
+    (subsample_seed, iteration).  Call ``set_iter_seed(iteration)`` once at
+    the start of each training loop iteration so the window advances.  The
+    wrapper functions (``make_sharded_*``) require no changes.
 
     Usage
     -----
@@ -1022,13 +1073,21 @@ class ShardedSparseTensor:
 
     def set_iter_seed(self, iteration: int) -> None:
         """
-        Advance the internal seed to *iteration*.
+        Record the current *iteration*, which selects this iteration's
+        subsample window on every shard.
 
-        Call this once at the top of each training loop iteration.  The seed
-        passed to shard k will be ``iteration * n_shards + k``, ensuring
-        distinct, reproducible samples per shard per iteration.
+        Call this once at the top of each training loop iteration.
+
+        CHANGED (Task 2): previously stored ``iteration * n_shards`` so each
+        shard could derive a distinct RNG seed (``+ k``).  Shards now carry
+        their own construction-time shuffle, so the raw iteration number is
+        all that's needed; per-shard windows are decorrelated by the per-shard
+        shuffle seeds, and the stride-by-n_sample window walk guarantees
+        epoch-like coverage of each shard (a stride of ``n_shards·n_sample``
+        could alias with the shard length and revisit the same window forever,
+        e.g. frac=0.5 with 2 shards).
         """
-        self._iter_seed = int(iteration) * self.n_shards
+        self._iter_seed = int(iteration)
         for did in self.device_ids:
             with cp.cuda.Device(did):
                 cp.get_default_memory_pool().free_all_blocks()
@@ -1041,6 +1100,7 @@ class ShardedSparseTensor:
         device_ids: Optional[List[int]] = None,
         subsample_frac: float = 1.0,
         masked: bool = False,
+        subsample_seed: int = 0,
     ) -> "ShardedSparseTensor":
         """
         Build a ``ShardedSparseTensor`` from an existing CuPy COO matrix.
@@ -1055,6 +1115,11 @@ class ShardedSparseTensor:
         device_ids     : CUDA ordinals; ``None`` → single-GPU fallback
         subsample_frac : NNZ fraction for stochastic updates (multi-GPU only)
         masked         : fit only observed entries (completion objective)
+        subsample_seed : base seed for the one-time per-shard NNZ shuffle that
+                         backs contiguous-window subsampling (shard k uses
+                         ``subsample_seed + k``); ignored at
+                         ``subsample_frac == 1.0``.  Typically
+                         ``cfg.exp.random_state``.
         """
         coo_coo = coo.tocoo()
 
@@ -1067,8 +1132,16 @@ class ShardedSparseTensor:
         n = len(device_ids)
         boundaries = [int(round(nnz * k / n)) for k in range(n + 1)]
 
+        # CHANGED (Task 2): shuffle each shard once at build time (host-side, free —
+        # the slices round-trip through the CPU anyway) so per-iteration subsampling
+        # is a contiguous window instead of a fresh device-side permutation(nnz).
+        # Exact runs (frac == 1.0) keep the original NNZ order.
+        _shuffle = subsample_frac < 1.0
         shards = [
-            _build_shard(coo_coo, boundaries[k], boundaries[k + 1], device_ids[k])
+            _build_shard(
+                coo_coo, boundaries[k], boundaries[k + 1], device_ids[k],
+                shuffle_seed=(int(subsample_seed) + k) if _shuffle else None,
+            )
             for k in range(n)
         ]
 

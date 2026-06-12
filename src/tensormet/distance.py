@@ -901,10 +901,6 @@ def kl_factor_update_largedim(
     if verbose:
         print(f"  Updating factor {mode}...")
 
-    if batch_cols is None:
-        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
-    # print("batch cols:", batch_cols)
-
     # new: avoid X buildup for large dimensions
     flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
     idxs = _unravel_flat_indices_C(flat, shape)
@@ -935,6 +931,15 @@ def kl_factor_update_largedim(
 
     # Reuse computations across repeated columns
     ucols, inv = cp.unique(cols, return_inverse=True)
+
+    # CHANGED (2026-06-12 review, Task 1): estimate AFTER all NNZ bookkeeping
+    # (flat, idxs, cols, ucols, inv) is live on the GPU, so the free-memory
+    # snapshot reflects the actual headroom for the per-batch temporaries.
+    # Previously estimated at the top of the function, which overestimated
+    # free VRAM by ~(N+3)*8*nnz bytes. Ported from the sharded path
+    # (sharded_sparse.py::_partial_numerator_for_shard).
+    if batch_cols is None:
+        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
 
     # Decode unique columns once per batch (general N-way unravel)
     other_modes = [m for m in range(len(shape)) if m != mode]
@@ -1021,10 +1026,6 @@ def kl_core_update_largedim(
     if verbose:
         print("  Updating core...")
 
-    if batch_rhat is None:
-        batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
-    if batch_num is None:
-        batch_num = _estimate_batch_num_for_outer(core, factors)
     shape = tuple(int(s) for s in shape)
     N = len(shape)
     if modes is None:
@@ -1049,6 +1050,15 @@ def kl_core_update_largedim(
     # --- Pass 1: compute w = x / r_hat in big batches, stash w (or stream into pass 2)
     # Stashing w costs nnz floats; if that's too big, you can stream (see note below).
     w_all = cp.empty_like(xvals)
+
+    # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
+    # (flat, idxs, Num/Den, w_all) is live so the free-memory snapshot is
+    # accurate. Previously estimated at the top of the function. Ported from
+    # the sharded path (sharded_sparse.py::_partial_core_num_for_shard).
+    if batch_rhat is None:
+        batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
+    if batch_num is None:
+        batch_num = _estimate_batch_num_for_outer(core, factors)
 
     rhat_batches = range(0, nnz, int(batch_rhat))
     if verbose:
@@ -1121,9 +1131,6 @@ def kl_compute_errors_largedim(
     if verbose:
         print("  Computing KL errors...")
 
-    if batch_rhat is None:
-        batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
-
     shape = tuple(int(s) for s in shape)
     N = len(shape)
 
@@ -1141,6 +1148,13 @@ def kl_compute_errors_largedim(
 
     # --- compute r_nz in batches (like your core update r_hat pass) ---
     r_nz = cp.empty_like(x_nz)
+
+    # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
+    # (flat, x_nz, idxs, r_nz) is live so the free-memory snapshot is accurate.
+    # Previously estimated at the top of the function.
+    if batch_rhat is None:
+        batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
+
     rhat_batches = range(0, nnz, int(batch_rhat))
     if verbose:
         rhat_batches = tqdm(rhat_batches, desc="  KL error r_hat pass", unit="batch", leave=False)
@@ -1206,8 +1220,6 @@ def fr_factor_update_largedim(
     if verbose:
         print(f"  Updating factor {mode}...")
 
-    if batch_cols is None:
-        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
     # new: avoid X buildup for large dimensions
     flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
     idxs = _unravel_flat_indices_C(flat, shape)
@@ -1237,6 +1249,15 @@ def fr_factor_update_largedim(
     numerator = cp.zeros_like(A)
 
     ucols, inv = cp.unique(cols, return_inverse=True)
+
+    # CHANGED (2026-06-12 review, Task 1): estimate AFTER all NNZ bookkeeping
+    # (flat, idxs, cols, ucols, inv) is live on the GPU so the free-memory
+    # snapshot reflects the actual headroom. Previously estimated at the top
+    # of the function. Ported from the sharded path
+    # (sharded_sparse.py::_partial_numerator_for_shard).
+    if batch_cols is None:
+        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
+
     other_modes = [m for m in range(len(shape)) if m != mode]
 
     col_batches = range(0, int(ucols.size), int(batch_cols))
@@ -1328,8 +1349,6 @@ def fr_core_update_largedim(
     if verbose:
         print("  Updating core...")
 
-    if batch_num is None:
-        batch_num = _estimate_batch_num_for_outer(core, factors)
     shape = tuple(int(s) for s in shape)
     N = len(shape)
 
@@ -1349,6 +1368,14 @@ def fr_core_update_largedim(
     # --- numerator: core-shaped accumulator, streamed over NNZ ---
     Num = cp.zeros_like(core)
     Den = cp.zeros_like(core) if masked else None
+
+    # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
+    # (flat, xvals, idxs, Num/Den) is live so the free-memory snapshot is
+    # accurate. Previously estimated at the top of the function. Ported from
+    # the sharded path (sharded_sparse.py::_partial_core_num_for_shard).
+    if batch_num is None:
+        batch_num = _estimate_batch_num_for_outer(core, factors)
+
     # small batches keep peak memory down (like your pass-2 accumulator)
     num_batches = range(0, nnz, int(batch_num))
     if verbose:
@@ -1405,8 +1432,6 @@ def fr_combined_core_errors_largedim(
     if verbose:
         print("  Updating core + computing Frobenius errors...")
 
-    if batch_num is None:
-        batch_num = _estimate_batch_num_for_outer(core, factors)
     shape = tuple(int(s) for s in shape)
     N = len(shape)
 
@@ -1427,6 +1452,13 @@ def fr_combined_core_errors_largedim(
     # Masked error accumulators (observed-only residual).
     residual_sq = cp.asarray(0.0, dtype=core.dtype)
     norm_X_sq = cp.asarray(0.0, dtype=core.dtype)
+
+    # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
+    # (flat, xvals, idxs, Num/Den_masked) is live so the free-memory snapshot
+    # is accurate. Previously estimated at the top of the function.
+    if batch_num is None:
+        batch_num = _estimate_batch_num_for_outer(core, factors)
+
     num_batches = range(0, nnz, int(batch_num))
     if verbose:
         num_batches = tqdm(num_batches, desc="  Core numerator pass", unit="batch", leave=False)
@@ -1502,8 +1534,6 @@ def fr_compute_errors_largedim(
     if verbose:
         print("  Computing Frobenius errors...")
 
-    if batch_rhat is None:
-        batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
     shape = tuple(int(s) for s in shape)
     N = len(shape)
 
@@ -1529,6 +1559,13 @@ def fr_compute_errors_largedim(
         return norm_Xhat / cp.maximum(norm_X, epsilon)
 
     idxs = _unravel_flat_indices_C(flat, shape)  # list of N arrays, each (nnz,)
+
+    # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
+    # (flat, x_nz, idxs) is live so the free-memory snapshot is accurate.
+    # Previously estimated at the top of the function (only triggered when the
+    # caller passed batch_rhat=None explicitly; the default is 1000).
+    if batch_rhat is None:
+        batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
 
     # --- compute xhat_nz in batches (same technique as KL error) ---
     inner_prod = cp.asarray(0.0, dtype=core.dtype)
