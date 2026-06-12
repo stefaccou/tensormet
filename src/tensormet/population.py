@@ -20,7 +20,7 @@ import hashlib, json
 _ALL_TENSORS = [
     "counting", "countingLog", "countingLogSoftPlus", "countingLogShifted",
     "sii", "siiSoftPlus", "siiShifted",
-    "sc",  "scSoftPlus",  "scShifted",
+    "sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat",
 ]
 
 
@@ -85,6 +85,53 @@ def _pass2_worker(
                     )
 
     return subset_counters  # Counter is picklable → returned to parent via pickle
+
+
+def _soft_knee_compress(
+    vals: torch.Tensor,
+    knee_quantile: float = 0.80,
+    scale: "float | None" = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Monotonic upper-tail compressor for flattening heavy right tails.
+
+    Values at or below the knee ``tau`` (a high quantile) pass through
+    unchanged; values above it are log-compressed, so only the extreme high
+    end is flattened while the bulk -- and the relative order of every entry --
+    is preserved. Output stays nonnegative for nonnegative input, and the
+    transform is C^1-continuous at the knee (slope 1 on both sides), so the
+    sorted distribution has no kink.
+
+        f(x) = x                              if x <= tau
+        f(x) = tau + s * log1p((x - tau) / s) if x >  tau
+
+    Args:
+        vals: 1-D tensor of (nonnegative) values, e.g. ``softplus(sc)``.
+        knee_quantile: quantile of ``vals`` used as the knee ``tau``.
+        scale: compression scale ``s``. Smaller ``s`` compresses harder. When
+            ``None``, defaults to the standard deviation of the sub-knee bulk
+            so the tail bends on the bulk's own scale.
+        eps: floor keeping ``scale`` strictly positive.
+
+    Returns:
+        Tensor of the same shape/dtype as ``vals``.
+    """
+    if vals.numel() == 0:
+        return vals
+    # kthvalue rather than torch.quantile: the latter caps its input at ~16M
+    # elements, but nnz here can be 50M+ (4-gram tensors).
+    n = vals.numel()
+    k = min(max(int(knee_quantile * (n - 1)) + 1, 1), n)
+    tau = torch.kthvalue(vals, k).values.to(vals.dtype)
+    if scale is None:
+        bulk = vals[vals <= tau]
+        ref = bulk if bulk.numel() > 1 else vals
+        scale = ref.std()
+    scale = torch.as_tensor(scale, dtype=vals.dtype, device=vals.device).clamp_min(eps)
+    out = vals.clone()
+    above = vals > tau
+    out[above] = tau + scale * torch.log1p((vals[above] - tau) / scale)
+    return out
 
 
 def _make_sparse_coo(idx: torch.Tensor, values: torch.Tensor, size: tuple):
@@ -317,7 +364,11 @@ def _shared_topk_hmean(counters: list[Counter], k: int, eps: float = 0.0,
     scored.sort(reverse=True)
     additional = [x for (_, __, x) in scored[:max(0, remaining_k)]]
 
-    return list(guaranteed) + additional
+    guaranteed_sorted = sorted(
+        guaranteed,
+        key=lambda x: (-sum(c.get(x, 0) for c in counters), x)
+    )
+    return guaranteed_sorted + additional
 
 
 
@@ -350,7 +401,7 @@ def populate_tensors_parquet(
     need_count     = "counting"    in want
     need_count_log = any(t in want for t in ("countingLog", "countingLogSoftPlus", "countingLogShifted"))
     need_sii       = any(t in want for t in ("sii", "siiSoftPlus", "siiShifted"))
-    need_sc        = any(t in want for t in ("sc",  "scSoftPlus",  "scShifted"))
+    need_sc        = any(t in want for t in ("sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat"))
 
     path_to_vectors = os.fspath(path_to_vectors)
     n_modes = len(cols_to_build)
@@ -794,9 +845,13 @@ def populate_tensors_parquet(
                     sc_shifted  = _make_sparse_coo(sc_tensor.indices(), vvals - vvals.min() + eps, size).coalesce()
                 if "scSoftPlus" in want:
                     sc_softplus = _make_sparse_coo(sc_tensor.indices(), torch.nn.functional.softplus(vvals), size).coalesce()
+                if "scSoftPlusFlat" in want:
+                    _sp = torch.nn.functional.softplus(vvals)
+                    sc_softplus_flat = _make_sparse_coo(sc_tensor.indices(), _soft_knee_compress(_sp), size).coalesce()
             else:
                 if "scShifted"  in want: sc_shifted  = sc_tensor
                 if "scSoftPlus" in want: sc_softplus = sc_tensor
+                if "scSoftPlusFlat" in want: sc_softplus_flat = sc_tensor
 
         vocab = {}
         for col in cols_to_build:
@@ -812,6 +867,7 @@ def populate_tensors_parquet(
             if "sii"         in want: torch.save(sii_tensor,       f"{p}/sii_{order}D_{dim_str}d{suffix}.pt")
             if "sc"          in want: torch.save(sc_tensor,        f"{p}/sc_{order}D_{dim_str}d{suffix}.pt")
             if "scSoftPlus"  in want: torch.save(sc_softplus,      f"{p}/scSoftPlus_{order}D_{dim_str}d{suffix}.pt")
+            if "scSoftPlusFlat" in want: torch.save(sc_softplus_flat, f"{p}/scSoftPlusFlat_{order}D_{dim_str}d{suffix}.pt")
             if "siiSoftPlus" in want: torch.save(sii_softplus,     f"{p}/siiSoftPlus_{order}D_{dim_str}d{suffix}.pt")
             if "scShifted"   in want: torch.save(sc_shifted,       f"{p}/scShifted_{order}D_{dim_str}d{suffix}.pt")
             if "siiShifted"  in want: torch.save(sii_shifted,      f"{p}/siiShifted_{order}D_{dim_str}d{suffix}.pt")
@@ -828,6 +884,7 @@ def populate_tensors_parquet(
             if "siiSoftPlus" in want: built["siiSoftPlus"] = sii_softplus
             if "siiShifted"  in want: built["siiShifted"]  = sii_shifted
             if "scSoftPlus"  in want: built["scSoftPlus"]  = sc_softplus
+            if "scSoftPlusFlat" in want: built["scSoftPlusFlat"] = sc_softplus_flat
             if "scShifted"   in want: built["scShifted"]   = sc_shifted
             results[variant] = (built, vocab)
 

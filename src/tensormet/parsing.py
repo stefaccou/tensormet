@@ -280,7 +280,6 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="Override the metric used for patience/diff, e.g. simlex_all_rho")
     parser.add_argument("--sem-softmax-temperature", type=float, dest="sem_softmax_temperature", default=None)
     parser.add_argument("--sem-fitness-target", type=int, dest="sem_fitness_target", default=None)
-    parser.add_argument("--n-sentence-cache", type=int, dest="n_sentence_cache", default=None)
     parser.add_argument("--remove-oov", type=_parse_bool, dest="remove_OOV", default=None)
     parser.add_argument("--time-iteration", type=_parse_bool, dest="time_iteration", default=None)
     parser.add_argument("--save-intermediate", type=_parse_bool, dest="save_intermediate", default=None)
@@ -348,7 +347,6 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "sem_primary_key",
         "sem_softmax_temperature",
         "sem_fitness_target",
-        "n_sentence_cache",
         "remove_OOV",
         "time_iteration",
         "save_intermediate",
@@ -558,7 +556,7 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
                              "Tokens absent from all marginals are silently skipped.")
     parser.add_argument("--tensors-to-build", type=_parse_cols_to_build, dest="tensors_to_build", default=None,
                         help="Comma-separated list of tensor names to build. Omit to build all. "
-                             "Valid: counting,countingLog,sii,siiSoftPlus,siiShifted,sc,scSoftPlus,scShifted. "
+                             "Valid: counting,countingLog,sii,siiSoftPlus,siiShifted,sc,scSoftPlus,scShifted,scSoftPlusFlat. "
                              "E.g. --tensors-to-build counting,countingLog,sc")
 
     parsed = parser.parse_args(args=argv)

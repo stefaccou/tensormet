@@ -7,6 +7,11 @@ import json
 import re
 import os
 from tensormet.utils import DATA_DIR, shared_factor_suffix, nontrivial_linked_groups, dim_spec_str
+from tensormet.naming import (
+    model_filename as _model_filename,
+    candidate_stems as _candidate_stems,
+    vocab_filename as _vocab_filename,
+)
 
 
 def _as_dim_tuple(dim) -> tuple:
@@ -142,13 +147,13 @@ class RunConfig:
 
     def model_filename(self) -> str:
         # deterministic + readable
-        r0 = self.exp.rank[0] if len(self.exp.rank) else "r"
-        prefix = f"{self.exp.name}_" if self.exp.name else ""
-        linked_nontrivial = nontrivial_linked_groups(self.exp.shared_factors, num_factors=self.exp.order)
-        sf_suffix = shared_factor_suffix(linked_nontrivial)
-        ss_suffix = f"_{str(self.exp.subsample_frac).replace('.', 'p')}ss" if self.exp.subsample_frac != 1.0 else ""
-        return (f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_"
-                f"{dim_spec_str(self.exp.dim)}d{sf_suffix}_{r0}r{ss_suffix}_{self.train.n_iter_max}i.pt")
+        return _model_filename(
+            self.exp.divergence, self.exp.method, self.exp.order,
+            self.exp.dim, self.exp.rank, self.train.n_iter_max,
+            name=self.exp.name,
+            shared_factors=self.exp.shared_factors,
+            subsample_frac=self.exp.subsample_frac,
+        )
 
     def model_path(self) -> Path:
         return self.output_dir() / self.model_filename()
@@ -200,28 +205,24 @@ class RunConfig:
 
         # 1. Build wildcard patterns for the base name.
         # Try new naming first (includes {order}D_), then fall back to legacy (no order prefix).
-        r0 = self.exp.rank[0] if len(self.exp.rank) else "r"
-        prefix = f"{self.exp.name}_" if self.exp.name else ""
-        linked_nontrivial = nontrivial_linked_groups(self.exp.shared_factors, num_factors=self.exp.order)
-        sf_suffix = shared_factor_suffix(linked_nontrivial)
-        ss_suffix = f"_{str(self.exp.subsample_frac).replace('.', 'p')}ss" if self.exp.subsample_frac != 1.0 else ""
-        _ds = dim_spec_str(self.exp.dim)
-        new_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{_ds}d{sf_suffix}_{r0}r{ss_suffix}_"
-        legacy_pattern = f"{prefix}{self.exp.divergence}_{self.exp.method}_{_ds}d_{r0}r_"
+        stems = _candidate_stems(
+            self.exp.divergence, self.exp.method, self.exp.order,
+            self.exp.dim, self.exp.rank,
+            name=self.exp.name,
+            shared_factors=self.exp.shared_factors,
+            subsample_frac=self.exp.subsample_frac,
+        )
 
-        # Pattern without shared-factor suffix, for legacy fallback when sf_suffix is set
-        new_pattern_no_sf = f"{prefix}{self.exp.divergence}_{self.exp.method}_{self.exp.order}D_{_ds}d_{r0}r{ss_suffix}_"
-
-        # Find all JSON config files: new (with sf_suffix) → new (without sf_suffix) → legacy
-        candidate_configs = list(out_dir.glob(f"{new_pattern}*i_config.json"))
-        if not candidate_configs and sf_suffix:
-            candidate_configs = list(out_dir.glob(f"{new_pattern_no_sf}*i_config.json"))
+        # Find all JSON config files: new (with sf) → new (without sf) → legacy
+        candidate_configs = []
+        for stem in stems:
+            candidate_configs = list(out_dir.glob(f"{stem}*i_config.json"))
             if candidate_configs:
-                print(f"No shared-factor checkpoints found; falling back to non-shared naming.")
-        if not candidate_configs:
-            candidate_configs = list(out_dir.glob(f"{legacy_pattern}*i_config.json"))
-            if candidate_configs:
-                print(f"No new-style ({self.exp.order}D) checkpoints found; falling back to legacy naming.")
+                if stem == stems[-1] and len(stems) > 1:
+                    print(f"No new-style ({self.exp.order}D) checkpoints found; falling back to legacy naming.")
+                elif stem != stems[0]:
+                    print(f"No shared-factor checkpoints found; falling back to non-shared naming.")
+                break
 
         best_candidate_paths = paths
         latest_iter = -1
@@ -413,9 +414,8 @@ class InspectionConfig:
 
     @property
     def vocab_path(self):
-        sf = shared_factor_suffix(nontrivial_linked_groups(self._norm_sf(), self.order))
         return (DATA_DIR / "tensors" / self.dataset /
-              f"vocabularies/{self.order}D_{dim_spec_str(self._norm_dim())}d{sf}.pkl")
+                "vocabularies" / _vocab_filename(self.order, self._norm_dim(), shared_factors=self._norm_sf()))
 
     def load_tucker(self, map_location="cpu", tier1=False):
         from tensormet.tucker_tensor import TuckerDecomposition

@@ -1,10 +1,12 @@
 from __future__ import annotations
 import tensorly as tl
-import pytensorlab as ptl
 import numpy as np
 from typing import List, Tuple, Optional, Union
 import math
-from tensormet.utils import einsum_letters, cp_einsum_optimize, make_lazy_cupy_pair
+from tensormet.utils import einsum_letters, cp_einsum_optimize, make_lazy_cupy_pair, lazy_import
+
+# pytensorlab transitively imports TensorFlow + VTK (~200s); defer it until used.
+ptl = lazy_import("pytensorlab")
 cp, cpx_sparse = make_lazy_cupy_pair()
 
 # -------------------------------------------------------------------

@@ -37,6 +37,13 @@ from tensormet.utils import (DATA_DIR,
                             resolve_checkpoint_path,
                    )
 from tensormet.sparse_ops import initialize_nonnegative_tucker
+from tensormet.naming import (
+    candidate_stems,
+    vocab_filename as _vocab_filename,
+    vocab_filename_legacy as _vocab_filename_legacy,
+    populated_filename,
+    populated_filename_legacy,
+)
 from tensormet.similarity import evaluate_sample, get_eval_num_threads, load_simlex, evaluate_simlex
 from tensormet.routing import get_update_routing_step, get_log_step, UpdateRouting
 from tensormet.distance import null_compute_errors
@@ -155,7 +162,7 @@ class TuckerDecomposition:
         """
         if method not in {"counting", "sc", "sii",
                           "countingLog", "countingLogSoftPlus", "countingLogShifted",
-                          "scSoftPlus", "scShifted",
+                          "scSoftPlus", "scShifted", "scSoftPlusFlat",
                           "siiSoftPlus", "siiShifted"}:
             raise ValueError("method must be one of {'counting','sc','sii'}")
         base = os.path.join(DATA_DIR, "tensors", dataset)
@@ -183,9 +190,9 @@ class TuckerDecomposition:
         # Handle the new {order}D_ naming format vs legacy naming.
         # New format (post N-D migration): {order}D_{dims}d{suffix}.pkl
         # Legacy format (3D only):         {dims}{suffix}.pkl
-        _ds = dim_spec_str(dims)
-        vocab_path_new = os.path.join(base, f"vocabularies/{order}D_{_ds}d{suffix}.pkl")
-        vocab_path_old = os.path.join(base, f"vocabularies/{_ds}{suffix}.pkl")
+        _vdir = os.path.join(base, "vocabularies")
+        vocab_path_new = os.path.join(_vdir, _vocab_filename(order, dims, shared_factors=parsed_shared))
+        vocab_path_old = os.path.join(_vdir, _vocab_filename_legacy(dims, shared_factors=parsed_shared))
 
         if os.path.exists(vocab_path_new):
             vocab_path = vocab_path_new
@@ -194,18 +201,15 @@ class TuckerDecomposition:
         else:
             raise FileNotFoundError(f"Missing vocab file. Checked {vocab_path_new} and {vocab_path_old}")
 
-
-
         decomp_path = os.path.join(base, "decomposition")
         # Construct candidate prefixes: new naming first, legacy fallback.
-        # New format: {name}{div}_{method}_{order}D_{dims}d{sf_suffix}_{rank}r_
-        # Legacy format (3D only): {name}{div}_{method}_{dims}d_{rank}r_
-        name_prefix = f"{name + '_' if name else ''}"
-        ss_suffix = f"_{str(subsample_frac).replace('.', 'p')}ss" if subsample_frac != 1.0 else ""
-
-        new_file_prefix      = f"{name_prefix}{divergence}_{method}_{order}D_{_ds}d{suffix}_{rank}r{ss_suffix}_"
-        new_file_prefix_no_sf = f"{name_prefix}{divergence}_{method}_{order}D_{_ds}d_{rank}r{ss_suffix}_"
-        legacy_file_prefix   = f"{name_prefix}{divergence}_{method}_{_ds}d_{rank}r_"
+        stems = candidate_stems(
+            divergence, method, order, dims, rank,
+            name=name, shared_factors=parsed_shared, subsample_frac=subsample_frac,
+        )
+        new_file_prefix      = stems[0]
+        new_file_prefix_no_sf = stems[1] if len(stems) > 2 else stems[0]
+        legacy_file_prefix   = stems[-1]
 
         def _find_highest_iter(decomp_dir: str, prefix: str) -> int:
             highest = -1
@@ -275,18 +279,17 @@ class TuckerDecomposition:
 
         # --- 4. Load Factors & Return ---
         (core, factors) = torch_or_pickle_load(decomp_path, map_location=map_location)
-        # if there is a "runs.jsonl" file in the decomposition folder, we print the content relevant to the loaded tensor
-        runs_path = os.path.join(decomp_path, "runs.jsonl")
+        # if there is a "runs.jsonl" file in the decomposition folder, print the record for this tensor
+        runs_path = os.path.join(os.path.dirname(decomp_path), "runs.jsonl")
         if os.path.exists(runs_path):
             with open(runs_path, "r") as f:
                 for line in f:
                     run_info = json.loads(line)
-                    if "output_tensor" in run_info.keys():
-                        if run_info["output_tensor"] == tensor_name:
-                            print("Loaded Tucker decomposition with the following parameters:")
-                            for key, value in run_info.items():
-                                print(f"  {key}: {value}")
-                            break
+                    if run_info.get("results", {}).get("model_path") == decomp_path:
+                        print("Loaded Tucker decomposition with the following parameters:")
+                        for key, value in run_info.items():
+                            print(f"  {key}: {value}")
+                        break
 
         else:
             print("Warning: file creation predates logging of runs; no run info available.")
@@ -915,12 +918,34 @@ def torch_sparse_to_cupy(
 class SparseTupleTensor:
     """Encapsulating the Sparse TupleTensor (built from vectors extracted from corpus) and the vocabulary,
     providing methods for decomposition, refactoring, etc.."""
-    def __init__(self, tensor, device="cpu", sparsity_type=None, shared_factors=None):
+    def __init__(self, tensor, device="cpu", sparsity_type=None, shared_factors=None, vocab=None):
         self.tensor = tensor
         self.sparsity_type = sparsity_type
         self.shape = tensor.shape
         self.device = device
         self.shared_factors = shared_factors
+        self.vocab = vocab
+
+    def link_vocab(self, vocab):
+        """Link a vocabulary to this tensor. Accepts a vocab dict or a path to a .pkl file."""
+        if isinstance(vocab, (str, Path)):
+            with open(vocab, "rb") as f:
+                vocab = pickle.load(f)
+        if not isinstance(vocab, dict):
+            raise TypeError(f"vocab must be a dict or a path to a .pkl file, got {type(vocab)}")
+        self.vocab = vocab
+
+    def _require_vocab(self):
+        if self.vocab is None:
+            raise RuntimeError(
+                "No vocabulary linked. Pass add_vocab=True to load_from_disk, "
+                "or call link_vocab() with a vocab dict or a path to a .pkl file."
+            )
+
+    @property
+    def roles(self):
+        self._require_vocab()
+        return [k[len("vocab_"):] for k in self.vocab if k.startswith("vocab_")]
 
     # --- Construction and loading ---
     @classmethod
@@ -933,6 +958,7 @@ class SparseTupleTensor:
             map_location: str = "cpu",
             tier1: bool = False,
             shared_factors: Optional[Union[Tuple[Tuple[int, int], ...], str]] = None,
+            add_vocab: bool = False,
     ) -> "SparseTupleTensor":
         """
         Load a populated sparse tensor from disk.
@@ -940,18 +966,21 @@ class SparseTupleTensor:
         Expects population artifacts saved as:
             tensors/{dataset}/populated/{method}_{dims}{suffix}.pt
         where suffix matches the shared-factor naming convention.
+
+        If add_vocab=True, automatically loads the matching vocabulary file
+        (derived from order, dims, shared_factors — same as TuckerDecomposition).
         """
         if method not in {
             "counting", "sc", "sii",
             "countingLog", "countingLogSoftPlus", "countingLogShifted",
             "siiSoftPlus", "siiShifted",
-            "scSoftPlus", "scShifted",
+            "scSoftPlus", "scShifted", "scSoftPlusFlat",
         }:
             raise ValueError(
                 "method must be one of "
                 "{'counting','sc','sii', \n"
                 "'countingLog', 'countingLogSoftPlus', 'countingLogShifted'\n"
-                "'siiSoftPlus','siiShifted','scSoftPlus','scShifted'}"
+                "'siiSoftPlus','siiShifted','scSoftPlus','scShifted','scSoftPlusFlat'}"
             )
 
         base = os.path.join(DATA_DIR, "tensors", dataset)
@@ -962,22 +991,39 @@ class SparseTupleTensor:
 
         linked_nontrivial = nontrivial_linked_groups(shared_factors, num_factors=order)
         suffix = shared_factor_suffix(linked_nontrivial)
-        _ds = dim_spec_str(dims)
-        populated_path = os.path.join(base, "populated", f"{method}_{order}D_{_ds}d{suffix}.pt")
+        populated_path = os.path.join(base, "populated", populated_filename(method, order, dims, shared_factors=shared_factors))
 
         if not os.path.exists(populated_path):
             if order == 3: # legacy naming support
-                populated_path = os.path.join(base, "populated", f"{method}_{_ds}{suffix}.pt")
+                populated_path = os.path.join(base, "populated", populated_filename_legacy(method, dims, shared_factors=shared_factors))
             else:
                 raise FileNotFoundError(f"Missing populated tensor file: {populated_path}")
 
         tensor = torch_or_pickle_load(populated_path, map_location=map_location)
+
+        vocab = None
+        if add_vocab:
+            _vdir = os.path.join(base, "vocabularies")
+            vocab_path_new = os.path.join(_vdir, _vocab_filename(order, dims, shared_factors=shared_factors))
+            vocab_path_old = os.path.join(_vdir, _vocab_filename_legacy(dims, shared_factors=shared_factors, order=order))
+            if os.path.exists(vocab_path_new):
+                vocab_path = vocab_path_new
+            elif os.path.exists(vocab_path_old):
+                vocab_path = vocab_path_old
+            else:
+                raise FileNotFoundError(
+                    f"add_vocab=True but no vocab file found. "
+                    f"Checked:\n  {vocab_path_new}\n  {vocab_path_old}"
+                )
+            with open(vocab_path, "rb") as f:
+                vocab = pickle.load(f)
 
         return cls(
             tensor,
             device=map_location,
             sparsity_type="torch",
             shared_factors=shared_factors,
+            vocab=vocab,
         )
 
 
@@ -1095,6 +1141,109 @@ class SparseTupleTensor:
         else:
             memory_size = self.tensor.nbytes
         print(f"approx. memory size: {memory_size / (1024**2):.2f} MB")
+
+    # --- Vocabulary inspection methods ---
+
+    def vocab_size(self, role=None):
+        """Return vocab size per role as a {role: int} dict, or for a single role as int."""
+        self._require_vocab()
+        if role is not None:
+            return len(self.vocab[f"vocab_{role}"])
+        return {r: len(self.vocab[f"vocab_{r}"]) for r in self.roles}
+
+    def vocab_for(self, role):
+        """Return the word list (index → word) for a role."""
+        self._require_vocab()
+        return self.vocab[f"vocab_{role}"]
+
+    def word_index(self, word, role):
+        """Return the tensor index for a word in a given role."""
+        self._require_vocab()
+        return self.vocab[f"{role}2i"][word]
+
+    def index_word(self, idx, role):
+        """Return the word for a tensor index in a given role."""
+        self._require_vocab()
+        return self.vocab[f"vocab_{role}"][idx]
+
+    def decode_entry(self, indices):
+        """Decode a raw COO index tuple to a word tuple."""
+        self._require_vocab()
+        roles = self.roles
+        return tuple(self.index_word(int(idx), roles[i]) for i, idx in enumerate(indices))
+
+    def top_entries(self, k=10, largest=True):
+        """Return the top-k entries by value as (word_tuple, value) pairs."""
+        self._require_vocab()
+        if not (isinstance(self.tensor, (torch.Tensor, SparseCOOTensor)) and self.tensor.is_sparse):
+            raise TypeError("top_entries requires a torch sparse tensor.")
+        t = self.tensor.coalesce()
+        values = t.values()
+        indices = t.indices()
+        actual_k = min(k, values.numel())
+        if actual_k == 0:
+            return []
+        top_vals, top_pos = torch.topk(values, actual_k, largest=largest)
+        return [
+            (self.decode_entry(tuple(indices[:, pos].tolist())), top_vals[i].item())
+            for i, pos in enumerate(top_pos)
+        ]
+
+    def entries_for(self, word, role, k=None):
+        """Return tensor entries involving word in the given role as (word_tuple, value) pairs.
+
+        If k is given, returns the top-k by value instead of all entries.
+        """
+        self._require_vocab()
+        if not (isinstance(self.tensor, (torch.Tensor, SparseCOOTensor)) and self.tensor.is_sparse):
+            raise TypeError("entries_for requires a torch sparse tensor.")
+        word_idx = self.word_index(word, role)
+        role_dim = self.roles.index(role)
+        t = self.tensor.coalesce()
+        indices = t.indices()
+        values = t.values()
+        mask = indices[role_dim] == word_idx
+        if not mask.any():
+            return []
+        matched_indices = indices[:, mask]
+        matched_values = values[mask]
+        if k is not None:
+            top_vals, top_pos = torch.topk(matched_values, min(k, matched_values.numel()))
+            matched_indices = matched_indices[:, top_pos]
+            matched_values = top_vals
+        return [
+            (self.decode_entry(tuple(matched_indices[:, i].tolist())), matched_values[i].item())
+            for i in range(matched_indices.shape[1])
+        ]
+
+    def marginal_weight(self, word, role):
+        """Return the sum of all tensor values for entries involving word in the given role."""
+        self._require_vocab()
+        if not (isinstance(self.tensor, (torch.Tensor, SparseCOOTensor)) and self.tensor.is_sparse):
+            raise TypeError("marginal_weight requires a torch sparse tensor.")
+        word_idx = self.word_index(word, role)
+        role_dim = self.roles.index(role)
+        t = self.tensor.coalesce()
+        indices = t.indices()
+        values = t.values()
+        mask = indices[role_dim] == word_idx
+        return values[mask].sum().item() if mask.any() else 0.0
+
+    def top_words_by_marginal(self, role, k=10):
+        """Return top-k words by marginal weight (sum of values across all co-occurrences)."""
+        self._require_vocab()
+        if not (isinstance(self.tensor, (torch.Tensor, SparseCOOTensor)) and self.tensor.is_sparse):
+            raise TypeError("top_words_by_marginal requires a torch sparse tensor.")
+        role_dim = self.roles.index(role)
+        vocab_list = self.vocab_for(role)
+        t = self.tensor.coalesce()
+        indices = t.indices()
+        values = t.values()
+        marginals = torch.zeros(len(vocab_list), dtype=values.dtype)
+        marginals.scatter_add_(0, indices[role_dim].to(torch.long), values)
+        actual_k = min(k, len(vocab_list))
+        top_vals, top_idxs = torch.topk(marginals, actual_k)
+        return [(vocab_list[idx.item()], top_vals[i].item()) for i, idx in enumerate(top_idxs)]
 
     def estimate_training_time(self,
                                rank=100,
@@ -1483,70 +1632,76 @@ class SparseTupleTensor:
 
                 fitness_scores.append(sem_out)
                 # Primary value used for early stopping / diff
+                _sem_value_available = True
                 if isinstance(sem_out, dict):
                     if sem_primary_key not in sem_out:
                         if sem_primary_key.startswith("simlex_") and simlex_pairs is not None:
                             print(f"Warning: '{sem_primary_key}' not available (all SimLex pairs OOV?); skipping sem check.")
-                            continue
-                        raise KeyError(f"Primary semantic key '{sem_primary_key}' missing from returned scores.")
-                    sem_value = float(sem_out[sem_primary_key])
-                    sem_all_dump = json.dumps(sem_out)
-                else:
-                    sem_value = float(sem_out)
-                    sem_all_dump = str(sem_out)
+                            _sem_value_available = False
+                        else:
+                            raise KeyError(f"Primary semantic key '{sem_primary_key}' missing from returned scores.")
 
-                _rec_err_log = rec_errors[-1] if rec_errors else None
-                print(
-                    f"Iteration {iteration + 1}\t"
-                    f"Rec_error: {_rec_err_log}\t"
-                    f"Sem({sem_primary_key}): {sem_value}\t"
-                    f"Sem_all: {sem_all_dump}"
-                )
+                if _sem_value_available:
+                    if isinstance(sem_out, dict):
+                        sem_value = float(sem_out[sem_primary_key])
+                        sem_all_dump = json.dumps(sem_out)
+                    else:
+                        sem_value = float(sem_out)
+                        sem_all_dump = str(sem_out)
+
+                    _rec_err_log = rec_errors[-1] if rec_errors else None
+                    print(
+                        f"Iteration {iteration + 1}\t"
+                        f"Rec_error: {_rec_err_log}\t"
+                        f"Sem({sem_primary_key}): {sem_value}\t"
+                        f"Sem_all: {sem_all_dump}"
+                    )
 
                 tl.set_backend("cupy")
 
-                # track best semantic model (based on primary key)
-                diff = sem_value - float(best_sem_score)
-                if diff > 0:
-                    best_sem_score = sem_value
-                    best_core = core.copy()
-                    best_factors = [factor.copy() for factor in factors]
-                    best_sem_iteration = iteration
-                    if verbose:
-                        print("New best semantic score; saving current best core and factors.")
-                    if save_intermediate:
-
-                        temp_tensor = TuckerTensor((best_core, best_factors))
-                        torch.save(temp_tensor, paths["model"])
-                        print("saving temp model to", paths["model"])
-
-                        np.save(paths["errors"], np.array([cp.asnumpy(e) for e in rec_errors]))
-
-                        # Save semantic scores more robustly
-                        if isinstance(sem_out, dict):
-                            # save as JSON alongside the provided fitness path
-                            with open(paths["fitness_json"], "w") as f:
-                                json.dump(fitness_scores, f, indent=2)
-                        else:
-                            np.save(paths["fitness"], np.array(fitness_scores, dtype=float))
-
-                # semantic patience (uses primary key only)
-                if diff < tol:
-                    sem_no_rec_improve_steps += 1
-                    if verbose:
-                        print(f"\tNo semantic improvement: {sem_no_rec_improve_steps}/{patience} (Δ={diff:.3e})")
-                    if sem_no_rec_improve_steps >= patience:
+                if _sem_value_available:
+                    # track best semantic model (based on primary key)
+                    diff = sem_value - float(best_sem_score)
+                    if diff > 0:
+                        best_sem_score = sem_value
+                        best_core = core.copy()
+                        best_factors = [factor.copy() for factor in factors]
+                        best_sem_iteration = iteration
                         if verbose:
-                            notify_discord(
-                                f"Stopped after {sem_no_rec_improve_steps} non-improving semantic steps "
-                                f"(patience={patience}). Converged at iteration {iteration}.",
-                                job_finished=False,
-                            )
-                        break
-                else:
-                    if sem_no_rec_improve_steps:
-                        print(f"\tSemantic improvement (Δ={diff:.3e}); resetting patience counter.")
-                    sem_no_rec_improve_steps = 0
+                            print("New best semantic score; saving current best core and factors.")
+                        if save_intermediate:
+
+                            temp_tensor = TuckerTensor((best_core, best_factors))
+                            torch.save(temp_tensor, paths["model"])
+                            print("saving temp model to", paths["model"])
+
+                            np.save(paths["errors"], np.array([cp.asnumpy(e) for e in rec_errors]))
+
+                            # Save semantic scores more robustly
+                            if isinstance(sem_out, dict):
+                                # save as JSON alongside the provided fitness path
+                                with open(paths["fitness_json"], "w") as f:
+                                    json.dump(fitness_scores, f, indent=2)
+                            else:
+                                np.save(paths["fitness"], np.array(fitness_scores, dtype=float))
+
+                    # semantic patience (uses primary key only)
+                    if diff < tol:
+                        sem_no_rec_improve_steps += 1
+                        if verbose:
+                            print(f"\tNo semantic improvement: {sem_no_rec_improve_steps}/{patience} (Δ={diff:.3e})")
+                        if sem_no_rec_improve_steps >= patience:
+                            if verbose:
+                                notify_discord(
+                                    f"Stopped after {sem_no_rec_improve_steps} non-improving semantic steps "
+                                    f"(patience={patience}). Converged at iteration {iteration}.",
+                                    job_finished=False,
+                                )
+                            break
+                    else:
+                        if sem_no_rec_improve_steps:
+                            print(f"\tSemantic improvement (Δ={diff:.3e}); resetting patience counter.")
+                        sem_no_rec_improve_steps = 0
 
             if checkpoint_saving: # only trigger if this is not 0 -> True
                 if (iteration + 1) % cfg.train.checkpoint_saving_steps == 0:

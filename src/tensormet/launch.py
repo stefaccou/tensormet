@@ -12,6 +12,7 @@ from tensormet.utils import (select_gpu,
                              linked_factor_groups,
                              dim_spec_str,
                              )
+from tensormet.naming import vocab_filename, vocab_filename_legacy
 import os
 import sys
 import pickle
@@ -219,18 +220,11 @@ def launch_nnt_decomposition(cfg):
 
     # we load the sample sentences only once
 
-    # Calculate suffix using the exact same logic as population.py
-    linked_groups = linked_factor_groups(cfg.exp.order, cfg.exp.shared_factors)
-    linked_nontrivial = [group for group in linked_groups if len(group) > 1]
-    suffix = shared_factor_suffix(linked_nontrivial)
-
-    # Note the added {cfg.exp.order}D_ to match what population.py writes
-    _ds = dim_spec_str(cfg.exp.dim)
+    # Vocabulary path — try new naming first, fall back to legacy (no order prefix)
+    _vdir = os.path.join(DATA_DIR, "tensors", cfg.exp.dataset, "vocabularies")
     vocab_path = os.path.join(
-        DATA_DIR,
-        "tensors",
-        cfg.exp.dataset,
-        f"vocabularies/{cfg.exp.order}D_{_ds}d{suffix}.pkl"
+        _vdir,
+        vocab_filename(cfg.exp.order, cfg.exp.dim, shared_factors=cfg.exp.shared_factors),
     )
     try:
         with open(vocab_path, "rb") as f:
@@ -241,10 +235,8 @@ def launch_nnt_decomposition(cfg):
     except FileNotFoundError:
         # print(vocab_path, "not found")
         vocab_path = os.path.join(
-            DATA_DIR,
-            "tensors",
-            cfg.exp.dataset,
-            f"vocabularies/{_ds}{suffix}.pkl"
+            _vdir,
+            vocab_filename_legacy(cfg.exp.dim, shared_factors=cfg.exp.shared_factors),
         )
         with open(vocab_path, "rb") as f:
             vocab = pickle.load(f)
@@ -290,7 +282,7 @@ def launch_nnt_decomposition(cfg):
     # If model already exists, skip (optional but recommended)
     if paths["model"].exists() and not cfg.train.overwrite and not cfg.train.resume:
         print(f"Decomposition already exists at {paths['model']}, skipping...")
-        sys.exit(0)
+        return None
 
 
     # Save config snapshot (single JSON)
@@ -359,7 +351,7 @@ def launch_nnt_decomposition(cfg):
             "cfg": asdict(cfg),
             "results": {
                 "iterations": int(tucker_decomp_info["iterations"]),
-                "final_error": float(tucker_decomp_info["final_error"]),
+                "final_error": float(tucker_decomp_info["final_error"]) if tucker_decomp_info["final_error"] is not None else None,
                 "final_fitness": final_fitness,
                 "final_fitness_full": final_fitness_full,
                 "runtime_seconds": round(end_time - start_time, 2),
@@ -370,7 +362,7 @@ def launch_nnt_decomposition(cfg):
             },
         },
     )
-    if not "bench" in cfg.exp.name:
+    if not (cfg.exp.name and "bench" in cfg.exp.name):
         notify_discord(
             f"Saved Tucker decomposition {cfg.exp.method} - {cfg.exp.dim}/{cfg.exp.rank[0]} to {paths['model']}"
             f" in {end_time - start_time:.2f} seconds."

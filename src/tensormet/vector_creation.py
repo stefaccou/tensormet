@@ -300,12 +300,16 @@ def create_vectors_parquet_sharded(
     except KeyboardInterrupt:
         pass
     finally:
-        wrote = flush_parquet(writer, buffer)
-        vector_count += wrote
-        part_rows += wrote
-        buffer.clear()
+        if buffer:
+            if writer is None:
+                writer = _open_part_writer(output_dir, part_id)
+            wrote = flush_parquet(writer, buffer)
+            vector_count += wrote
+            part_rows += wrote
+            buffer.clear()
 
-        writer.close()
+        if writer is not None:
+            writer.close()
         save_meta()
         docs = None
         gc.collect()
@@ -518,12 +522,15 @@ def create_frame_vectors_parquet_sharded(
     except KeyboardInterrupt:
         print("\nGracefully interrupting and flushing buffer...")
     finally:
-        wrote = flush_parquet(writer, buffer, SCHEMA=FRAME_SCHEMA)
-        vector_count += wrote
-        part_rows += wrote
-        buffer.clear()
+        if buffer:
+            if writer is None:
+                writer = _open_part_writer(output_dir, part_id, SCHEMA=FRAME_SCHEMA)
+            wrote = flush_parquet(writer, buffer, SCHEMA=FRAME_SCHEMA)
+            vector_count += wrote
+            part_rows += wrote
+            buffer.clear()
 
-        if writer:
+        if writer is not None:
             writer.close()
         save_meta()
         gc.collect()

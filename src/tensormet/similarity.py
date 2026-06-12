@@ -32,7 +32,7 @@ def get_eval_num_threads(fraction: float = 0.75, min_threads: int = 1) -> int:
 def load_og_sentences(vector_path, save=False, order=3):
     sentences = set()
     # vector path is a csv file
-    pickle_path = vector_path[:-3] + ".pkl"
+    pickle_path = vector_path[:-3] + "pkl"  # strip "csv", append "pkl"
     if os.path.exists(pickle_path):
         print("loading pickled version")
         with open(pickle_path, "rb") as f:
@@ -48,10 +48,10 @@ def load_og_sentences(vector_path, save=False, order=3):
             # vector = eval(vector)
             # v, s, o = vector[0], vector[1], vector[2]
             # sentences.add((v, s, o))
-            vector = eval(vector)
+            vector = ast.literal_eval(vector)
             sentences.add(tuple(vector[:order]))
     if save:
-        with open(vector_path, "wb") as f:
+        with open(pickle_path, "wb") as f:
             pickle.dump(sentences, f)
 
     return list(sentences)

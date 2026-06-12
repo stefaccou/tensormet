@@ -8,7 +8,6 @@ import numpy as np
 # import cupyx.scipy.sparse as cpx_sparse
 
 import tensorly as tl
-import pytensorlab as ptl
 
 from tensorly.base import unfold
 from tensorly.tucker_tensor import tucker_to_tensor
@@ -22,9 +21,12 @@ from tensormet.sparse_ops import (
     safe_ravel,
     compute_Zcols_batch
 )
-from tensormet.utils import ThreadBudget, einsum_letters, cp_einsum_optimize, make_lazy_cupy_pair
+from tensormet.utils import ThreadBudget, einsum_letters, cp_einsum_optimize, make_lazy_cupy_pair, lazy_import
 
 cp, cpx_sparse = make_lazy_cupy_pair()
+
+# pytensorlab transitively imports TensorFlow + VTK (~200s); defer it until used.
+ptl = lazy_import("pytensorlab")
 
 # -- Kullback-Leibler Divergence --
 
@@ -808,11 +810,24 @@ def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.7, temp_mult=4.0)
     return max(1, int(b))
 
 
-def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.8, temp_mult=4.0):
+def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.8, temp_mult=4.0,
+                               masked=False, workspace_reserve=512 * 1024**2):
     """
     Estimate safe batch size for compute_Zcols_batch.
     Uses pure Python math to avoid numpy 32-bit overflows and sets a hard cap.
     temp_mult has to be sufficiently high: 2 massively undershot the temp need
+
+    masked : bool
+        The masked/completion objective builds a *second* CSR (S_den) and runs a
+        second SpMM per batch (denominator += S_den @ Z_rows, see
+        _partial_numerator_for_shard), roughly doubling the per-batch sparse
+        working set. The default (numerator-only) budget under-counts this, which
+        let masked runs overshoot VRAM — the cuBLAS workspace cudaMalloc (done
+        outside CuPy's pool) then failed as CUBLAS_STATUS_NOT_INITIALIZED. When
+        masked=True the per-batch cost is inflated accordingly.
+    workspace_reserve : int
+        Bytes held back from the free-memory budget for out-of-pool allocations
+        (cuBLAS/cuSPARSE handle workspaces) so they always have room.
     """
     N = core.ndim
     R = [int(factors[n].shape[1]) for n in range(N)]
@@ -829,8 +844,13 @@ def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.8, temp_mult=4.0):
     # Element-wise operations allocate full temporary copies, so we need a multiplier of ~3.0
     tmp_bytes_per_b = remaining_R_prod * itemsize
     bytes_per_b = int(math.ceil(tmp_bytes_per_b * temp_mult))
+    if masked:
+        # Second CSR + SpMM + denominator accumulation ≈ doubles the working set.
+        bytes_per_b *= 2
 
-    free_b = int(_gpu_free_bytes())
+    # Reserve headroom for cuBLAS/cuSPARSE workspaces, which cudaMalloc outside
+    # CuPy's memory pool and would otherwise have nothing left to allocate.
+    free_b = max(1, int(_gpu_free_bytes()) - int(workspace_reserve))
     budget_b = int(free_b * safety)
 
     b = max(1, budget_b // max(1, bytes_per_b))
@@ -882,7 +902,7 @@ def kl_factor_update_largedim(
         print(f"  Updating factor {mode}...")
 
     if batch_cols is None:
-        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode)
+        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
     # print("batch cols:", batch_cols)
 
     # new: avoid X buildup for large dimensions
@@ -1187,7 +1207,7 @@ def fr_factor_update_largedim(
         print(f"  Updating factor {mode}...")
 
     if batch_cols is None:
-        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode)
+        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
     # new: avoid X buildup for large dimensions
     flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
     idxs = _unravel_flat_indices_C(flat, shape)
@@ -1563,7 +1583,7 @@ def fr_factor_update_largedim_tier1(
         print(f"  Updating factor {mode}...")
 
     if batch_cols is None:
-        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode)
+        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
 
     flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
     idxs = _unravel_flat_indices_C(flat, shape)
@@ -1645,7 +1665,7 @@ def kl_factor_update_largedim_tier1(
         print(f"  Updating factor {mode}...")
 
     if batch_cols is None:
-        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode)
+        batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
 
     flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
     idxs = _unravel_flat_indices_C(flat, shape)

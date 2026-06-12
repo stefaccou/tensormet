@@ -42,10 +42,18 @@ Only the *largedim* variants are sharded:
 from __future__ import annotations
 
 import math
+import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+
+# Opt-in worker diagnostics for the multi-GPU masked path. Set TENSORMET_DEBUG_SHARD=1
+# (ideally alongside CUDA_LAUNCH_BLOCKING=1) to bounds-check row gathers per batch and
+# dump device memory + batch context if a shard raises. Off by default: the per-batch
+# r_i.max() bounds check forces a host sync that would otherwise hurt GPU overlap.
+_DEBUG_SHARD = os.environ.get("TENSORMET_DEBUG_SHARD", "") not in ("", "0", "false", "False")
 
 from tensormet.distance import (
     # Factor update helpers
@@ -219,62 +227,133 @@ def _partial_numerator_for_shard(
     # Estimate AFTER all NNZ bookkeeping is live on the GPU so the free-memory
     # snapshot reflects the actual headroom available for the einsum temporaries.
     if batch_cols is None:
-        batch_cols = int(_estimate_batch_cols_for_Z(core_d, factors_d, mode))
+        batch_cols = int(_estimate_batch_cols_for_Z(core_d, factors_d, mode, masked=masked))
 
-    for batch_start in range(0, n_ucols, batch_cols):
-        batch_end = min(batch_start + batch_cols, n_ucols)
-        u = ucols[batch_start:batch_end]
+    mempool = cp.get_default_memory_pool()
+    # cuBLAS/cuSPARSE allocate their GEMM/SpMM workspaces with a raw cudaMalloc
+    # *outside* CuPy's pool. The masked path's extra per-batch allocations
+    # (A_d[r_i], den_w, S_den, the second SpMM, the persistent denominator) fill
+    # the pool enough that this out-of-pool workspace cudaMalloc can fail — which
+    # surfaces as CUBLAS_STATUS_NOT_INITIALIZED from gemmStridedBatchedEx, not as
+    # a CuPy OutOfMemoryError (this is why full, with a *larger* einsum but no
+    # extra allocations, never crashes). On either failure we return the pool's
+    # cached blocks to the driver, halve the batch, and retry. Each batch is
+    # committed atomically (accumulators are touched only after every allocation
+    # for the batch has succeeded), so a retry never double-counts.
+    _retryable = [cp.cuda.memory.OutOfMemoryError]
+    try:
+        _retryable.append(cp.cuda.cublas.CUBLASError)
+    except AttributeError:  # pragma: no cover - cuBLAS error class always present in practice
+        pass
+    _retryable = tuple(_retryable)
 
-        _, idxs_by_mode = _unravel_cols_for_mode(u, shape, mode)
-        Z_u = compute_Zcols_batch(
-            core=core_d,
-            factors=factors_d,
-            mode=mode,
-            other_modes=other_modes,
-            idxs_by_mode=idxs_by_mode,
-            epsilon=epsilon,
-        )
+    bc = int(batch_cols)
+    batch_start = 0
+    while batch_start < n_ucols:
+        batch_end = min(batch_start + bc, n_ucols)
+        try:
+            u = ucols[batch_start:batch_end]
+            _, idxs_by_mode = _unravel_cols_for_mode(u, shape, mode)
+            Z_u = compute_Zcols_batch(
+                core=core_d,
+                factors=factors_d,
+                mode=mode,
+                other_modes=other_modes,
+                idxs_by_mode=idxs_by_mode,
+                epsilon=epsilon,
+            )
 
-        nz_idx = cp.where((inv >= batch_start) & (inv < batch_end))[0]
-        if nz_idx.size == 0:
-            continue
+            nz_idx = cp.where((inv >= batch_start) & (inv < batch_end))[0]
+            if nz_idx.size == 0:
+                batch_start = batch_end
+                continue
 
-        r_i = rows[nz_idx]
-        v_i = vals[nz_idx]
-        u_i = inv[nz_idx] - batch_start
-        Z_rows = Z_u[u_i]
+            r_i = rows[nz_idx]
+            v_i = vals[nz_idx]
+            u_i = inv[nz_idx] - batch_start
+            Z_rows = Z_u[u_i]
 
-        if divergence == "kl":
-            A_rows = A_d[r_i]
-            R_nz = cp.sum(A_rows * Z_rows, axis=1)
-            R_nz = cp.clip(R_nz, a_min=epsilon, a_max=None)
-            w = v_i / R_nz
-        else:  # "fr"
-            w = v_i
+            if _DEBUG_SHARD:
+                # Fancy-index gathers (A_d[r_i], Z_u[u_i]) are NOT bounds-checked
+                # by CuPy; an OOB index is an illegal access that poisons the
+                # context and only surfaces later (often as a cuBLAS error).
+                r_max = int(r_i.max()) if r_i.size else -1
+                u_max = int(u_i.max()) if u_i.size else -1
+                if r_max >= A_d.shape[0] or u_max >= Z_u.shape[0]:
+                    raise RuntimeError(
+                        f"[shard-diag] OOB gather: r_max={r_max} (A_d rows={A_d.shape[0]}), "
+                        f"u_max={u_max} (Z_u rows={Z_u.shape[0]}), device={device_id}, "
+                        f"batch={batch_start}:{batch_end}, nnz_b={int(r_i.size)}"
+                    )
 
-        # numerator[row] += w * Z  — cuSPARSE SpMM (no serialised atomics)
-        nnz_b = int(r_i.size)
-        col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
-        row_idx_b = r_i.astype(cp.int32)
-        S_b = cpx_sparse.csr_matrix(
-            (w, (row_idx_b, col_idx_b)),
-            shape=(numerator.shape[0], nnz_b),
-        )
-        numerator += S_b @ Z_rows
+            nnz_b = int(r_i.size)
+            col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
+            row_idx_b = r_i.astype(cp.int32)
 
-        if masked:
-            # Observed-only denominator weight:
-            #   KL -> 1 (sum of Z over observed columns)
-            #   FR -> Xhat at the observed entry = <A[row], Z[col]>
             if divergence == "kl":
-                den_w = cp.full(nnz_b, den_scale, dtype=Z_rows.dtype)
+                A_rows = A_d[r_i]
+                R_nz = cp.clip(cp.sum(A_rows * Z_rows, axis=1), a_min=epsilon, a_max=None)
+                w = v_i / R_nz
             else:  # "fr"
-                den_w = cp.sum(A_d[r_i] * Z_rows, axis=1) * den_scale
-            S_den = cpx_sparse.csr_matrix(
-                (den_w, (row_idx_b, col_idx_b)),
+                w = v_i
+
+            # numerator[row] += w * Z  — cuSPARSE SpMM (no serialised atomics).
+            # Build contributions into locals first so a failure below leaves the
+            # accumulators untouched and the batch can be retried cleanly.
+            S_b = cpx_sparse.csr_matrix(
+                (w, (row_idx_b, col_idx_b)),
                 shape=(numerator.shape[0], nnz_b),
             )
-            denominator += S_den @ Z_rows
+            num_contrib = S_b @ Z_rows
+
+            den_contrib = None
+            if masked:
+                # Observed-only denominator weight:
+                #   KL -> 1 (sum of Z over observed columns)
+                #   FR -> Xhat at the observed entry = <A[row], Z[col]>
+                if divergence == "kl":
+                    den_w = cp.full(nnz_b, den_scale, dtype=Z_rows.dtype)
+                else:  # "fr"
+                    den_w = cp.sum(A_d[r_i] * Z_rows, axis=1) * den_scale
+                S_den = cpx_sparse.csr_matrix(
+                    (den_w, (row_idx_b, col_idx_b)),
+                    shape=(numerator.shape[0], nnz_b),
+                )
+                den_contrib = S_den @ Z_rows
+
+            # Every allocation for this batch succeeded → commit atomically.
+            numerator += num_contrib
+            if masked:
+                denominator += den_contrib
+
+            batch_start = batch_end
+
+        except _retryable as exc:
+            # Drop this attempt's large temporaries, return cached blocks to the
+            # driver so the out-of-pool cuBLAS/cuSPARSE workspace has room, then
+            # retry the *same* columns at half the width.
+            Z_u = Z_rows = num_contrib = den_contrib = S_b = None
+            mempool.free_all_blocks()
+            if bc <= 1:
+                try:
+                    free_b, total_b = cp.cuda.runtime.memGetInfo()
+                except Exception:
+                    free_b = total_b = -1
+                print(
+                    f"[shard-diag] FAILED at bc=1 device={device_id} div={divergence} "
+                    f"masked={masked} n_ucols={n_ucols} batch={batch_start}:{batch_end} "
+                    f"free={free_b/1e9:.2f}GB/{total_b/1e9:.2f}GB "
+                    f"err={type(exc).__name__}: {exc}",
+                    file=sys.stderr, flush=True,
+                )
+                raise
+            new_bc = max(1, bc // 2)
+            print(
+                f"[shard-diag] shrinking batch device={device_id} masked={masked} "
+                f"{bc}->{new_bc} at batch_start={batch_start} ({type(exc).__name__})",
+                file=sys.stderr, flush=True,
+            )
+            bc = new_bc
 
     cp.cuda.Device(device_id).synchronize()
     return cp.asnumpy(numerator), (cp.asnumpy(denominator) if masked else None)
@@ -907,6 +986,33 @@ class ShardedSparseTensor:
             ThreadPoolExecutor(max_workers=self.n_shards)
             if self.n_shards > 1 else None
         )
+        # Load cuBLAS GEMM kernels into every device context up front, on this
+        # (single) thread, before any parallel factor update can run.
+        self._warm_up_gpus()
+
+    def _warm_up_gpus(self) -> None:
+        """Force cuBLAS GEMM kernel modules to load on each device, serially.
+
+        CUDA 12 defaults to lazy module loading: a context does not load the
+        cuBLAS GEMM cubins until its first matmul. The *full* objective happens
+        to issue that first call single-threaded on the primary device (the
+        analytic denominator in ``_sharded_factor_update``); the *masked*
+        objective skips that step, so all worker threads issue their first
+        cuBLAS call concurrently on their own devices in iteration 1. Those
+        simultaneous one-time loads race and intermittently surface as
+        ``CUBLAS_STATUS_NOT_INITIALIZED`` from ``gemmStridedBatchedEx`` — even
+        with plenty of free VRAM. Touching each device here (both a plain and a
+        batched matmul, in the dtypes we use) serialises the load so the
+        workers find the kernels already resident.
+        """
+        for did in self.device_ids:
+            with cp.cuda.Device(did):
+                for dtype in (cp.float32, cp.float64):
+                    a2 = cp.ones((2, 2), dtype=dtype)
+                    a3 = cp.ones((2, 2, 2), dtype=dtype)  # -> gemmStridedBatchedEx
+                    _ = a2 @ a2
+                    _ = a3 @ a3
+                cp.cuda.Device(did).synchronize()
 
     def __del__(self) -> None:
         pool = getattr(self, "_pool", None)

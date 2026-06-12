@@ -114,6 +114,40 @@ def make_lazy_cupy_pair() -> Tuple[Any, Any]:
     return _LazyGPU(0), _LazyGPU(1)
 
 
+class _LazyModule:
+    """Proxy that imports a module on first attribute access.
+
+    Lets a heavy optional dependency (e.g. ``pytensorlab``, which transitively
+    imports TensorFlow + VTK and costs ~200s) stay out of import time until it
+    is actually used.  Existing ``mod.attr`` call sites keep working unchanged.
+    """
+
+    def __init__(self, name: str) -> None:
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_module", None)
+
+    def _resolve(self):
+        mod = object.__getattribute__(self, "_module")
+        if mod is None:
+            import importlib
+            mod = importlib.import_module(object.__getattribute__(self, "_name"))
+            object.__setattr__(self, "_module", mod)
+        return mod
+
+    def __getattr__(self, attr: str):
+        return getattr(self._resolve(), attr)
+
+    def __repr__(self) -> str:
+        name = object.__getattribute__(self, "_name")
+        resolved = object.__getattribute__(self, "_module") is not None
+        return f"<_LazyModule {name!r} resolved={resolved}>"
+
+
+def lazy_import(name: str) -> Any:
+    """Return a proxy that defers ``import name`` until first attribute access."""
+    return _LazyModule(name)
+
+
 def notify_discord(message, job_finished=True):
     try:
 
