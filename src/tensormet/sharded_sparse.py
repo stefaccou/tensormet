@@ -63,9 +63,11 @@ _DEBUG_SHARD = os.environ.get("TENSORMET_DEBUG_SHARD", "") not in ("", "0", "fal
 from tensormet.distance import (
     # Factor update helpers
     _blocked_coo_to_flat_indices,
+    _build_mode_grouping,
     _estimate_batch_cols_for_Z,
     _unravel_flat_indices_C,
     _unravel_cols_for_mode,
+    ModeGrouping,
     fr_factor_update_largedim,
     kl_factor_update_largedim,
     # Core update helpers
@@ -210,6 +212,7 @@ def _partial_numerator_for_shard(
     subsample_frac: float = 1.0,
     iteration: Optional[int] = None,
     masked: bool = False,
+    grouping: Optional[ModeGrouping] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Compute the partial factor-numerator contribution from a single NNZ shard.
@@ -227,6 +230,13 @@ def _partial_numerator_for_shard(
     on this shard and returned, since for the masked/completion objective the
     denominator depends on the NNZ pattern and cannot be computed analytically.
 
+    ``grouping`` : ModeGrouping, optional
+        CHANGED (2026-06-12 review, Task 3 — E-1/E-2/E-3): precomputed per-shard,
+        per-mode NNZ grouping (built once on this device by the owning
+        ShardedSparseTensor). When supplied, the per-iteration flat-index decode,
+        ``cp.unique`` sort, and per-batch ``cp.where`` scan are skipped. Only
+        passed on the exact (non-subsampling) path; ``None`` under subsampling.
+
     Returns
     -------
     (partial_num, partial_den) : np.ndarray of shape ``(I_mode, R_mode)`` each.
@@ -240,33 +250,49 @@ def _partial_numerator_for_shard(
     factors_d = [cp.asarray(f) for f in factors_np]
     A_d = factors_d[mode]
 
-    flat, vals = _blocked_coo_to_flat_indices(shard, shape)
-
-    if flat.size == 0:
-        zero = cp.asnumpy(cp.zeros_like(A_d))
-        return zero, (zero.copy() if masked else None)
-
-    if subsample_frac < 1.0:
-        flat, vals = _apply_subsample(flat, vals, subsample_frac, iteration)
-
-    # Under subsampling the numerator's `vals` are already rescaled by 1/frac
-    # (see _apply_subsample). The masked denominator weights (unit / x̂) must be
-    # rescaled identically so the MU ratio stays unbiased; the factor cancels in
-    # the ratio but only if both sides carry it.
-    den_scale = (1.0 / subsample_frac) if subsample_frac < 1.0 else 1.0
-
-    idxs = _unravel_flat_indices_C(flat, shape)
-    rows = idxs[mode]
-
     other_modes = [m for m in range(len(shape)) if m != mode]
-    other_shape = tuple(shape[m] for m in other_modes)
-    other_coords = [idxs[m] for m in other_modes]
-    cols = safe_ravel(tuple(other_coords), other_shape, cp)
-
     numerator = cp.zeros_like(A_d)
     denominator = cp.zeros_like(A_d) if masked else None
-    ucols, inv = cp.unique(cols, return_inverse=True)
-    n_ucols = int(ucols.size)
+
+    if grouping is not None:
+        # Cached path (Task 3): NNZ already decoded, sorted and grouped by column
+        # for this shard. No subsampling is active when a grouping is supplied.
+        ucols = grouping.ucols
+        segment_offsets = grouping.segment_offsets
+        rows_sorted = grouping.rows_sorted
+        vals_sorted = grouping.vals_sorted
+        col_index = grouping.col_index
+        inv = None
+        den_scale = 1.0
+        n_ucols = int(ucols.size)
+        if n_ucols == 0:
+            zero = cp.asnumpy(cp.zeros_like(A_d))
+            return zero, (zero.copy() if masked else None)
+    else:
+        flat, vals = _blocked_coo_to_flat_indices(shard, shape)
+
+        if flat.size == 0:
+            zero = cp.asnumpy(cp.zeros_like(A_d))
+            return zero, (zero.copy() if masked else None)
+
+        if subsample_frac < 1.0:
+            flat, vals = _apply_subsample(flat, vals, subsample_frac, iteration)
+
+        # Under subsampling the numerator's `vals` are already rescaled by 1/frac
+        # (see _apply_subsample). The masked denominator weights (unit / x̂) must be
+        # rescaled identically so the MU ratio stays unbiased; the factor cancels in
+        # the ratio but only if both sides carry it.
+        den_scale = (1.0 / subsample_frac) if subsample_frac < 1.0 else 1.0
+
+        idxs = _unravel_flat_indices_C(flat, shape)
+        rows = idxs[mode]
+
+        other_shape = tuple(shape[m] for m in other_modes)
+        other_coords = [idxs[m] for m in other_modes]
+        cols = safe_ravel(tuple(other_coords), other_shape, cp)
+
+        ucols, inv = cp.unique(cols, return_inverse=True)
+        n_ucols = int(ucols.size)
 
     # Estimate AFTER all NNZ bookkeeping is live on the GPU so the free-memory
     # snapshot reflects the actual headroom available for the einsum temporaries.
@@ -307,14 +333,26 @@ def _partial_numerator_for_shard(
                 epsilon=epsilon,
             )
 
-            nz_idx = cp.where((inv >= batch_start) & (inv < batch_end))[0]
-            if nz_idx.size == 0:
-                batch_start = batch_end
-                continue
+            # nnz entries belonging to these unique columns
+            if grouping is not None:
+                # E-2: contiguous slice of the column-grouped arrays — no scan.
+                seg_lo = int(segment_offsets[batch_start])
+                seg_hi = int(segment_offsets[batch_end])
+                if seg_hi == seg_lo:
+                    batch_start = batch_end
+                    continue
+                r_i = rows_sorted[seg_lo:seg_hi]
+                v_i = vals_sorted[seg_lo:seg_hi]
+                u_i = col_index[seg_lo:seg_hi] - batch_start
+            else:
+                nz_idx = cp.where((inv >= batch_start) & (inv < batch_end))[0]
+                if nz_idx.size == 0:
+                    batch_start = batch_end
+                    continue
 
-            r_i = rows[nz_idx]
-            v_i = vals[nz_idx]
-            u_i = inv[nz_idx] - batch_start
+                r_i = rows[nz_idx]
+                v_i = vals[nz_idx]
+                u_i = inv[nz_idx] - batch_start
             Z_rows = Z_u[u_i]
 
             if _DEBUG_SHARD:
@@ -418,6 +456,7 @@ def _sharded_factor_update(
     iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
     masked: bool = False,
+    groupings: Optional[List[Optional[ModeGrouping]]] = None,
 ) -> cp.ndarray:
     """
     Orchestrate multi-GPU factor numerator computation and reduce on CPU.
@@ -426,6 +465,10 @@ def _sharded_factor_update(
     (no NNZ access). Masked/completion objective: the denominator depends on
     the observed entries, so each shard returns a partial denominator that is
     reduced on CPU alongside the partial numerators.
+
+    ``groupings`` (Task 3): optional per-shard precomputed :class:`ModeGrouping`
+    for this mode (``groupings[k]`` lives on ``device_ids[k]``). Supplied only on
+    the exact, non-subsampling path so each worker skips the decode/sort/scan.
     """
     primary = device_ids[0]
 
@@ -475,6 +518,7 @@ def _sharded_factor_update(
                 # iteration number selects the rotating window on every shard.
                 iteration=iter_seed,
                 masked=masked,
+                grouping=(groupings[k] if groupings is not None else None),
             ): k
             for k in range(len(device_ids))
         }
@@ -1029,6 +1073,15 @@ class ShardedSparseTensor:
         # (weighted/completion objective), mirroring cfg.exp.objective="masked".
         self.masked = bool(masked)
         self._iter_seed: Optional[int] = None
+        # CHANGED (2026-06-12 review, Task 3): per-shard cache of per-mode NNZ
+        # groupings (sort + unique columns + segment offsets). Built lazily on
+        # each shard's own device the first time a mode is updated, then reused
+        # every iteration. Only used on the exact (non-subsampling) path — under
+        # subsampling the sampled NNZ pattern changes every iteration, so the
+        # grouping cannot be reused.
+        self._grouping_caches: List[Dict[int, ModeGrouping]] = [
+            {} for _ in range(self.n_shards)
+        ]
         # Persistent pool: threads (and their cuBLAS handles) live for the
         # lifetime of this object.  Re-creating a pool each call causes
         # thread-ID recycling in Python 3.13 which leaves stale cuBLAS
@@ -1091,6 +1144,28 @@ class ShardedSparseTensor:
         for did in self.device_ids:
             with cp.cuda.Device(did):
                 cp.get_default_memory_pool().free_all_blocks()
+
+    def _mode_groupings(self, mode: int) -> Optional[List[ModeGrouping]]:
+        """Return one :class:`ModeGrouping` per shard for *mode* (Task 3).
+
+        Returns ``None`` under stochastic subsampling (the sampled NNZ pattern
+        changes every iteration, so a grouping cannot be reused). Otherwise each
+        shard's grouping is built once, on that shard's own device, and cached;
+        subsequent iterations reuse it, skipping the per-iteration decode,
+        ``cp.unique`` sort, and per-batch ``cp.where`` scan.
+        """
+        if self.subsample_frac < 1.0:
+            return None
+        out: List[ModeGrouping] = []
+        for k in range(self.n_shards):
+            cache = self._grouping_caches[k]
+            g = cache.get(mode)
+            if g is None:
+                with cp.cuda.Device(self.device_ids[k]):
+                    g = _build_mode_grouping(self.shards[k], self.orig_shape, mode)
+                cache[mode] = g
+            out.append(g)
+        return out
 
     @classmethod
     def from_coo(
@@ -1177,6 +1252,7 @@ class ShardedSparseTensor:
             divergence="kl", epsilon=epsilon, batch_cols=batch_cols, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
             pool=self._pool, masked=self.masked,
+            groupings=self._mode_groupings(mode),
         )
 
     def fr_factor_update(
@@ -1204,6 +1280,7 @@ class ShardedSparseTensor:
             divergence="fr", epsilon=epsilon, batch_cols=batch_cols, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
             pool=self._pool, masked=self.masked,
+            groupings=self._mode_groupings(mode),
         )
 
     # ------------------------------------------------------------------

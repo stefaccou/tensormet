@@ -46,7 +46,7 @@ from tensormet.naming import (
 )
 from tensormet.similarity import evaluate_sample, get_eval_num_threads, load_simlex, evaluate_simlex
 from tensormet.routing import get_update_routing_step, get_log_step, UpdateRouting
-from tensormet.distance import null_compute_errors
+from tensormet.distance import null_compute_errors, NNZGroupingCache
 from tensormet.stochastic_sparse import CooSubsampler
 from tensormet.sharded_sparse import (
             ShardedSparseTensor,
@@ -1400,6 +1400,27 @@ class SparseTupleTensor:
             if (_subsample_frac < 1.0 and _sst is None) else None
         )
 
+        # --- per-mode NNZ grouping cache (single-GPU largedim path) ---
+        # CHANGED (2026-06-12 review, Task 3 — E-1/E-2/E-3): when the single-GPU
+        # largedim factor kernels run on a static tensor, precompute each mode's
+        # column grouping (sort + unique + segment offsets) once here and reuse it
+        # every iteration, replacing the per-iteration decode + cp.unique + per-batch
+        # cp.where scan. Mirror routing.get_update_routing_step's factor decision so
+        # the cache is built only when the factor function is actually a largedim
+        # kernel (the only one that accepts `grouping`). Disabled under subsampling
+        # (sampled NNZ change every iteration) and on the multi-GPU path (the SST
+        # owns its own per-shard caches).
+        _routing_max_dim = max(dim) if isinstance(dim, (tuple, list)) else dim
+        _factor_is_largedim = (
+            largedim or masked
+            or (_routing_max_dim >= 4000 if divergence == "kl" else _routing_max_dim > 4000)
+        )
+        _grouping_cache = (
+            NNZGroupingCache(self.tensor, shape)
+            if (_sst is None and _subsample_frac >= 1.0 and _factor_is_largedim)
+            else None
+        )
+
         linked_factors = defaultdict(set)
         if self.shared_factors:
             for a, b in self.shared_factors:
@@ -1476,7 +1497,7 @@ class SparseTupleTensor:
             )
             # --- factors ---
             for mode in modes:
-                factors[mode] = routing.factor_update(
+                _factor_kwargs = dict(
                     vec_tensor=_current_tensor,
                     core=core,
                     factors=factors,
@@ -1484,8 +1505,16 @@ class SparseTupleTensor:
                     shape=shape,
                     thread_budget=thread_budget,
                     epsilon=epsilon,
-                    verbose=verbose
+                    verbose=verbose,
                 )
+                # CHANGED (2026-06-12 review, Task 3): hand the largedim factor
+                # kernel its cached per-mode grouping (built lazily on first use)
+                # so it skips the decode/unique/scan. Only set when the cache is
+                # active (single-GPU largedim, no subsampling); the SST path caches
+                # internally and other kernels never receive this kwarg.
+                if _grouping_cache is not None:
+                    _factor_kwargs["grouping"] = _grouping_cache.get(mode)
+                factors[mode] = routing.factor_update(**_factor_kwargs)
 
                 # new: factor linking
                 if mode in linked_factors:

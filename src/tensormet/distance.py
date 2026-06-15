@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math
 import itertools
+from dataclasses import dataclass
 
 from tqdm import tqdm
 import numpy as np
@@ -641,6 +642,114 @@ def _blocked_coo_to_flat_indices(vec_tensor, orig_shape):
     return flat, vals
 
 
+# ---------------------------------------------------------------------------
+# Per-mode NNZ grouping cache (2026-06-12 review, Task 3 — findings E-1/E-2/E-3)
+# ---------------------------------------------------------------------------
+#
+# The largedim factor update groups NNZ by unfolding column (`cp.unique`), then
+# scans the full inverse-map (`cp.where`) once per column batch. Both are done
+# every iteration on a *static* tensor, so they are the single largest avoidable
+# cost in the hot loop. SOTA sparse-tensor formats (SPLATT/CSF, HiCOO, ALTO)
+# hoist exactly this per-mode grouping out of the loop. ModeGrouping precomputes
+# it once per (tensor, mode); the kernels then operate on contiguous slices.
+
+@dataclass
+class ModeGrouping:
+    """Precomputed per-mode NNZ grouping for a largedim factor update.
+
+    Built once per (tensor, mode) and reused every iteration, so the
+    ``cp.unique`` sort (E-1), the flat-index decode (E-3), and the per-batch
+    full-``inv`` ``cp.where`` scan (E-2) are all hoisted out of the training
+    loop.
+
+    The NNZ are reordered so that all entries sharing an unfolding column are
+    contiguous: ``rows_sorted[segment_offsets[j]:segment_offsets[j+1]]`` are the
+    mode-``mode`` coordinates of the entries in unique column ``ucols[j]`` (and
+    ``vals_sorted`` the corresponding values). A batch of unique columns
+    ``[start:end)`` is therefore the single contiguous slice
+    ``[segment_offsets[start]:segment_offsets[end])`` — no ``cp.where`` scan of
+    the whole array, just two offset lookups. ``col_index`` holds, per sorted
+    entry, the index into ``ucols`` of its column, so the per-entry Z-row index
+    within a batch is ``col_index[slice] - start`` (a plain slice + subtract; no
+    ``cp.repeat``, which CuPy will not take a device array of counts for).
+
+    Depends only on the tensor's NNZ pattern (not on the divergence or the
+    masked/full objective), so one grouping serves all of those. NOT valid under
+    stochastic subsampling, where the sampled entries change every iteration.
+    """
+    ucols: "cp.ndarray"            # (n_ucols,) sorted unique unfolding-column ids
+    segment_offsets: "cp.ndarray"  # (n_ucols+1,) run boundaries in the sorted order
+    rows_sorted: "cp.ndarray"      # (nnz,) mode-`mode` coordinate, column-grouped
+    vals_sorted: "cp.ndarray"      # (nnz,) tensor values, same order
+    col_index: "cp.ndarray"        # (nnz,) index into `ucols` per sorted entry
+
+    @property
+    def n_ucols(self) -> int:
+        return int(self.ucols.size)
+
+
+def _build_mode_grouping(vec_tensor, shape, mode) -> ModeGrouping:
+    """Decode + sort + group a static COO once for ``mode`` (see ModeGrouping).
+
+    Must be called on the device that owns ``vec_tensor`` (the sort and gather
+    run there). The result is reusable for every subsequent iteration.
+    """
+    flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
+    idxs = _unravel_flat_indices_C(flat, shape)
+    rows = idxs[mode]
+
+    other_modes = [m for m in range(len(shape)) if m != mode]
+    other_shape = tuple(shape[m] for m in other_modes)
+    other_coords = [idxs[m] for m in other_modes]
+    cols = safe_ravel(tuple(other_coords), other_shape, cp)
+
+    # Sort NNZ by unfolding column so equal columns form contiguous runs. This is
+    # the one sort that the cache replaces the per-iteration cp.unique with.
+    order = cp.argsort(cols, kind="stable")
+    ucols, inv, counts = cp.unique(cols, return_inverse=True, return_counts=True)
+    inv = inv.reshape(-1)  # guard: NumPy 2.0 briefly returned a 2-D inverse
+    # segment_offsets[j]:segment_offsets[j+1] is unique column j's run; the cumsum
+    # of run lengths, prefixed with 0, gives the (n_ucols+1,) boundary array.
+    segment_offsets = cp.concatenate(
+        (cp.zeros(1, dtype=counts.dtype), cp.cumsum(counts))
+    )
+    return ModeGrouping(
+        ucols=ucols,
+        segment_offsets=segment_offsets,
+        rows_sorted=rows[order],
+        vals_sorted=vals[order],
+        # inv is in original order; reordering by `order` gives the unique-column
+        # index per *sorted* entry, aligned with rows_sorted / vals_sorted.
+        col_index=inv[order],
+    )
+
+
+class NNZGroupingCache:
+    """Lazily builds and stores one :class:`ModeGrouping` per mode for a static COO.
+
+    Pass an instance' per-mode grouping (``cache.get(mode)``) to
+    ``kl_factor_update_largedim`` / ``fr_factor_update_largedim`` via the
+    ``grouping=`` argument to skip the per-iteration flat-index decode,
+    ``cp.unique`` sort, and per-batch ``cp.where`` scan.
+
+    Construct once *before* the training loop and reuse. Valid only while the
+    underlying NNZ is static — do NOT use under stochastic subsampling (the
+    sampled values change every iteration); pass ``None`` there.
+    """
+
+    def __init__(self, vec_tensor, shape):
+        self._vec_tensor = vec_tensor
+        self._shape = tuple(shape)
+        self._by_mode: dict = {}
+
+    def get(self, mode) -> ModeGrouping:
+        g = self._by_mode.get(mode)
+        if g is None:
+            g = _build_mode_grouping(self._vec_tensor, self._shape, mode)
+            self._by_mode[mode] = g
+        return g
+
+
 def _tucker_sum_all_entries(core, factors, epsilon=1e-12):
     """
     Exact sum(R) where R = Tucker(core, factors), without forming R.
@@ -874,6 +983,7 @@ def kl_factor_update_largedim(
     batch_cols=None,
     verbose=False,
     masked=False,
+    grouping=None,
 ):
     """
     KL multiplicative update for Tucker factor A^(mode) WITHOUT building dense Z,
@@ -890,6 +1000,13 @@ def kl_factor_update_largedim(
         (the zero-filled / full-tensor objective). If True, only OBSERVED columns
         contribute: den[i, r] = sum_{j in Omega_i} Z[r, j]. This is the weighted/
         completion objective (treat unobserved entries as missing, not zero).
+    grouping : ModeGrouping, optional
+        CHANGED (2026-06-12 review, Task 3 — E-1/E-2/E-3): precomputed per-mode
+        NNZ grouping for this (static) tensor. When supplied, the per-iteration
+        flat-index decode, ``cp.unique`` sort, and per-batch full-``inv``
+        ``cp.where`` scan are all skipped — the NNZ are already column-grouped, so
+        each column batch is a contiguous slice. Must be ``None`` under stochastic
+        subsampling (the sampled values change every iteration).
     """
 
     # Sparse unfolding X_(mode)
@@ -901,18 +1018,32 @@ def kl_factor_update_largedim(
     if verbose:
         print(f"  Updating factor {mode}...")
 
-    # new: avoid X buildup for large dimensions
-    flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
-    idxs = _unravel_flat_indices_C(flat, shape)
-
-    rows = idxs[mode]
-
     other_modes = [m for m in range(len(shape)) if m != mode]
-    other_coords = [idxs[m] for m in other_modes]
 
-    # build a safe unfolded-column id in int64 only for grouping
-    other_shape = tuple(shape[m] for m in other_modes)
-    cols = safe_ravel(tuple(other_coords), other_shape, cp)
+    if grouping is not None:
+        # Cached path (Task 3): NNZ already decoded, sorted and grouped by
+        # unfolding column. No _blocked_coo_to_flat_indices / cp.unique here.
+        ucols = grouping.ucols
+        segment_offsets = grouping.segment_offsets
+        rows_sorted = grouping.rows_sorted
+        vals_sorted = grouping.vals_sorted
+        col_index = grouping.col_index
+        inv = None  # contiguous segments replace the inv-scan
+    else:
+        # Uncached path: decode + group this iteration (subsampled tensors land
+        # here, since their NNZ pattern changes every call).
+        flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
+        idxs = _unravel_flat_indices_C(flat, shape)
+
+        rows = idxs[mode]
+
+        other_coords = [idxs[m] for m in other_modes]
+        # build a safe unfolded-column id in int64 only for grouping
+        other_shape = tuple(shape[m] for m in other_modes)
+        cols = safe_ravel(tuple(other_coords), other_shape, cp)
+
+        # Reuse computations across repeated columns
+        ucols, inv = cp.unique(cols, return_inverse=True)
 
     A = factors[mode]  # (I_mode, R_mode)
 
@@ -929,26 +1060,22 @@ def kl_factor_update_largedim(
     # Accumulate numerator = W @ Z.T without building full Z
     numerator = cp.zeros_like(A)
 
-    # Reuse computations across repeated columns
-    ucols, inv = cp.unique(cols, return_inverse=True)
-
     # CHANGED (2026-06-12 review, Task 1): estimate AFTER all NNZ bookkeeping
     # (flat, idxs, cols, ucols, inv) is live on the GPU, so the free-memory
     # snapshot reflects the actual headroom for the per-batch temporaries.
     # Previously estimated at the top of the function, which overestimated
     # free VRAM by ~(N+3)*8*nnz bytes. Ported from the sharded path
-    # (sharded_sparse.py::_partial_numerator_for_shard).
+    # (sharded_sparse.py::_partial_numerator_for_shard). With a grouping the
+    # cached arrays are persistent, so the snapshot is already representative.
     if batch_cols is None:
         batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
 
-    # Decode unique columns once per batch (general N-way unravel)
-    other_modes = [m for m in range(len(shape)) if m != mode]
-
-    col_batches = range(0, int(ucols.size), int(batch_cols))
+    n_ucols = int(ucols.size)
+    col_batches = range(0, n_ucols, int(batch_cols))
     if verbose:
         col_batches = tqdm(col_batches, desc=f"  Factor {mode} col-batches", unit="batch", leave=False)
     for start in col_batches:
-        end = min(start + int(batch_cols), int(ucols.size))
+        end = min(start + int(batch_cols), n_ucols)
         u = ucols[start:end]
 
         _, idxs_by_mode = _unravel_cols_for_mode(u, shape, mode)  # dict: other_mode -> (m,)
@@ -964,13 +1091,23 @@ def kl_factor_update_largedim(
         )
 
         # nnz entries belonging to these unique columns
-        nz_idx = cp.where((inv >= start) & (inv < end))[0]
-        if nz_idx.size == 0:
-            continue
-
-        r_i = rows[nz_idx]             # (nnz_b,)
-        v_i = vals[nz_idx]             # (nnz_b,)
-        u_i = inv[nz_idx] - start      # local [0..m)
+        if grouping is not None:
+            # E-2: contiguous slice of the column-grouped arrays — no full scan.
+            seg_lo = int(segment_offsets[start])
+            seg_hi = int(segment_offsets[end])
+            if seg_hi == seg_lo:
+                continue
+            r_i = rows_sorted[seg_lo:seg_hi]   # (nnz_b,)
+            v_i = vals_sorted[seg_lo:seg_hi]   # (nnz_b,)
+            # local Z row per entry: ucols index minus the batch's first column.
+            u_i = col_index[seg_lo:seg_hi] - start
+        else:
+            nz_idx = cp.where((inv >= start) & (inv < end))[0]
+            if nz_idx.size == 0:
+                continue
+            r_i = rows[nz_idx]             # (nnz_b,)
+            v_i = vals[nz_idx]             # (nnz_b,)
+            u_i = inv[nz_idx] - start      # local [0..m)
 
         A_rows = A[r_i]                # (nnz_b, R_mode)
         Z_rows = Z_u[u_i]              # (nnz_b, R_mode)
@@ -1195,6 +1332,7 @@ def fr_factor_update_largedim(
     batch_cols=None,
     verbose=False,
     masked=False,
+    grouping=None,
 ):
     """
     Frobenius (Euclidean) multiplicative update for Tucker factor A^(mode)
@@ -1211,6 +1349,12 @@ def fr_factor_update_largedim(
         columns (zero-filled objective). If True, the denominator is restricted
         to observed entries: den[i, r] = sum_{j in Omega_i} Xhat[i, j] Z[r, j],
         accumulated per batch. This is the weighted/completion objective.
+    grouping : ModeGrouping, optional
+        CHANGED (2026-06-12 review, Task 3 — E-1/E-2/E-3): precomputed per-mode
+        NNZ grouping for this (static) tensor. When supplied, the per-iteration
+        decode, ``cp.unique`` sort, and per-batch ``cp.where`` scan are skipped
+        (the NNZ are already column-grouped). Must be ``None`` under stochastic
+        subsampling.
     """
     # Sparse unfolding X_(mode)
     # X = unfold_from_vectorized_sparse(vec_tensor, shape, mode).tocoo()
@@ -1220,18 +1364,29 @@ def fr_factor_update_largedim(
     if verbose:
         print(f"  Updating factor {mode}...")
 
-    # new: avoid X buildup for large dimensions
-    flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
-    idxs = _unravel_flat_indices_C(flat, shape)
-
-    rows = idxs[mode]
-
     other_modes = [m for m in range(len(shape)) if m != mode]
-    other_coords = [idxs[m] for m in other_modes]
 
-    # build a safe unfolded-column id in int64 only for grouping
-    other_shape = tuple(shape[m] for m in other_modes)
-    cols = safe_ravel(tuple(other_coords), other_shape, cp)
+    if grouping is not None:
+        # Cached path (Task 3): NNZ already decoded, sorted and grouped by column.
+        ucols = grouping.ucols
+        segment_offsets = grouping.segment_offsets
+        rows_sorted = grouping.rows_sorted
+        vals_sorted = grouping.vals_sorted
+        col_index = grouping.col_index
+        inv = None
+    else:
+        # Uncached path: decode + group this iteration (subsampled tensors).
+        flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
+        idxs = _unravel_flat_indices_C(flat, shape)
+
+        rows = idxs[mode]
+
+        other_coords = [idxs[m] for m in other_modes]
+        # build a safe unfolded-column id in int64 only for grouping
+        other_shape = tuple(shape[m] for m in other_modes)
+        cols = safe_ravel(tuple(other_coords), other_shape, cp)
+
+        ucols, inv = cp.unique(cols, return_inverse=True)
 
     A = factors[mode]  # (I_mode, R_mode)
 
@@ -1248,8 +1403,6 @@ def fr_factor_update_largedim(
     # ---- Numerator part: numerator = X @ Z via batching unique columns, no full Z
     numerator = cp.zeros_like(A)
 
-    ucols, inv = cp.unique(cols, return_inverse=True)
-
     # CHANGED (2026-06-12 review, Task 1): estimate AFTER all NNZ bookkeeping
     # (flat, idxs, cols, ucols, inv) is live on the GPU so the free-memory
     # snapshot reflects the actual headroom. Previously estimated at the top
@@ -1258,13 +1411,12 @@ def fr_factor_update_largedim(
     if batch_cols is None:
         batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
 
-    other_modes = [m for m in range(len(shape)) if m != mode]
-
-    col_batches = range(0, int(ucols.size), int(batch_cols))
+    n_ucols = int(ucols.size)
+    col_batches = range(0, n_ucols, int(batch_cols))
     if verbose:
         col_batches = tqdm(col_batches, desc=f"  Factor {mode} col-batches", unit="batch", leave=False)
     for start in col_batches:
-        end = min(start + int(batch_cols), int(ucols.size))
+        end = min(start + int(batch_cols), n_ucols)
         u = ucols[start:end]
 
         _, idxs_by_mode = _unravel_cols_for_mode(u, shape, mode)
@@ -1280,13 +1432,22 @@ def fr_factor_update_largedim(
         )
 
         # nnz entries belonging to these unique columns
-        nz_idx = cp.where((inv >= start) & (inv < end))[0]
-        if nz_idx.size == 0:
-            continue
-
-        r_i = rows[nz_idx]          # (nnz_b,)
-        v_i = vals[nz_idx]          # (nnz_b,)
-        u_i = inv[nz_idx] - start   # local index into this batch [0..m)
+        if grouping is not None:
+            # E-2: contiguous slice of the column-grouped arrays — no full scan.
+            seg_lo = int(segment_offsets[start])
+            seg_hi = int(segment_offsets[end])
+            if seg_hi == seg_lo:
+                continue
+            r_i = rows_sorted[seg_lo:seg_hi]   # (nnz_b,)
+            v_i = vals_sorted[seg_lo:seg_hi]   # (nnz_b,)
+            u_i = col_index[seg_lo:seg_hi] - start
+        else:
+            nz_idx = cp.where((inv >= start) & (inv < end))[0]
+            if nz_idx.size == 0:
+                continue
+            r_i = rows[nz_idx]          # (nnz_b,)
+            v_i = vals[nz_idx]          # (nnz_b,)
+            u_i = inv[nz_idx] - start   # local index into this batch [0..m)
 
         Z_rows = Z_u[u_i]           # (nnz_b, R_mode)
 
