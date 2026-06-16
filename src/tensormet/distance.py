@@ -860,19 +860,34 @@ def _core_multilinear_grams(core, grams, epsilon=1e-12):
 def _gpu_free_bytes():
     """
     Conservative 'free bytes now' estimate.
-    Flushes the CuPy memory pool first to get an accurate driver-level reading.
+
+    CHANGED (2026-06-15): no longer calls ``mempool.free_all_blocks()`` first.
+    That flush returned every cached block to the CUDA driver via ``cudaFree``
+    — a synchronizing, single-threaded driver call — and the next kernel then
+    had to ``cudaMalloc`` it all back. Run from the per-iteration batch-size
+    estimators (~6-7×/iteration), it drained the GPU to idle while one host
+    thread sat in the driver, producing the stop-start iteration stalls (and
+    defeating the whole point of the memory pool). The driver's own free figure
+    plus the pool's cached-but-reusable bytes give the same headroom estimate
+    without any cudaFree/cudaMalloc churn.
     """
-    # 1. Force CuPy to return all cached/unused memory to the CUDA driver
-    cp.get_default_memory_pool().free_all_blocks()
-
-    # 2. Now ask the driver how much memory is actually free
+    mempool = cp.get_default_memory_pool()
     free_b, total_b = cp.cuda.runtime.memGetInfo()
-    return int(free_b)
+    # Pool blocks that are cached but currently unused are reusable for the next
+    # allocation without hitting the driver, so count them as available too.
+    pool_reusable = int(mempool.free_bytes())
+    return int(free_b) + pool_reusable
 
-def _estimate_batch_num_for_outer(core, factors, safety=0.70, temp_mult=2.0):
+def _estimate_batch_num_for_outer(core, factors, safety=0.70, temp_mult=2.0, reserve_b=0):
     """
     New estimator for the optimized matrix-multiplication accumulator.
     It no longer assumes the materialization of the full core outer product!
+
+    reserve_b :
+        Bytes held back from the free-VRAM budget for allocations that are not
+        live at estimate time. Used when the estimate is hoisted out of the
+        iteration loop (precompute_largedim_batches) to reserve the kernel's
+        transient NNZ decode arrays, preserving the in-kernel snapshot headroom.
     """
     N = len(factors)
     itemsize = int(np.dtype(core.dtype).itemsize)
@@ -886,7 +901,7 @@ def _estimate_batch_num_for_outer(core, factors, safety=0.70, temp_mult=2.0):
     bytes_per_b = 2 * largest_KR_rank * itemsize
     bytes_per_b = int(math.ceil(bytes_per_b * temp_mult))
 
-    free_b = int(_gpu_free_bytes())
+    free_b = max(1, int(_gpu_free_bytes()) - int(reserve_b))
     budget_b = int(free_b * safety)
 
     b = max(1, budget_b // max(1, bytes_per_b))
@@ -898,7 +913,9 @@ def _estimate_batch_num_for_outer(core, factors, safety=0.70, temp_mult=2.0):
     return min(int(b), hard_cap)
 
 
-def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.7, temp_mult=4.0):  # Increased temp_mult; safety raised from 0.60
+def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.7, temp_mult=4.0, reserve_b=0):  # Increased temp_mult; safety raised from 0.60
+    # reserve_b: bytes held back for allocations not live at estimate time
+    # (see _estimate_batch_num_for_outer); set when hoisted out of the loop.
     N = core.ndim
     R = [int(factors[n].shape[1]) for n in range(N)]
     dtype = core.dtype
@@ -911,7 +928,7 @@ def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.7, temp_mult=4.0)
     # Total bytes per batch element
     bytes_per_b = int(np.ceil(tmp_bytes_per_b * temp_mult))
 
-    free_b = _gpu_free_bytes()
+    free_b = max(1, int(_gpu_free_bytes()) - int(reserve_b))
     # Ensure we leave a large buffer for the rest of the graph
     budget_b = int(free_b * safety)
 
@@ -971,6 +988,46 @@ def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.8, temp_mult=4.0,
     hard_cap = max(1, int(free_b * 0.50 // max(1, tmp_bytes_per_b)))
 
     return min(int(b), hard_cap)
+
+
+def precompute_largedim_batches(core, factors, modes, masked=False, nnz_live=0):
+    """
+    Precompute the single-GPU largedim KL per-iteration batch sizes ONCE.
+
+    CHANGED (2026-06-15): the batch-size estimates depend only on core/factor
+    shapes and dtype (fixed for a run) plus a free-VRAM snapshot, so calling
+    them inside every factor/core/error update just repeated identical
+    arithmetic — and, before the ``_gpu_free_bytes`` fix, flushed the memory
+    pool 6-7×/iteration. The main loop now calls this once, after all persistent
+    device allocations are live, and threads the results into the kernels'
+    ``batch_*`` kwargs so the kernels skip their internal estimate entirely.
+
+    nnz_live :
+        Per-iteration NNZ count of the tensor the kernels will decode (the
+        subsample window size under stochastic subsampling, else the full nnz).
+        The kernels allocate ~(N+3)·8·nnz_live bytes of transient decode arrays
+        (flat / idxs / cols / ucols / inv) that are not live at precompute time;
+        reserving those bytes here reproduces the headroom the in-kernel
+        estimate got from snapshotting after that bookkeeping (review Task 1),
+        so hoisting the call out does not regress peak-memory safety.
+
+    Returns a dict with ``batch_cols`` (mode -> int), ``batch_rhat`` and
+    ``batch_num``.
+    """
+    N = core.ndim
+    transient_b = (N + 3) * 8 * int(nnz_live)
+    batch_cols = {
+        m: _estimate_batch_cols_for_Z(
+            core, factors, m, masked=masked,
+            workspace_reserve=512 * 1024**2 + transient_b,
+        )
+        for m in modes
+    }
+    return {
+        "batch_cols": batch_cols,
+        "batch_rhat": _estimate_batch_rhat_for_tensordot(core, factors, reserve_b=transient_b),
+        "batch_num": _estimate_batch_num_for_outer(core, factors, reserve_b=transient_b),
+    }
 
 def kl_factor_update_largedim(
     vec_tensor,

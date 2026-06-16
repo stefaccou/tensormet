@@ -46,7 +46,7 @@ from tensormet.naming import (
 )
 from tensormet.similarity import evaluate_sample, get_eval_num_threads, load_simlex, evaluate_simlex
 from tensormet.routing import get_update_routing_step, get_log_step, UpdateRouting
-from tensormet.distance import null_compute_errors, NNZGroupingCache
+from tensormet.distance import null_compute_errors, NNZGroupingCache, precompute_largedim_batches
 from tensormet.stochastic_sparse import CooSubsampler
 from tensormet.sharded_sparse import (
             ShardedSparseTensor,
@@ -1421,6 +1421,24 @@ class SparseTupleTensor:
             else None
         )
 
+        # --- per-iteration batch sizes (single-GPU largedim KL path) ---
+        # CHANGED (2026-06-15): the largedim KL factor/core/error kernels sized
+        # their column/NNZ batches by calling _estimate_batch_*() every update,
+        # and each estimate flushed the CuPy pool to the driver (cudaFree +
+        # re-cudaMalloc), stalling the GPU to idle ~6-7×/iteration. The estimates
+        # depend only on core/factor shapes+dtype (fixed for the run), so compute
+        # them ONCE here and thread them into the kernels' batch_* kwargs. Gated
+        # to the KL single-GPU largedim path (FR/sharded/plain kernels size
+        # themselves; the SST owns its own batching). nnz_live reserves the
+        # kernels' transient decode arrays so hoisting keeps Task 1's headroom.
+        _full_nnz = int(self.tensor.tocoo().row.size)
+        _nnz_live = _iter_sampler.n_sample if _iter_sampler is not None else _full_nnz
+        _largedim_batches = (
+            precompute_largedim_batches(core, factors, modes, masked=masked, nnz_live=_nnz_live)
+            if (divergence == "kl" and _sst is None and _factor_is_largedim)
+            else None
+        )
+
         linked_factors = defaultdict(set)
         if self.shared_factors:
             for a, b in self.shared_factors:
@@ -1514,6 +1532,10 @@ class SparseTupleTensor:
                 # internally and other kernels never receive this kwarg.
                 if _grouping_cache is not None:
                     _factor_kwargs["grouping"] = _grouping_cache.get(mode)
+                # Precomputed col-batch size (largedim KL factor kernel only);
+                # skips the per-update _estimate_batch_cols_for_Z + pool flush.
+                if _largedim_batches is not None:
+                    _factor_kwargs["batch_cols"] = _largedim_batches["batch_cols"][mode]
                 factors[mode] = routing.factor_update(**_factor_kwargs)
 
                 # new: factor linking
@@ -1523,9 +1545,14 @@ class SparseTupleTensor:
 
             # --- core + error ---
             if routing.core_returns_error:
-                # FR: combined core update + error in one call
+                # FR: combined core update + error in one call.
+                # CHANGED (2026-06-12 review, Task 5 — I-1): feed the FULL tensor,
+                # not the subsampled/rescaled _current_tensor. This call only fires
+                # on log steps (routing sets core_returns_error = True*log_step), so
+                # the fused error portion (norm_X², ⟨X,X̂⟩) is unbiased; the core MU
+                # step it also performs is then the exact full-NNZ update that step.
                 core, rel_err = routing.core_update(
-                    vec_tensor=_current_tensor,
+                    vec_tensor=self.tensor,
                     shape=shape,
                     core=core,
                     factors=factors,
@@ -1536,7 +1563,7 @@ class SparseTupleTensor:
                 )
             else:
                 # KL: core update, then compute error separately
-                core = routing.core_update(
+                _core_kwargs = dict(
                     vec_tensor=_current_tensor,
                     shape=shape,
                     core=core,
@@ -1544,17 +1571,36 @@ class SparseTupleTensor:
                     modes=modes,
                     thread_budget=thread_budget,
                     epsilon=epsilon,
-                    verbose=verbose
+                    verbose=verbose,
                 )
-                rel_err = routing.error_fn(
-                    vec_tensor=_current_tensor,
+                # Precomputed NNZ-batch sizes (largedim KL core kernel only);
+                # skips the per-update _estimate_batch_* + pool flush.
+                if _largedim_batches is not None:
+                    _core_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
+                    _core_kwargs["batch_num"] = _largedim_batches["batch_num"]
+                core = routing.core_update(**_core_kwargs)
+
+                # CHANGED (2026-06-12 review, Task 5 — I-1): the KL error runs on
+                # the FULL tensor, not the subsampled/rescaled _current_tensor.
+                # x·log(x/r), the sum_R_nz zero-correction, and ‖X‖ are nonlinear
+                # in the rescaled values, so a subsampled error is biased by frac.
+                # error_fn only does real work on log steps (else null_compute_errors),
+                # so full-NNZ evaluation is cheap. The core update above keeps using
+                # _current_tensor (its MU numerator is linear → 1/frac-unbiased).
+                _err_kwargs = dict(
+                    vec_tensor=self.tensor,
                     shape=shape,
                     core=core,
                     factors=factors,
                     thread_budget=thread_budget,
                     epsilon=epsilon,
-                    verbose=verbose
+                    verbose=verbose,
                 )
+                # Only the real largedim error fn accepts batch_rhat; on non-log
+                # steps error_fn is null_compute_errors (no such kwarg).
+                if _largedim_batches is not None and log_step:
+                    _err_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
+                rel_err = routing.error_fn(**_err_kwargs)
             # Normalize if desired
             if normalize_factors:
                 core, factors = tucker_normalize((core, factors))
