@@ -186,6 +186,7 @@ def _apply_subsample(
     vals: cp.ndarray,
     subsample_frac: float,
     iteration: Optional[int],
+    rescale: bool = True,
 ) -> Tuple[cp.ndarray, cp.ndarray]:
     """
     Take this iteration's contiguous NNZ window from pre-shuffled storage.
@@ -220,10 +221,18 @@ def _apply_subsample(
         treated as 0 (deterministic given (construction seed, iteration) —
         no RNG state survives between calls, so resumed runs draw the same
         windows as uninterrupted ones).
+    rescale :
+        When True (default) values are multiplied by ``1/frac`` so that a
+        **linear** accumulation over the window is unbiased — correct for the
+        MU numerators.  When False the raw windowed values are returned; the
+        caller must instead weight the *summed* result by ``nnz/n_sample``.
+        This is the unbiased path for **nonlinear** error terms
+        (``x·log(x/r)``, ``x²``), where rescaling the values would inject a
+        ``1/frac`` bias inside the nonlinearity (review finding I-1).
 
     Returns
     -------
-    flat_s, vals_s : windowed and rescaled arrays.
+    flat_s, vals_s : windowed arrays (values rescaled iff ``rescale``).
     """
     nnz = int(flat.size)
     n_sample = max(1, int(round(subsample_frac * nnz)))
@@ -235,6 +244,8 @@ def _apply_subsample(
     else:  # wrap around the end of the shuffled sequence
         flat_s = cp.concatenate((flat[start:], flat[: end - nnz]))
         vals_s = cp.concatenate((vals[start:], vals[: end - nnz]))
+    if not rescale:
+        return flat_s, vals_s
     scale = vals.dtype.type(1.0 / subsample_frac)
     return flat_s, vals_s * scale
 
@@ -845,6 +856,8 @@ def _partial_kl_error_for_shard(
     epsilon: float,
     batch_rhat: Optional[int],
     device_id: int,
+    subsample_frac: float = 1.0,
+    iteration: Optional[int] = None,
 ) -> Tuple[float, float, float]:
     """
     Compute partial KL error scalars from a single NNZ shard.
@@ -853,12 +866,17 @@ def _partial_kl_error_for_shard(
     -------
     (kl_pos, sum_R_nz, sum_X) from this shard's NNZ contribution.
 
-    CHANGED (2026-06-12 review, Task 5 — I-1): always evaluated on the **full**
-    shard NNZ, never on a subsample window. The error terms are nonlinear
-    (``x·log(x/r)``, ``x²``) and ``sum_R_nz`` is a zero-correction, so the old
-    ``1/frac`` value rescale used for the (linear) MU numerators produced a
-    biased metric. Errors run only on log steps, so full-NNZ evaluation is cheap
-    enough and unbiased; the subsample_frac/iteration plumbing is gone.
+    CHANGED (2026-06-16): the error is sampled on the **same** ``subsample_frac``
+    window as the MU numerators (so it costs O(frac·nnz), restoring the
+    pre-Task-5 speed) but stays **unbiased** the way Task 5/finding I-1 require:
+    the window is taken with ``rescale=False`` and each *summed* scalar is
+    weighted by ``nnz/n_sample`` (≈ ``1/frac``).  This is the review's option
+    (b) — weight the sums, never the values, so the ``1/frac`` factor does not
+    enter the nonlinear ``x·log(x/r)`` / ``x²`` terms.  ``sum_R`` (the analytic
+    full reconstruction sum) is kept exact in the orchestrator, so weighting
+    ``sum_R_nz`` here makes ``kl_zero = sum_R − sum_R_nz`` unbiased too.  At
+    ``subsample_frac == 1`` the window is the whole shard and ``weight == 1``,
+    so the metric is identical to the exact full-NNZ value.
     """
     cp.cuda.Device(device_id).use()
     core_d = cp.asarray(core_np)
@@ -869,11 +887,20 @@ def _partial_kl_error_for_shard(
         batch_rhat = int(_estimate_batch_rhat_for_tensordot(core_d, factors_d))
 
     flat, x_nz = _blocked_coo_to_flat_indices(shard, shape)
-    nnz = int(flat.size)
+    nnz_full = int(flat.size)
 
-    if nnz == 0:
+    if nnz_full == 0:
         return 0.0, 0.0, 0.0
 
+    # Sample the same window as the numerators (cheap), but DON'T rescale the
+    # values — weight the summed terms by nnz/n_sample instead (unbiased,
+    # nonlinearity-safe). frac == 1 → no sampling, weight == 1.
+    weight = 1.0
+    if subsample_frac < 1.0:
+        flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, iteration, rescale=False)
+        weight = nnz_full / int(flat.size)
+
+    nnz = int(flat.size)
     x_nz = cp.clip(x_nz.astype(core_d.dtype), a_min=epsilon, a_max=None)
     idxs = _unravel_flat_indices_C(flat, shape)
 
@@ -885,9 +912,9 @@ def _partial_kl_error_for_shard(
     r_nz = cp.clip(r_nz, a_min=epsilon, a_max=None)
 
     term_pos = x_nz * cp.log(x_nz / r_nz) - x_nz + r_nz
-    kl_pos = float(cp.sum(term_pos).get())
-    sum_R_nz = float(cp.sum(r_nz).get())
-    sum_X = float(cp.sum(x_nz).get())
+    kl_pos = float(cp.sum(term_pos).get()) * weight
+    sum_R_nz = float(cp.sum(r_nz).get()) * weight
+    sum_X = float(cp.sum(x_nz).get()) * weight
 
     cp.cuda.Device(device_id).synchronize()
     return kl_pos, sum_R_nz, sum_X
@@ -903,6 +930,8 @@ def _sharded_kl_error(
     batch_rhat: Optional[int],
     pool: Optional[ThreadPoolExecutor] = None,
     masked: bool = False,
+    subsample_frac: float = 1.0,
+    iter_seed: Optional[int] = None,
 ) -> cp.ndarray:
     """
     Compute relative KL error with sharded NNZ; returns a scalar CuPy array
@@ -911,9 +940,13 @@ def _sharded_kl_error(
     When ``masked`` is True the zero-entry contribution (sum_R - sum_R_nz) is
     dropped, so the metric reflects the observed-only / completion objective.
 
-    CHANGED (2026-06-12 review, Task 5 — I-1): the error is always computed on
-    the full shard NNZ (no subsample window), so the subsample_frac/iter_seed
-    plumbing was removed — see ``_partial_kl_error_for_shard``.
+    CHANGED (2026-06-16): the error is evaluated on the per-iteration
+    ``subsample_frac`` window (cost O(frac·nnz)), and each shard weights its
+    summed scalars by ``nnz/n_sample`` so the metric stays unbiased — see
+    ``_partial_kl_error_for_shard``.  ``sum_R`` below is the exact analytic full
+    sum (unweighted); combined with the weighted ``sum_R_nz_total`` it gives an
+    unbiased ``kl_zero``.  At ``subsample_frac == 1`` this reduces to the exact
+    full-NNZ value.
     """
     primary = device_ids[0]
     core_np = cp.asnumpy(core)
@@ -933,6 +966,8 @@ def _sharded_kl_error(
                 epsilon=epsilon,
                 batch_rhat=batch_rhat,
                 device_id=device_ids[k],
+                subsample_frac=subsample_frac,
+                iteration=iter_seed,
             ): k
             for k in range(len(device_ids))
         }
@@ -969,6 +1004,8 @@ def _partial_fr_error_for_shard(
     batch_rhat: Optional[int],
     device_id: int,
     masked: bool = False,
+    subsample_frac: float = 1.0,
+    iteration: Optional[int] = None,
 ) -> Tuple[float, float, float]:
     """
     Compute partial Frobenius error scalars from a single NNZ shard.
@@ -979,11 +1016,15 @@ def _partial_fr_error_for_shard(
     ``inner_prod`` is 0 when ``masked`` (the full ‖X̂‖² term is not used);
     ``residual_sq`` (= sum (x - x̂)²) is 0 when not ``masked``.
 
-    CHANGED (2026-06-12 review, Task 5 — I-1): always evaluated on the **full**
-    shard NNZ. ``norm_X_sq`` sums ``x²`` and ``residual_sq`` sums ``(x-x̂)²``;
-    the ``1/frac`` value rescale used for the (linear) MU numerators biases both
-    quadratic terms by ``1/frac``, so the metric is computed unsubsampled. Errors
-    run only on log steps, so this is cheap; subsample plumbing removed.
+    CHANGED (2026-06-16): sampled on the same ``subsample_frac`` window as the
+    MU numerators (cost O(frac·nnz)) but **unbiased** per finding I-1 — the
+    window is taken with ``rescale=False`` and the summed quadratic terms
+    (``norm_X_sq``, ``inner_prod``, ``residual_sq``) are weighted by
+    ``nnz/n_sample`` (≈ ``1/frac``).  Weighting the *sum* avoids the ``1/frac²``
+    bias that rescaling the *values* before squaring would produce.  ``norm_Xhat²``
+    is analytic and stays exact in the orchestrator; weighting ``norm_X_sq`` and
+    ``inner_prod`` keeps the full residual ``‖X‖²+‖X̂‖²−2⟨X,X̂⟩`` unbiased.  In the
+    masked ratio the weight cancels.  frac == 1 → weight == 1 (exact full NNZ).
     """
     cp.cuda.Device(device_id).use()
     core_d = cp.asarray(core_np)
@@ -994,15 +1035,21 @@ def _partial_fr_error_for_shard(
         batch_rhat = int(_estimate_batch_rhat_for_tensordot(core_d, factors_d))
 
     flat, x_nz = _blocked_coo_to_flat_indices(shard, shape)
-    nnz = int(flat.size)
+    nnz_full = int(flat.size)
 
-    if nnz == 0:
+    if nnz_full == 0:
         return 0.0, 0.0, 0.0
 
+    weight = 1.0
+    if subsample_frac < 1.0:
+        flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, iteration, rescale=False)
+        weight = nnz_full / int(flat.size)
+
+    nnz = int(flat.size)
     x_nz = cp.clip(x_nz.astype(core_d.dtype), a_min=0.0, a_max=None)
     idxs = _unravel_flat_indices_C(flat, shape)
 
-    norm_X_sq = float(cp.sum(x_nz * x_nz).get())
+    norm_X_sq = float(cp.sum(x_nz * x_nz).get()) * weight
 
     inner_prod_d = cp.asarray(0.0, dtype=core_d.dtype)
     residual_sq_d = cp.asarray(0.0, dtype=core_d.dtype)
@@ -1015,8 +1062,8 @@ def _partial_fr_error_for_shard(
         else:
             inner_prod_d += cp.sum(x_nz[start:end] * xhat_b)
 
-    inner_prod = float(inner_prod_d.get())
-    residual_sq = float(residual_sq_d.get())
+    inner_prod = float(inner_prod_d.get()) * weight
+    residual_sq = float(residual_sq_d.get()) * weight
     cp.cuda.Device(device_id).synchronize()
     return norm_X_sq, inner_prod, residual_sq
 
@@ -1031,6 +1078,8 @@ def _sharded_fr_error(
     batch_rhat: Optional[int],
     pool: Optional[ThreadPoolExecutor] = None,
     masked: bool = False,
+    subsample_frac: float = 1.0,
+    iter_seed: Optional[int] = None,
 ) -> cp.ndarray:
     """
     Compute relative Frobenius error with sharded NNZ; returns a scalar CuPy
@@ -1040,9 +1089,11 @@ def _sharded_fr_error(
     computed analytically on the primary device (no NNZ). The masked/completion
     objective uses the observed-only relative RMSE sqrt(sum_Ω (x - x̂)²) / ‖X‖.
 
-    CHANGED (2026-06-12 review, Task 5 — I-1): the error is always computed on
-    the full shard NNZ (no subsample window), so the subsample_frac/iter_seed
-    plumbing was removed — see ``_partial_fr_error_for_shard``.
+    CHANGED (2026-06-16): the error is evaluated on the per-iteration
+    ``subsample_frac`` window (cost O(frac·nnz)) with the summed terms weighted
+    by ``nnz/n_sample`` for unbiasedness — see ``_partial_fr_error_for_shard``.
+    ``norm_Xhat²`` below stays analytic/exact.  At ``subsample_frac == 1`` this
+    reduces to the exact full-NNZ value.
     """
     primary = device_ids[0]
     N = len(factors)
@@ -1064,6 +1115,8 @@ def _sharded_fr_error(
                 batch_rhat=batch_rhat,
                 device_id=device_ids[k],
                 masked=masked,
+                subsample_frac=subsample_frac,
+                iteration=iter_seed,
             ): k
             for k in range(len(device_ids))
         }
@@ -1546,13 +1599,15 @@ class ShardedSparseTensor:
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_rhat=batch_rhat, verbose=verbose, masked=self.masked,
             )
-        # CHANGED (2026-06-12 review, Task 5 — I-1): error is computed on the
-        # full shard NNZ (unbiased); no subsample_frac/iter_seed is forwarded.
+        # CHANGED (2026-06-16): error sampled on the same subsample window as the
+        # numerators (O(frac·nnz)) but weighted per shard for unbiasedness — the
+        # frac/iter_seed are forwarded so the window matches this iteration.
         return _sharded_kl_error(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, shape=shape,
             epsilon=epsilon, batch_rhat=batch_rhat,
             pool=self._pool, masked=self.masked,
+            subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
         )
 
     def fr_compute_errors(
@@ -1573,13 +1628,15 @@ class ShardedSparseTensor:
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_rhat=batch_rhat, verbose=verbose, masked=self.masked,
             )
-        # CHANGED (2026-06-12 review, Task 5 — I-1): error is computed on the
-        # full shard NNZ (unbiased); no subsample_frac/iter_seed is forwarded.
+        # CHANGED (2026-06-16): error sampled on the same subsample window as the
+        # numerators (O(frac·nnz)) but weighted per shard for unbiasedness — the
+        # frac/iter_seed are forwarded so the window matches this iteration.
         return _sharded_fr_error(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, shape=shape,
             epsilon=epsilon, batch_rhat=batch_rhat,
             pool=self._pool, masked=self.masked,
+            subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
         )
 
 
