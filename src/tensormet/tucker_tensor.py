@@ -45,7 +45,7 @@ from tensormet.naming import (
     populated_filename_legacy,
 )
 from tensormet.similarity import evaluate_sample, get_eval_num_threads, load_simlex, evaluate_simlex
-from tensormet.routing import get_update_routing_step, get_log_step, UpdateRouting
+from tensormet.routing import get_update_routing_step, get_log_step, UpdateRouting, needs_largedim
 from tensormet.distance import null_compute_errors, NNZGroupingCache, precompute_largedim_batches
 from tensormet.stochastic_sparse import CooSubsampler
 from tensormet.sharded_sparse import (
@@ -1332,7 +1332,9 @@ class SparseTupleTensor:
         shape = tuple(self.shape)
         rank = validate_tucker_rank(shape, rank=rank)
         modes = list(range(len(rank)))
-        _max_dim = max(shape)
+        # NOTE (Task 6): the routing size decision is centralised in
+        # needs_largedim(dim, ...) (see _largedim_selected below); no local
+        # max(shape) threshold variable is needed here anymore.
         if checkpoint_tensor is not None:
             if isinstance(checkpoint_tensor, tuple):
                 # if TensorLy TuckerTensor
@@ -1410,11 +1412,13 @@ class SparseTupleTensor:
         # kernel (the only one that accepts `grouping`). Disabled under subsampling
         # (sampled NNZ change every iteration) and on the multi-GPU path (the SST
         # owns its own per-shard caches).
-        _routing_max_dim = max(dim) if isinstance(dim, (tuple, list)) else dim
-        _factor_is_largedim = (
-            largedim or masked
-            or (_routing_max_dim >= 4000 if divergence == "kl" else _routing_max_dim > 4000)
-        )
+        # CHANGED (2026-06-12 review, Task 6): the dense vs. largedim decision is
+        # now the single needs_largedim() predicate, shared by routing, this cache
+        # gate AND the multi-GPU override below — so all of them agree on the
+        # selected family (previously this gate used divergence-specific 4000
+        # literals that could disagree with routing for FR dims in (3000, 4000]).
+        _largedim_selected = needs_largedim(dim, largedim=largedim, masked=masked)
+        _factor_is_largedim = _largedim_selected
         _grouping_cache = (
             NNZGroupingCache(self.tensor, shape)
             if (_sst is None and _subsample_frac >= 1.0 and _factor_is_largedim)
@@ -1477,6 +1481,17 @@ class SparseTupleTensor:
                 print(f"Warning: could not load SimLex-999 from {_SIMLEX_PATH}: {_e}")
 
         print(divergence, rank, _subsample_frac)
+        # CHANGED (2026-06-12 review, Task 6): announce the routing family chosen by
+        # the unified needs_largedim() predicate. Sharding engages iff largedim does
+        # (and n_gpus > 1), so the three cases below are mutually exclusive.
+        if _sst is not None and _largedim_selected:
+            _selected_path = f"sharded×{_n_gpus}"
+        elif _largedim_selected:
+            _selected_path = "largedim"
+        else:
+            _selected_path = "small-dim dense"
+        print(f"routing path: {_selected_path} (max_dim={max(dim) if isinstance(dim, (tuple, list)) else dim}, "
+              f"LARGEDIM_THRESHOLD reached={_largedim_selected}, n_gpus={_n_gpus})")
         # est_iter_time = self.estimate_training_time(rank=rank[0], subsample=_subsample_frac)
         # print(f"estimated training time: {est_iter_time}*{n_iter_max}={est_iter_time*n_iter_max}")
         for iteration in range(start_iteration, n_iter_max):
@@ -1486,15 +1501,19 @@ class SparseTupleTensor:
             routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step,
                                               largedim=largedim, masked=masked)
             # --- multi-GPU routing override (largedim variants only) ---
-            if _sst is not None:
-                if divergence == "kl" and (_max_dim >= 4000 or largedim):
+            # CHANGED (2026-06-12 review, Task 6): gate on the same needs_largedim()
+            # predicate as routing (via _largedim_selected) instead of re-deriving
+            # divergence-specific 4000 literals. Sharding now engages iff the
+            # largedim path is selected and a shard set exists (n_gpus > 1).
+            if _sst is not None and _largedim_selected:
+                if divergence == "kl":
                     routing = UpdateRouting(
                         factor_update=make_sharded_kl_factor_update(_sst),
                         core_update=make_sharded_kl_core_update(_sst),
                         error_fn=make_sharded_kl_compute_errors(_sst),
                         core_returns_error=routing.core_returns_error,
                     )
-                elif divergence == "fr" and (_max_dim > 4000 or largedim):
+                elif divergence == "fr":
                     routing = UpdateRouting(
                         factor_update=make_sharded_fr_factor_update(_sst),
                         core_update=make_sharded_fr_core_update(_sst),

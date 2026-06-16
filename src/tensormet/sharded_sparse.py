@@ -107,16 +107,43 @@ def _build_shard(
 
     Preserves the same ``(block_size, n_blocks)`` shape so that
     ``_blocked_coo_to_flat_indices`` works identically on shards.
-    Routes through CPU because CuPy does not support direct cross-device
-    tensor slicing.  One-time cost at initialisation.
+
+    CHANGED (2026-06-12 review, Task 7 — O-3): when *target_device* is the device
+    the source COO already lives on (always the case for shard 0, the primary), the
+    shard is built from device-local slices — no GPU→CPU→GPU round-trip. The slices
+    are copied into fresh contiguous arrays so the parent COO can be released once
+    ``from_coo`` drops its reference; otherwise a *view* into the full COO would pin
+    the entire NNZ on the primary device, defeating the point of sharding. Only the
+    genuine cross-device shards (k > 0) still round-trip through the host, because
+    CuPy does not support direct cross-device tensor slicing. One-time cost at
+    initialisation either way.
 
     When *shuffle_seed* is given (subsampling enabled), the slice is uniformly
-    shuffled on the host before transfer, so that the contiguous windows taken
-    by ``_apply_subsample`` are uniform samples without replacement.  COO entry
-    order carries no meaning for any downstream accumulation (sums are
-    order-invariant; ``cp.unique`` re-sorts its input), so the shuffle is
-    content-preserving.
+    shuffled before the shard is built, so that the contiguous windows taken by
+    ``_apply_subsample`` are uniform samples without replacement.  COO entry order
+    carries no meaning for any downstream accumulation (sums are order-invariant;
+    ``cp.unique`` re-sorts its input), so the shuffle is content-preserving. On the
+    device-local path the permutation is still drawn host-side (deterministic, and
+    identical in distribution to the cross-device shards), but only the index array
+    crosses the bus — the shard data never leaves its device.
     """
+    # Device-local short-circuit (shard 0, and any shard whose target matches source).
+    source_device = int(coo.row.device) if hasattr(coo.row, "device") else 0
+    if source_device == target_device:
+        with cp.cuda.Device(target_device):
+            row, col, data = coo.row[start:end], coo.col[start:end], coo.data[start:end]
+            if shuffle_seed is not None:
+                perm = cp.asarray(
+                    np.random.default_rng(int(shuffle_seed)).permutation(int(row.size))
+                )
+                # Fancy indexing already returns fresh contiguous arrays.
+                row, col, data = row[perm], col[perm], data[perm]
+            else:
+                # Plain slices are views into the full COO; copy so the parent NNZ
+                # arrays can be freed instead of being pinned alive by the views.
+                row, col, data = row.copy(), col.copy(), data.copy()
+            return cpx_sparse.coo_matrix((data, (row, col)), shape=coo.shape)
+
     row_np = cp.asnumpy(coo.row[start:end])
     col_np = cp.asnumpy(coo.col[start:end])
     data_np = cp.asnumpy(coo.data[start:end])
@@ -213,6 +240,7 @@ def _partial_numerator_for_shard(
     iteration: Optional[int] = None,
     masked: bool = False,
     grouping: Optional[ModeGrouping] = None,
+    batch_sink: Optional[list] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Compute the partial factor-numerator contribution from a single NNZ shard.
@@ -236,6 +264,12 @@ def _partial_numerator_for_shard(
         ShardedSparseTensor). When supplied, the per-iteration flat-index decode,
         ``cp.unique`` sort, and per-batch ``cp.where`` scan are skipped. Only
         passed on the exact (non-subsampling) path; ``None`` under subsampling.
+
+    ``batch_sink`` : list, optional
+        CHANGED (2026-06-12 review, Task 4): a one-element mutable list into which
+        the realized ``batch_cols`` (after any OOM-retry halving) is written, so the
+        owning ShardedSparseTensor can cache and reuse it next iteration. Left as a
+        keyword to preserve the 2-tuple return for direct callers.
 
     Returns
     -------
@@ -437,6 +471,9 @@ def _partial_numerator_for_shard(
             )
             bc = new_bc
 
+    # Report the batch width actually used (post-retry) so the caller can cache it.
+    if batch_sink is not None:
+        batch_sink[0] = int(bc)
     cp.cuda.Device(device_id).synchronize()
     return cp.asnumpy(numerator), (cp.asnumpy(denominator) if masked else None)
 
@@ -457,6 +494,7 @@ def _sharded_factor_update(
     pool: Optional[ThreadPoolExecutor] = None,
     masked: bool = False,
     groupings: Optional[List[Optional[ModeGrouping]]] = None,
+    batch_box: Optional[dict] = None,
 ) -> cp.ndarray:
     """
     Orchestrate multi-GPU factor numerator computation and reduce on CPU.
@@ -497,6 +535,10 @@ def _sharded_factor_update(
 
     # Parallel partial numerators (+ denominators when masked)
     partials: List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]] = [None] * len(device_ids)
+    # CHANGED (Task 4): per-shard sinks collect the realized batch width so the
+    # caller can cache it; one list per shard avoids a key collision when several
+    # shards share a device.
+    sinks: List[list] = [[None] for _ in device_ids]
     _own_pool = pool is None
     _pool = ThreadPoolExecutor(max_workers=len(device_ids)) if _own_pool else pool
     try:
@@ -519,6 +561,7 @@ def _sharded_factor_update(
                 iteration=iter_seed,
                 masked=masked,
                 grouping=(groupings[k] if groupings is not None else None),
+                batch_sink=sinks[k],
             ): k
             for k in range(len(device_ids))
         }
@@ -527,6 +570,13 @@ def _sharded_factor_update(
     finally:
         if _own_pool:
             _pool.shutdown(wait=True)
+
+    # CHANGED (Task 4): report the smallest batch width any shard used (the safe
+    # value to reuse: if one device had to shrink, all should).
+    if batch_box is not None:
+        realized = [s[0] for s in sinks if s[0] is not None]
+        if realized:
+            batch_box["batch_cols"] = min(realized)
 
     # CPU reduce + MU update
     numerator_np = np.add.reduce([p[0] for p in partials])
@@ -560,6 +610,7 @@ def _partial_core_num_for_shard(
     subsample_frac: float = 1.0,
     iteration: Optional[int] = None,
     masked: bool = False,
+    batch_sink: Optional[list] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Compute the partial core-numerator contribution from a single NNZ shard.
@@ -610,7 +661,9 @@ def _partial_core_num_for_shard(
     Den = cp.zeros_like(core_d) if masked else None
 
     # Estimate AFTER NNZ bookkeeping is live so the free-memory snapshot is accurate.
-    if batch_rhat is None:
+    # CHANGED (Task 4): only the KL two-pass path uses batch_rhat — skip its
+    # estimate (and its memGetInfo read) for the single-pass FR path.
+    if divergence == "kl" and batch_rhat is None:
         batch_rhat = int(_estimate_batch_rhat_for_tensordot(core_d, factors_d))
     if batch_num is None:
         batch_num = int(_estimate_batch_num_for_outer(core_d, factors_d))
@@ -641,6 +694,10 @@ def _partial_core_num_for_shard(
                 xhat_b = _rhat_from_factor_rows_sequential(core_d, mats, epsilon=epsilon)
                 _accumulate_core_num_outer(Den, xhat_b * den_scale, mats)
 
+    # CHANGED (Task 4): report the batch sizes used so the caller can cache them
+    # (FR leaves batch_rhat None — it runs a single pass).
+    if batch_sink is not None:
+        batch_sink[0] = (batch_rhat, int(batch_num))
     cp.cuda.Device(device_id).synchronize()
     return cp.asnumpy(Num), (cp.asnumpy(Den) if masked else None)
 
@@ -660,6 +717,7 @@ def _sharded_core_update(
     iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
     masked: bool = False,
+    batch_box: Optional[dict] = None,
 ) -> cp.ndarray:
     """
     Orchestrate multi-GPU core numerator computation and reduce on CPU.
@@ -668,6 +726,9 @@ def _sharded_core_update(
     contractions) is computed once on the primary device. Masked/completion
     objective: each shard returns a partial denominator (observed-only) that is
     reduced on CPU alongside the partial numerators.
+
+    CHANGED (Task 4): ``batch_box`` (if given) receives the realized
+    ``batch_rhat``/``batch_num`` so the caller can cache them across iterations.
     """
     primary = device_ids[0]
     N = len(shape)
@@ -682,6 +743,7 @@ def _sharded_core_update(
         factors_buf = factors
 
     partials: List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]] = [None] * len(device_ids)
+    sinks: List[list] = [[None] for _ in device_ids]  # CHANGED (Task 4): realized batch report
     _own_pool = pool is None
     _pool = ThreadPoolExecutor(max_workers=len(device_ids)) if _own_pool else pool
     try:
@@ -700,6 +762,7 @@ def _sharded_core_update(
                 subsample_frac=subsample_frac,
                 iteration=iter_seed,  # CHANGED (Task 2): window index, not a per-shard seed
                 masked=masked,
+                batch_sink=sinks[k],
             ): k
             for k in range(len(device_ids))
         }
@@ -708,6 +771,17 @@ def _sharded_core_update(
     finally:
         if _own_pool:
             _pool.shutdown(wait=True)
+
+    # CHANGED (Task 4): cache the smallest realized batch sizes across shards.
+    if batch_box is not None:
+        reports = [s[0] for s in sinks if s[0] is not None]
+        if reports:
+            rhats = [r[0] for r in reports if r[0] is not None]
+            nums = [r[1] for r in reports if r[1] is not None]
+            if rhats:
+                batch_box["batch_rhat"] = min(rhats)
+            if nums:
+                batch_box["batch_num"] = min(nums)
 
     Num_np = np.add.reduce([p[0] for p in partials])
 
@@ -754,8 +828,6 @@ def _partial_kl_error_for_shard(
     epsilon: float,
     batch_rhat: Optional[int],
     device_id: int,
-    subsample_frac: float = 1.0,
-    iteration: Optional[int] = None,
 ) -> Tuple[float, float, float]:
     """
     Compute partial KL error scalars from a single NNZ shard.
@@ -763,6 +835,13 @@ def _partial_kl_error_for_shard(
     Returns
     -------
     (kl_pos, sum_R_nz, sum_X) from this shard's NNZ contribution.
+
+    CHANGED (2026-06-12 review, Task 5 — I-1): always evaluated on the **full**
+    shard NNZ, never on a subsample window. The error terms are nonlinear
+    (``x·log(x/r)``, ``x²``) and ``sum_R_nz`` is a zero-correction, so the old
+    ``1/frac`` value rescale used for the (linear) MU numerators produced a
+    biased metric. Errors run only on log steps, so full-NNZ evaluation is cheap
+    enough and unbiased; the subsample_frac/iteration plumbing is gone.
     """
     cp.cuda.Device(device_id).use()
     core_d = cp.asarray(core_np)
@@ -777,10 +856,6 @@ def _partial_kl_error_for_shard(
 
     if nnz == 0:
         return 0.0, 0.0, 0.0
-
-    if subsample_frac < 1.0:
-        flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, iteration)
-        nnz = int(flat.size)
 
     x_nz = cp.clip(x_nz.astype(core_d.dtype), a_min=epsilon, a_max=None)
     idxs = _unravel_flat_indices_C(flat, shape)
@@ -809,8 +884,6 @@ def _sharded_kl_error(
     shape: Tuple[int, ...],
     epsilon: float,
     batch_rhat: Optional[int],
-    subsample_frac: float = 1.0,
-    iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
     masked: bool = False,
 ) -> cp.ndarray:
@@ -820,6 +893,10 @@ def _sharded_kl_error(
 
     When ``masked`` is True the zero-entry contribution (sum_R - sum_R_nz) is
     dropped, so the metric reflects the observed-only / completion objective.
+
+    CHANGED (2026-06-12 review, Task 5 — I-1): the error is always computed on
+    the full shard NNZ (no subsample window), so the subsample_frac/iter_seed
+    plumbing was removed — see ``_partial_kl_error_for_shard``.
     """
     primary = device_ids[0]
     core_np = cp.asnumpy(core)
@@ -839,8 +916,6 @@ def _sharded_kl_error(
                 epsilon=epsilon,
                 batch_rhat=batch_rhat,
                 device_id=device_ids[k],
-                subsample_frac=subsample_frac,
-                iteration=iter_seed,  # CHANGED (Task 2): window index, not a per-shard seed
             ): k
             for k in range(len(device_ids))
         }
@@ -876,8 +951,6 @@ def _partial_fr_error_for_shard(
     epsilon: float,
     batch_rhat: Optional[int],
     device_id: int,
-    subsample_frac: float = 1.0,
-    iteration: Optional[int] = None,
     masked: bool = False,
 ) -> Tuple[float, float, float]:
     """
@@ -888,6 +961,12 @@ def _partial_fr_error_for_shard(
     (norm_X_sq, inner_prod, residual_sq) from this shard's NNZ contribution.
     ``inner_prod`` is 0 when ``masked`` (the full ‖X̂‖² term is not used);
     ``residual_sq`` (= sum (x - x̂)²) is 0 when not ``masked``.
+
+    CHANGED (2026-06-12 review, Task 5 — I-1): always evaluated on the **full**
+    shard NNZ. ``norm_X_sq`` sums ``x²`` and ``residual_sq`` sums ``(x-x̂)²``;
+    the ``1/frac`` value rescale used for the (linear) MU numerators biases both
+    quadratic terms by ``1/frac``, so the metric is computed unsubsampled. Errors
+    run only on log steps, so this is cheap; subsample plumbing removed.
     """
     cp.cuda.Device(device_id).use()
     core_d = cp.asarray(core_np)
@@ -902,10 +981,6 @@ def _partial_fr_error_for_shard(
 
     if nnz == 0:
         return 0.0, 0.0, 0.0
-
-    if subsample_frac < 1.0:
-        flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, iteration)
-        nnz = int(flat.size)
 
     x_nz = cp.clip(x_nz.astype(core_d.dtype), a_min=0.0, a_max=None)
     idxs = _unravel_flat_indices_C(flat, shape)
@@ -937,8 +1012,6 @@ def _sharded_fr_error(
     shape: Tuple[int, ...],
     epsilon: float,
     batch_rhat: Optional[int],
-    subsample_frac: float = 1.0,
-    iter_seed: Optional[int] = None,
     pool: Optional[ThreadPoolExecutor] = None,
     masked: bool = False,
 ) -> cp.ndarray:
@@ -949,6 +1022,10 @@ def _sharded_fr_error(
     Full objective uses ‖X - X̂‖²_F = ‖X‖² + ‖X̂‖² - 2⟨X, X̂⟩, with ‖X̂‖²
     computed analytically on the primary device (no NNZ). The masked/completion
     objective uses the observed-only relative RMSE sqrt(sum_Ω (x - x̂)²) / ‖X‖.
+
+    CHANGED (2026-06-12 review, Task 5 — I-1): the error is always computed on
+    the full shard NNZ (no subsample window), so the subsample_frac/iter_seed
+    plumbing was removed — see ``_partial_fr_error_for_shard``.
     """
     primary = device_ids[0]
     N = len(factors)
@@ -969,8 +1046,6 @@ def _sharded_fr_error(
                 epsilon=epsilon,
                 batch_rhat=batch_rhat,
                 device_id=device_ids[k],
-                subsample_frac=subsample_frac,
-                iteration=iter_seed,  # CHANGED (Task 2): window index, not a per-shard seed
                 masked=masked,
             ): k
             for k in range(len(device_ids))
@@ -1046,28 +1121,42 @@ class ShardedSparseTensor:
 
     Attributes
     ----------
-    full_tensor : cpx_sparse.coo_matrix  — full COO on device_ids[0]
+    full_tensor : cpx_sparse.coo_matrix | None  — full COO on device_ids[0] for the
+                  single-shard delegate path; ``None`` for multi-shard (Task 7 — the
+                  primary device holds only its own ~1/n shard, and the caller's own
+                  reference, e.g. ``TuckerDecomposition.tensor``, is the canonical copy)
     orig_shape  : tuple[int, ...]        — original N-D tensor shape
     device_ids  : list[int]              — one per shard; [0] is primary
     shards      : list[coo_matrix]       — shards[k] lives on device_ids[k]
     n_shards    : int
+    nnz         : int                    — total NNZ across all shards
     subsample_frac : float               — NNZ fraction; 1.0 = exact
     """
 
     def __init__(
         self,
-        full_tensor: cpx_sparse.coo_matrix,
+        full_tensor: Optional[cpx_sparse.coo_matrix],
         orig_shape: Tuple[int, ...],
         device_ids: List[int],
         shards: List[cpx_sparse.coo_matrix],
         subsample_frac: float = 1.0,
         masked: bool = False,
+        nnz: Optional[int] = None,
     ) -> None:
         self.full_tensor = full_tensor
         self.orig_shape = orig_shape
         self.device_ids = device_ids
         self.shards = shards
         self.n_shards = len(device_ids)
+        # CHANGED (2026-06-12 review, Task 7): NNZ metadata kept explicitly so the
+        # multi-shard path no longer needs to retain the device-resident full COO
+        # just to know its size.
+        if nnz is not None:
+            self.nnz = int(nnz)
+        elif full_tensor is not None:
+            self.nnz = int(full_tensor.row.size)
+        else:
+            self.nnz = int(sum(int(s.row.size) for s in shards))
         self.subsample_frac = float(subsample_frac)
         # Optimisation objective: when True, fit only observed entries
         # (weighted/completion objective), mirroring cfg.exp.objective="masked".
@@ -1082,6 +1171,15 @@ class ShardedSparseTensor:
         self._grouping_caches: List[Dict[int, ModeGrouping]] = [
             {} for _ in range(self.n_shards)
         ]
+        # CHANGED (2026-06-12 review, Task 4): cache the per-(kernel, mode) batch
+        # sizes so the per-iteration hot path stops calling _estimate_batch_*
+        # (each of which reads driver memGetInfo). The estimates depend only on the
+        # static core/factor shapes, so the first iteration's value is reused. The
+        # factor path's OOM-retry can shrink a batch mid-update; the realized width
+        # is fed back here and the cache is kept monotonically non-increasing
+        # ("persist the reduced value") so later iterations don't re-trip the retry.
+        self._factor_batch_cache: Dict[Tuple[str, int], int] = {}
+        self._core_batch_cache: Dict[str, Dict[str, int]] = {}
         # Persistent pool: threads (and their cuBLAS handles) live for the
         # lifetime of this object.  Re-creating a pool each call causes
         # thread-ID recycling in Python 3.13 which leaves stale cuBLAS
@@ -1139,11 +1237,38 @@ class ShardedSparseTensor:
         epoch-like coverage of each shard (a stride of ``n_shards·n_sample``
         could alias with the shard length and revisit the same window forever,
         e.g. frac=0.5 with 2 shards).
+
+        CHANGED (2026-06-12 review, Task 4): no longer flushes every device's
+        memory pool each iteration. Returning pool blocks to the driver forced a
+        device sync and a full ``cudaMalloc`` storm on the next iteration's
+        working set. The pool is now left intact (its blocks are reused), and the
+        only remaining flush is the on-demand one inside the factor OOM-retry
+        handler in ``_partial_numerator_for_shard``.
         """
         self._iter_seed = int(iteration)
-        for did in self.device_ids:
-            with cp.cuda.Device(did):
-                cp.get_default_memory_pool().free_all_blocks()
+
+    def _record_factor_batch(self, key: Tuple[str, int], realized: Optional[int]) -> None:
+        """Cache the realized factor batch width, kept monotonically non-increasing.
+
+        CHANGED (Task 4): once an OOM-retry shrinks a batch, the smaller value is
+        persisted so later iterations start there instead of re-tripping the retry.
+        """
+        if realized is None:
+            return
+        prev = self._factor_batch_cache.get(key)
+        self._factor_batch_cache[key] = realized if prev is None else min(prev, int(realized))
+
+    def _record_core_batch(self, divergence: str, box: dict) -> None:
+        """Cache the realized core batch sizes (``batch_rhat``/``batch_num``)."""
+        cached = dict(self._core_batch_cache.get(divergence, {}))
+        for kk in ("batch_rhat", "batch_num"):
+            v = box.get(kk)
+            if v is None:
+                continue
+            prev = cached.get(kk)
+            cached[kk] = int(v) if prev is None else min(prev, int(v))
+        if cached:
+            self._core_batch_cache[divergence] = cached
 
     def _mode_groupings(self, mode: int) -> Optional[List[ModeGrouping]]:
         """Return one :class:`ModeGrouping` per shard for *mode* (Task 3).
@@ -1220,8 +1345,16 @@ class ShardedSparseTensor:
             for k in range(n)
         ]
 
-        return cls(coo_coo, orig_shape, list(device_ids), shards,
-                   subsample_frac=subsample_frac, masked=masked)
+        # CHANGED (2026-06-12 review, Task 7 — O-3): do NOT retain `coo_coo` as a
+        # device-resident `full_tensor`. It is only ever read on the single-shard
+        # delegate path (above), so on the multi-shard path it would be dead weight —
+        # a full extra NNZ copy on the most contended device on top of shard 0. The
+        # caller's own reference (TuckerDecomposition.tensor) is the canonical full
+        # copy; we keep only the nnz metadata. Dropping it here lets the local
+        # `coo_coo` be collected once the shards (each holding their own ~1/n copy)
+        # are built.
+        return cls(None, orig_shape, list(device_ids), shards,
+                   subsample_frac=subsample_frac, masked=masked, nnz=nnz)
 
     # ------------------------------------------------------------------
     # Factor update methods
@@ -1246,14 +1379,21 @@ class ShardedSparseTensor:
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_cols=batch_cols, verbose=verbose, masked=self.masked,
             )
-        return _sharded_factor_update(
+        # CHANGED (Task 4): reuse the cached batch width; capture the realized one.
+        key = ("kl", mode)
+        bc = batch_cols if batch_cols is not None else self._factor_batch_cache.get(key)
+        box: dict = {}
+        A_new = _sharded_factor_update(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, mode=mode, shape=shape,
-            divergence="kl", epsilon=epsilon, batch_cols=batch_cols, verbose=verbose,
+            divergence="kl", epsilon=epsilon, batch_cols=bc, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
             pool=self._pool, masked=self.masked,
             groupings=self._mode_groupings(mode),
+            batch_box=box,
         )
+        self._record_factor_batch(key, box.get("batch_cols"))
+        return A_new
 
     def fr_factor_update(
         self,
@@ -1274,14 +1414,21 @@ class ShardedSparseTensor:
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_cols=batch_cols, verbose=verbose, masked=self.masked,
             )
-        return _sharded_factor_update(
+        # CHANGED (Task 4): reuse the cached batch width; capture the realized one.
+        key = ("fr", mode)
+        bc = batch_cols if batch_cols is not None else self._factor_batch_cache.get(key)
+        box: dict = {}
+        A_new = _sharded_factor_update(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, mode=mode, shape=shape,
-            divergence="fr", epsilon=epsilon, batch_cols=batch_cols, verbose=verbose,
+            divergence="fr", epsilon=epsilon, batch_cols=bc, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
             pool=self._pool, masked=self.masked,
             groupings=self._mode_groupings(mode),
+            batch_box=box,
         )
+        self._record_factor_batch(key, box.get("batch_cols"))
+        return A_new
 
     # ------------------------------------------------------------------
     # Core update methods
@@ -1308,14 +1455,22 @@ class ShardedSparseTensor:
                 batch_rhat=batch_rhat, batch_num=batch_num, verbose=verbose,
                 masked=self.masked,
             )
-        return _sharded_core_update(
+        # CHANGED (Task 4): reuse cached batch sizes; capture the realized ones.
+        cached = self._core_batch_cache.get("kl", {})
+        brhat = batch_rhat if batch_rhat is not None else cached.get("batch_rhat")
+        bnum = batch_num if batch_num is not None else cached.get("batch_num")
+        box: dict = {}
+        core_new = _sharded_core_update(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, shape=shape,
             divergence="kl", epsilon=epsilon,
-            batch_rhat=batch_rhat, batch_num=batch_num, verbose=verbose,
+            batch_rhat=brhat, batch_num=bnum, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
             pool=self._pool, masked=self.masked,
+            batch_box=box,
         )
+        self._record_core_batch("kl", box)
+        return core_new
 
     def fr_core_update(
         self,
@@ -1336,14 +1491,21 @@ class ShardedSparseTensor:
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_num=batch_num, verbose=verbose, masked=self.masked,
             )
-        return _sharded_core_update(
+        # CHANGED (Task 4): reuse cached batch_num; capture the realized one.
+        cached = self._core_batch_cache.get("fr", {})
+        bnum = batch_num if batch_num is not None else cached.get("batch_num")
+        box: dict = {}
+        core_new = _sharded_core_update(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, shape=shape,
             divergence="fr", epsilon=epsilon,
-            batch_rhat=None, batch_num=batch_num, verbose=verbose,
+            batch_rhat=None, batch_num=bnum, verbose=verbose,
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
             pool=self._pool, masked=self.masked,
+            batch_box=box,
         )
+        self._record_core_batch("fr", box)
+        return core_new
 
     # ------------------------------------------------------------------
     # Error computation methods
@@ -1367,11 +1529,12 @@ class ShardedSparseTensor:
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_rhat=batch_rhat, verbose=verbose, masked=self.masked,
             )
+        # CHANGED (2026-06-12 review, Task 5 — I-1): error is computed on the
+        # full shard NNZ (unbiased); no subsample_frac/iter_seed is forwarded.
         return _sharded_kl_error(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, shape=shape,
             epsilon=epsilon, batch_rhat=batch_rhat,
-            subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
             pool=self._pool, masked=self.masked,
         )
 
@@ -1393,11 +1556,12 @@ class ShardedSparseTensor:
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_rhat=batch_rhat, verbose=verbose, masked=self.masked,
             )
+        # CHANGED (2026-06-12 review, Task 5 — I-1): error is computed on the
+        # full shard NNZ (unbiased); no subsample_frac/iter_seed is forwarded.
         return _sharded_fr_error(
             shards=self.shards, device_ids=self.device_ids,
             core=core, factors=factors, shape=shape,
             epsilon=epsilon, batch_rhat=batch_rhat,
-            subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
             pool=self._pool, masked=self.masked,
         )
 

@@ -11,6 +11,32 @@ from tensormet.distance import (kl_factor_update, kl_core_update, kl_compute_err
 # -- Routing function --
 Divergence = Literal["kl", "fr"]
 
+# CHANGED (2026-06-12 review, Task 6): single source of truth for the dense vs.
+# largedim/NNZ-streaming routing decision. Replaces the scattered literal
+# `3000`/`4000` comparisons that previously lived (and disagreed: KL factor used
+# 4000 while KL core/error used 3000) in both this module and the multi-GPU
+# override in TuckerDecomposition.fit. One constant, one predicate, used for all
+# three kernel choices AND the sharding override so factor/core/error always
+# select the same family and multi-GPU engages iff the largedim path does.
+LARGEDIM_THRESHOLD = 3000
+
+
+def needs_largedim(dim, largedim: bool = False, masked: bool = False) -> bool:
+    """Whether the largedim (NNZ-streaming) kernel family must be used.
+
+    Returns True when the caller forces it (``largedim``), when the masked
+    objective is requested (only the largedim kernels implement masking), or
+    when the largest mode dimension reaches :data:`LARGEDIM_THRESHOLD`.
+
+    This is the *only* place the size threshold is encoded; callers (routing
+    below and the multi-GPU override in ``fit``) must funnel through it so the
+    dense/largedim/sharded choice stays consistent across factor, core and
+    error kernels.
+    """
+    _max_dim = max(dim) if isinstance(dim, (tuple, list)) else dim
+    return bool(largedim or masked or (_max_dim >= LARGEDIM_THRESHOLD))
+
+
 @dataclass(frozen=True)
 class UpdateRouting:
     factor_update: Callable
@@ -30,15 +56,15 @@ def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedi
         largedim NNZ-streaming kernels (they work for any dimensionality), so we
         always route to those and bind ``masked=True`` via functools.partial.
     """
-    _max_dim = max(dim) if isinstance(dim, (tuple, list)) else dim
-    # Masked kernels stream over NNZ and are correct at any size, so force the
-    # largedim path whenever the masked objective is requested.
-    force_large = largedim or masked
+    # Single decision for the whole step: factor, core and error all follow the
+    # same family. `masked` is folded in by needs_largedim (masked kernels stream
+    # over NNZ and are correct at any size, so they force the largedim path).
+    force_large = needs_largedim(dim, largedim=largedim, masked=masked)
 
     if divergence == "kl":
-        factor_fn = kl_factor_update_largedim if (_max_dim >= 4000 or force_large) else kl_factor_update
-        core_fn = kl_core_update_largedim if (_max_dim >= 3000 or force_large) else kl_core_update
-        error_fn = kl_compute_errors_largedim if (_max_dim >= 3000 or force_large) else kl_compute_errors
+        factor_fn = kl_factor_update_largedim if force_large else kl_factor_update
+        core_fn = kl_core_update_largedim if force_large else kl_core_update
+        error_fn = kl_compute_errors_largedim if force_large else kl_compute_errors
         if masked:
             factor_fn = partial(factor_fn, masked=True)
             core_fn = partial(core_fn, masked=True)
@@ -51,7 +77,7 @@ def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedi
         )
 
     if divergence == "fr":
-        if _max_dim <= 4000 and not force_large:
+        if not force_large:
             return UpdateRouting(
                     factor_update=fr_factor_update,
                     core_update=fr_combined_core_errors if log_step else fr_core_update,  # returns (core, rel_error)
