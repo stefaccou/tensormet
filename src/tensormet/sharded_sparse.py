@@ -95,6 +95,23 @@ cp, cpx_sparse = make_lazy_cupy_pair()
 # Internal utilities
 # ---------------------------------------------------------------------------
 
+def _array_device_id(arr) -> Optional[int]:
+    """Best-effort CUDA device ordinal for *arr*; ``None`` if it is not on a GPU.
+
+    CuPy arrays expose ``.device`` as a ``cupy.cuda.Device`` whose ``int()`` is the
+    ordinal. NumPy >= 2.0 also exposes ``.device``, but as the string ``'cpu'`` (so
+    ``int(...)`` raises) — those arrays are not CUDA-resident and must take the
+    host-transfer path, hence ``None``.
+    """
+    dev = getattr(arr, "device", None)
+    if dev is None:
+        return None
+    try:
+        return int(dev)
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_shard(
     coo: cpx_sparse.coo_matrix,
     start: int,
@@ -128,8 +145,8 @@ def _build_shard(
     crosses the bus — the shard data never leaves its device.
     """
     # Device-local short-circuit (shard 0, and any shard whose target matches source).
-    source_device = int(coo.row.device) if hasattr(coo.row, "device") else 0
-    if source_device == target_device:
+    source_device = _array_device_id(coo.row)
+    if source_device is not None and source_device == target_device:
         with cp.cuda.Device(target_device):
             row, col, data = coo.row[start:end], coo.col[start:end], coo.data[start:end]
             if shuffle_seed is not None:
