@@ -18,10 +18,15 @@ from functools import reduce
 import hashlib, json
 
 _ALL_TENSORS = [
-    "counting", "countingLog", "countingLogSoftPlus", "countingLogShifted",
+    "counting", "countingLog", "countingLogEps",
+    "probLog", "probLogSoftPlus", "probLogShifted",
     "sii", "siiSoftPlus", "siiShifted",
     "sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat",
 ]
+
+# epsilon added after log(count) so that singletons (count == 1) map to a small
+# non-zero value instead of log(1) == 0, keeping them in the sparse tensor.
+_COUNT_LOG_EPS = 1e-8
 
 
 # ── new top-level worker (must be picklable → module level) ─────
@@ -399,7 +404,9 @@ def populate_tensors_parquet(
         want = _ALL_TENSORS
 
     need_count     = "counting"    in want
-    need_count_log = any(t in want for t in ("countingLog", "countingLogSoftPlus", "countingLogShifted"))
+    need_prob_log  = any(t in want for t in ("probLog", "probLogSoftPlus", "probLogShifted"))
+    need_count_log = "countingLog" in want          # pure log(count); log(1)=0 kept as-is
+    need_count_log_eps = "countingLogEps" in want
     need_sii       = any(t in want for t in ("sii", "siiSoftPlus", "siiShifted"))
     need_sc        = any(t in want for t in ("sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat"))
 
@@ -751,7 +758,9 @@ def populate_tensors_parquet(
         # filter tuples from max counter
         indices = []
         count_values     = [] if need_count     else None
+        prob_log_values  = [] if need_prob_log  else None
         count_log_values = [] if need_count_log else None
+        count_log_eps_values = [] if need_count_log_eps else None
         sii_values       = [] if need_sii       else None
         sc_values        = [] if need_sc        else None
 
@@ -763,8 +772,15 @@ def populate_tensors_parquet(
             indices.append([col2i[cols_to_build[i]][el] for i, el in enumerate(els_to_check)])
             if need_count:
                 count_values.append(float(cnt))
+            if need_prob_log:
+                # uses log of PROBABILITY --> Negative
+                prob_log_values.append(log(cnt / total_len))
             if need_count_log:
-                count_log_values.append(log(cnt / total_len))
+                # pure log of the raw COUNT --> non-negative; log(1)=0 kept as-is
+                count_log_values.append(log(cnt))
+            if need_count_log_eps:
+                # uses log of the raw COUNT --> non-negative; eps keeps log(1) > 0
+                count_log_eps_values.append(log(cnt) + _COUNT_LOG_EPS)
             # Use finite values instead of -inf to prevent coalesce/sorting issues
             if need_sii:
                 sii_val = specific_interaction_information(els_to_check)
@@ -780,8 +796,12 @@ def populate_tensors_parquet(
             empty = torch.empty((0,), dtype=torch.float32)
             if need_count:
                 count_tensor = _make_sparse_coo(idx, empty, size).coalesce()
+            if need_prob_log:
+                prob_log_tensor = _make_sparse_coo(idx, empty, size).coalesce()
             if need_count_log:
                 count_log_tensor = _make_sparse_coo(idx, empty, size).coalesce()
+            if need_count_log_eps:
+                count_log_eps_tensor = _make_sparse_coo(idx, empty, size).coalesce()
             if need_sii:
                 sii_tensor = _make_sparse_coo(idx, empty, size).coalesce()
             if need_sc:
@@ -793,8 +813,12 @@ def populate_tensors_parquet(
             # Create tensors
             if need_count:
                 count_tensor = _make_sparse_coo(idx, torch.tensor(count_values, dtype=torch.float32), size)
+            if need_prob_log:
+                prob_log_tensor = _make_sparse_coo(idx, torch.tensor(prob_log_values, dtype=torch.float32), size)
             if need_count_log:
                 count_log_tensor = _make_sparse_coo(idx, torch.tensor(count_log_values, dtype=torch.float32), size)
+            if need_count_log_eps:
+                count_log_eps_tensor = _make_sparse_coo(idx, torch.tensor(count_log_eps_values, dtype=torch.float32), size)
             if need_sii:
                 sii_tensor = _make_sparse_coo(idx, torch.tensor(sii_values, dtype=torch.float32), size)
             if need_sc:
@@ -803,29 +827,33 @@ def populate_tensors_parquet(
             # CRITICAL: Clear Python lists from memory before coalescing
             del indices
             if need_count:     del count_values
+            if need_prob_log:  del prob_log_values
             if need_count_log: del count_log_values
+            if need_count_log_eps: del count_log_eps_values
             if need_sii:       del sii_values
             if need_sc:        del sc_values
 
             # Coalesce (this is the memory-intensive part)
             if need_count:     count_tensor     = count_tensor.coalesce()
+            if need_prob_log:  prob_log_tensor  = prob_log_tensor.coalesce()
             if need_count_log: count_log_tensor = count_log_tensor.coalesce()
+            if need_count_log_eps: count_log_eps_tensor = count_log_eps_tensor.coalesce()
             if need_sii:       sii_tensor       = sii_tensor.coalesce()
             if need_sc:        sc_tensor        = sc_tensor.coalesce()
 
         # normalized variants
         eps = 1e-8
-        if need_count_log:
-            if count_log_tensor._nnz():
-                vvals = count_log_tensor.values()
-                if "countingLogShifted" in want: # This is normalised, raw didn't work for our usecase
+        if need_prob_log:
+            if prob_log_tensor._nnz():
+                vvals = prob_log_tensor.values()
+                if "probLogShifted" in want: # This is normalised, raw didn't work for our usecase
                     _v = vvals - vvals.min()
-                    count_log_shifted  = _make_sparse_coo(count_log_tensor.indices(), _v / (_v.max() + eps), size).coalesce()
-                if "countingLogSoftPlus" in want:
-                    count_log_softplus = _make_sparse_coo(count_log_tensor.indices(), torch.nn.functional.softplus(vvals), size).coalesce()
+                    prob_log_shifted  = _make_sparse_coo(prob_log_tensor.indices(), _v / (_v.max() + eps), size).coalesce()
+                if "probLogSoftPlus" in want:
+                    prob_log_softplus = _make_sparse_coo(prob_log_tensor.indices(), torch.nn.functional.softplus(vvals), size).coalesce()
             else:
-                if "countingLogShifted"  in want: count_log_shifted  = count_log_tensor
-                if "countingLogSoftPlus" in want: count_log_softplus = count_log_tensor
+                if "probLogShifted"  in want: prob_log_shifted  = prob_log_tensor
+                if "probLogSoftPlus" in want: prob_log_softplus = prob_log_tensor
 
         if need_sii:
             if sii_tensor._nnz():
@@ -862,8 +890,10 @@ def populate_tensors_parquet(
         if save:
             if "counting"           in want: torch.save(count_tensor,      f"{p}/counting_{order}D_{dim_str}d{suffix}.pt")
             if "countingLog"        in want: torch.save(count_log_tensor,  f"{p}/countingLog_{order}D_{dim_str}d{suffix}.pt")
-            if "countingLogShifted" in want: torch.save(count_log_shifted, f"{p}/countingLogShifted_{order}D_{dim_str}d{suffix}.pt")
-            if "countingLogSoftPlus" in want: torch.save(count_log_softplus, f"{p}/countingLogSoftPlus_{order}D_{dim_str}d{suffix}.pt")
+            if "countingLogEps"     in want: torch.save(count_log_eps_tensor, f"{p}/countingLogEps_{order}D_{dim_str}d{suffix}.pt")
+            if "probLog"            in want: torch.save(prob_log_tensor,   f"{p}/probLog_{order}D_{dim_str}d{suffix}.pt")
+            if "probLogShifted"     in want: torch.save(prob_log_shifted,  f"{p}/probLogShifted_{order}D_{dim_str}d{suffix}.pt")
+            if "probLogSoftPlus"    in want: torch.save(prob_log_softplus, f"{p}/probLogSoftPlus_{order}D_{dim_str}d{suffix}.pt")
             if "sii"         in want: torch.save(sii_tensor,       f"{p}/sii_{order}D_{dim_str}d{suffix}.pt")
             if "sc"          in want: torch.save(sc_tensor,        f"{p}/sc_{order}D_{dim_str}d{suffix}.pt")
             if "scSoftPlus"  in want: torch.save(sc_softplus,      f"{p}/scSoftPlus_{order}D_{dim_str}d{suffix}.pt")
@@ -877,8 +907,10 @@ def populate_tensors_parquet(
             built = {}
             if "counting"            in want: built["counting"]            = count_tensor
             if "countingLog"         in want: built["countingLog"]         = count_log_tensor
-            if "countingLogShifted"  in want: built["countingLogShifted"]  = count_log_shifted
-            if "countingLogSoftPlus" in want: built["countingLogSoftPlus"] = count_log_softplus
+            if "countingLogEps"      in want: built["countingLogEps"]      = count_log_eps_tensor
+            if "probLog"             in want: built["probLog"]             = prob_log_tensor
+            if "probLogShifted"      in want: built["probLogShifted"]      = prob_log_shifted
+            if "probLogSoftPlus"     in want: built["probLogSoftPlus"]     = prob_log_softplus
             if "sii"         in want: built["sii"]         = sii_tensor
             if "sc"          in want: built["sc"]          = sc_tensor
             if "siiSoftPlus" in want: built["siiSoftPlus"] = sii_softplus

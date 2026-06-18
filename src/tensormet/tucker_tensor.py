@@ -161,7 +161,8 @@ class TuckerDecomposition:
                     vocab: dict with keys 'vocab_v','vocab_s','vocab_o','v2i','s2i','o2i'
         """
         if method not in {"counting", "sc", "sii",
-                          "countingLog", "countingLogSoftPlus", "countingLogShifted",
+                          "countingLog", "countingLogEps",
+                          "probLog", "probLogSoftPlus", "probLogShifted",
                           "scSoftPlus", "scShifted", "scSoftPlusFlat",
                           "siiSoftPlus", "siiShifted"}:
             raise ValueError("method must be one of {'counting','sc','sii'}")
@@ -972,14 +973,16 @@ class SparseTupleTensor:
         """
         if method not in {
             "counting", "sc", "sii",
-            "countingLog", "countingLogSoftPlus", "countingLogShifted",
+            "countingLog", "countingLogEps",
+            "probLog", "probLogSoftPlus", "probLogShifted",
             "siiSoftPlus", "siiShifted",
             "scSoftPlus", "scShifted", "scSoftPlusFlat",
         }:
             raise ValueError(
                 "method must be one of "
                 "{'counting','sc','sii', \n"
-                "'countingLog', 'countingLogSoftPlus', 'countingLogShifted'\n"
+                "'countingLog', 'countingLogEps', \n"
+                "'probLog', 'probLogSoftPlus', 'probLogShifted'\n"
                 "'siiSoftPlus','siiShifted','scSoftPlus','scShifted','scSoftPlusFlat'}"
             )
 

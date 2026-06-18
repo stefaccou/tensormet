@@ -556,7 +556,7 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
                              "Tokens absent from all marginals are silently skipped.")
     parser.add_argument("--tensors-to-build", type=_parse_cols_to_build, dest="tensors_to_build", default=None,
                         help="Comma-separated list of tensor names to build. Omit to build all. "
-                             "Valid: counting,countingLog,sii,siiSoftPlus,siiShifted,sc,scSoftPlus,scShifted,scSoftPlusFlat. "
+                             "Valid: counting,countingLog,countingLogEps,probLog,probLogSoftPlus,probLogShifted,sii,siiSoftPlus,siiShifted,sc,scSoftPlus,scShifted,scSoftPlusFlat. "
                              "E.g. --tensors-to-build counting,countingLog,sc")
 
     parsed = parser.parse_args(args=argv)
