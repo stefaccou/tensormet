@@ -780,6 +780,45 @@ def _extract_ngrams_from_lemmas(lemmas: list[str], n: int, sent_id: int) -> list
     return rows
 
 
+def _extract_ngrams_padded(
+    doc_sents: list[tuple[int, list[str]]],
+    n: int,
+    bos: str,
+    eos: str,
+) -> list[dict]:
+    """
+    Build one continuous, boundary-padded token stream for a single document and
+    slide an n-gram window across it.
+
+    Each sentence is wrapped as ``bos <lemmas...> eos`` and the sentences are
+    concatenated in order, so windows span sentence boundaries (… eos bos …).
+    Unlike `_extract_ngrams_from_lemmas`, this also captures sentences shorter
+    than n (their tokens still contribute via the boundary windows). The window
+    never crosses the document boundary — documents are processed independently.
+
+    Each emitted row carries the sent_id of its *first* token, which keeps a
+    sentence's rows contiguous and in write order.
+    """
+    tokens: list[str] = []
+    tok_sids: list[int] = []
+    for sid, lemmas in doc_sents:
+        tokens.append(bos)
+        tok_sids.append(sid)
+        for lem in lemmas:
+            tokens.append(lem)
+            tok_sids.append(sid)
+        tokens.append(eos)
+        tok_sids.append(sid)
+
+    rows: list[dict] = []
+    for i in range(len(tokens) - n + 1):
+        row: dict = {"sent_id": tok_sids[i]}
+        for j in range(n):
+            row[f"w{j + 1}"] = tokens[i + j]
+        rows.append(row)
+    return rows
+
+
 def _safe_open_part_writer(output_dir: Path, part_id: int, schema: pa.Schema):
     """Open a ParquetWriter for the given part, bumping part_id if the file already exists."""
     while _part_path(output_dir, part_id).exists():
@@ -805,6 +844,15 @@ def create_ngram_vectors_parquet_sharded(
     if not ngram_orders:
         raise ValueError(
             f"create_ngram_vectors_parquet_sharded called with non-ngram type '{cfg.exp.type}'"
+        )
+
+    pad_sequence = cfg.exp.pad_sequence
+    bos_token = cfg.exp.bos_token
+    eos_token = cfg.exp.eos_token
+    if pad_sequence:
+        print(
+            f"[pad-sequence] Wrapping each sentence as '{bos_token} ... {eos_token}' and "
+            f"sliding the window across document boundaries."
         )
 
     # base_dir is used only for logs (runs.jsonl, vector_creation_log.txt).
@@ -930,17 +978,26 @@ def create_ngram_vectors_parquet_sharded(
     try:
         for text_batch in chunked(gen_texts(), cfg.exp.batch_size * 8):
             for doc in nlp.pipe(text_batch, batch_size=cfg.exp.batch_size):
+                doc_sents: list[tuple[int, list[str]]] = []
                 for sent in doc.sents:
                     lemmas = [
                         tok.lemma_.lower()
                         for tok in sent
                         if not tok.is_punct and not tok.is_space and tok.lemma_.strip()
                     ]
-                    for n in ngram_orders:
-                        rows = _extract_ngrams_from_lemmas(lemmas, n, global_sent_id)
-                        if rows:
-                            ns[n]["buffer"].extend(rows)
+                    if lemmas:
+                        doc_sents.append((global_sent_id, lemmas))
                     global_sent_id += 1
+
+                for n in ngram_orders:
+                    if pad_sequence:
+                        rows = _extract_ngrams_padded(doc_sents, n, bos_token, eos_token)
+                    else:
+                        rows = []
+                        for sid, lemmas in doc_sents:
+                            rows.extend(_extract_ngrams_from_lemmas(lemmas, n, sid))
+                    if rows:
+                        ns[n]["buffer"].extend(rows)
 
             # Flush any n whose buffer is full, then checkpoint together.
             flushed = False

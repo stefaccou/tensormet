@@ -452,6 +452,13 @@ class VectorExperimentConfig:
     batch_size: int = 256
     cpu_frac: float = 0.66
 
+    # sequence padding: wrap each sentence as `bos <lemmas...> eos` and slide the
+    # n-gram window across the whole document, so windows span sentence
+    # boundaries (… </s> <s> …). The window resets at document boundaries.
+    pad_sequence: bool = False
+    bos_token: str = "<s>"
+    eos_token: str = "</s>"
+
     # logging
     log_every_s: float = 30.0
 
@@ -492,6 +499,8 @@ class VectorRunConfig:
         """Per-order n-gram parquet directory."""
         label = self._path_label()
         prefix = f"{n}-gram-raw" if raw else f"{n}-gram"
+        if self.exp.pad_sequence:
+            prefix += "-pad"
         return self.exp.output_dir / f"{prefix}-{label}_{self.exp.target_vectors}"
 
 

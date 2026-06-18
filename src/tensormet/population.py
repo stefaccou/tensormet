@@ -841,6 +841,15 @@ def populate_tensors_parquet(
             if need_sii:       sii_tensor       = sii_tensor.coalesce()
             if need_sc:        sc_tensor        = sc_tensor.coalesce()
 
+        # countingLog: drop hapax legomena whose log(count) == 0 (cnt == 1), not stored explicit zeros.
+        # the epsilon path avoids this by adding the small nonzero constant
+        if need_count_log and count_log_tensor._nnz():
+            vvals = count_log_tensor.values()
+            nz = vvals != 0
+            count_log_tensor = _make_sparse_coo(
+                count_log_tensor.indices()[:, nz], vvals[nz], size
+            ).coalesce()
+
         # normalized variants
         eps = 1e-8
         if need_prob_log:
@@ -887,37 +896,34 @@ def populate_tensors_parquet(
             vocab[f"{col}2i"] = col2i[col]
 
         p = f"{path_to_tensors}/populated"
+
+        # Collect every requested tensor under its canonical name. Shared by the
+        # save and in-memory paths so the reported sizes match what is persisted.
+        built = {}
+        if "counting"        in want: built["counting"]        = count_tensor
+        if "countingLog"     in want: built["countingLog"]     = count_log_tensor
+        if "countingLogEps"  in want: built["countingLogEps"]  = count_log_eps_tensor
+        if "probLog"         in want: built["probLog"]         = prob_log_tensor
+        if "probLogShifted"  in want: built["probLogShifted"]  = prob_log_shifted
+        if "probLogSoftPlus" in want: built["probLogSoftPlus"] = prob_log_softplus
+        if "sii"          in want: built["sii"]          = sii_tensor
+        if "siiSoftPlus"  in want: built["siiSoftPlus"]  = sii_softplus
+        if "siiShifted"   in want: built["siiShifted"]   = sii_shifted
+        if "sc"           in want: built["sc"]           = sc_tensor
+        if "scSoftPlus"   in want: built["scSoftPlus"]   = sc_softplus
+        if "scShifted"    in want: built["scShifted"]    = sc_shifted
+        if "scSoftPlusFlat" in want: built["scSoftPlusFlat"] = sc_softplus_flat
+
+        # Report tensor sizes (nonzero entries) just before saving them.
+        for name, tens in built.items():
+            print(f"  {name} [{order}D {dim_str}d{suffix}]: {tens._nnz()} nonzero values")
+
         if save:
-            if "counting"           in want: torch.save(count_tensor,      f"{p}/counting_{order}D_{dim_str}d{suffix}.pt")
-            if "countingLog"        in want: torch.save(count_log_tensor,  f"{p}/countingLog_{order}D_{dim_str}d{suffix}.pt")
-            if "countingLogEps"     in want: torch.save(count_log_eps_tensor, f"{p}/countingLogEps_{order}D_{dim_str}d{suffix}.pt")
-            if "probLog"            in want: torch.save(prob_log_tensor,   f"{p}/probLog_{order}D_{dim_str}d{suffix}.pt")
-            if "probLogShifted"     in want: torch.save(prob_log_shifted,  f"{p}/probLogShifted_{order}D_{dim_str}d{suffix}.pt")
-            if "probLogSoftPlus"    in want: torch.save(prob_log_softplus, f"{p}/probLogSoftPlus_{order}D_{dim_str}d{suffix}.pt")
-            if "sii"         in want: torch.save(sii_tensor,       f"{p}/sii_{order}D_{dim_str}d{suffix}.pt")
-            if "sc"          in want: torch.save(sc_tensor,        f"{p}/sc_{order}D_{dim_str}d{suffix}.pt")
-            if "scSoftPlus"  in want: torch.save(sc_softplus,      f"{p}/scSoftPlus_{order}D_{dim_str}d{suffix}.pt")
-            if "scSoftPlusFlat" in want: torch.save(sc_softplus_flat, f"{p}/scSoftPlusFlat_{order}D_{dim_str}d{suffix}.pt")
-            if "siiSoftPlus" in want: torch.save(sii_softplus,     f"{p}/siiSoftPlus_{order}D_{dim_str}d{suffix}.pt")
-            if "scShifted"   in want: torch.save(sc_shifted,       f"{p}/scShifted_{order}D_{dim_str}d{suffix}.pt")
-            if "siiShifted"  in want: torch.save(sii_shifted,      f"{p}/siiShifted_{order}D_{dim_str}d{suffix}.pt")
+            for name, tens in built.items():
+                torch.save(tens, f"{p}/{name}_{order}D_{dim_str}d{suffix}.pt")
             with open(f"{path_to_tensors}/vocabularies/{order}D_{dim_str}d{suffix}.pkl", "wb") as f:
                 pickle.dump(vocab, f)
         else:
-            built = {}
-            if "counting"            in want: built["counting"]            = count_tensor
-            if "countingLog"         in want: built["countingLog"]         = count_log_tensor
-            if "countingLogEps"      in want: built["countingLogEps"]      = count_log_eps_tensor
-            if "probLog"             in want: built["probLog"]             = prob_log_tensor
-            if "probLogShifted"      in want: built["probLogShifted"]      = prob_log_shifted
-            if "probLogSoftPlus"     in want: built["probLogSoftPlus"]     = prob_log_softplus
-            if "sii"         in want: built["sii"]         = sii_tensor
-            if "sc"          in want: built["sc"]          = sc_tensor
-            if "siiSoftPlus" in want: built["siiSoftPlus"] = sii_softplus
-            if "siiShifted"  in want: built["siiShifted"]  = sii_shifted
-            if "scSoftPlus"  in want: built["scSoftPlus"]  = sc_softplus
-            if "scSoftPlusFlat" in want: built["scSoftPlusFlat"] = sc_softplus_flat
-            if "scShifted"   in want: built["scShifted"]   = sc_shifted
             results[variant] = (built, vocab)
 
     return results
