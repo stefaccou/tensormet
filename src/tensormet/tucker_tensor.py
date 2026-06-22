@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import pickle
+import signal
 
 import torch
 import json
@@ -193,7 +194,7 @@ class TuckerDecomposition:
         # Legacy format (3D only):         {dims}{suffix}.pkl
         _vdir = os.path.join(base, "vocabularies")
         vocab_path_new = os.path.join(_vdir, _vocab_filename(order, dims, shared_factors=parsed_shared))
-        vocab_path_old = os.path.join(_vdir, _vocab_filename_legacy(dims, shared_factors=parsed_shared))
+        vocab_path_old = os.path.join(_vdir, _vocab_filename_legacy(dims, shared_factors=parsed_shared, order=order))
 
         if os.path.exists(vocab_path_new):
             vocab_path = vocab_path_new
@@ -1497,6 +1498,32 @@ class SparseTupleTensor:
               f"LARGEDIM_THRESHOLD reached={_largedim_selected}, n_gpus={_n_gpus})")
         # est_iter_time = self.estimate_training_time(rank=rank[0], subsample=_subsample_frac)
         # print(f"estimated training time: {est_iter_time}*{n_iter_max}={est_iter_time*n_iter_max}")
+
+        # --- graceful-stop handler ---
+        # First Ctrl+C (SIGINT): request a resumable save at the end of the current
+        # iteration, then restore the default handler so a SECOND Ctrl+C exits
+        # immediately (as it did before this handler existed). signal.signal only
+        # works from the main thread; if we're on a worker thread, skip gracefully.
+        _interrupt_requested = {"flag": False}
+        _original_sigint = None
+        _sigint_installed = False
+
+        def _handle_interrupt(signum, frame):
+            print(
+                "\nInterrupt received: will save a resumable checkpoint at the end of "
+                "the current iteration. Press Ctrl+C again to exit immediately."
+            )
+            _interrupt_requested["flag"] = True
+            # Restore prior handler so a second Ctrl+C behaves as it used to (raises).
+            signal.signal(signal.SIGINT, _original_sigint)
+
+        try:
+            _original_sigint = signal.signal(signal.SIGINT, _handle_interrupt)
+            _sigint_installed = True
+        except ValueError:
+            # Not running in the main thread; leave default interrupt behaviour intact.
+            _sigint_installed = False
+
         for iteration in range(start_iteration, n_iter_max):
             if time_iteration:
                 start_time = time.time()
@@ -1841,6 +1868,39 @@ class SparseTupleTensor:
                             f"Sem_all: {fitness_dump}\n"
                         )
 
+            # ---- graceful stop: save a resumable checkpoint, then break ----
+            # Triggered by the first Ctrl+C. We write the same artifacts the normal
+            # checkpoint path does (a {iteration+1}.pt model plus errors/fitness),
+            # so get_resume_state() can pick this run up exactly as a periodic
+            # checkpoint. A second Ctrl+C during the save raises KeyboardInterrupt
+            # (default handler restored above), exiting immediately as before.
+            if _interrupt_requested["flag"]:
+                print(f"Saving resumable checkpoint at iteration {iteration} before stopping...")
+                try:
+                    os.makedirs(paths["checkpoint_dir"], exist_ok=True)
+                    checkpoint_tensor = TuckerTensor(
+                        (cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors])
+                    )
+                    ckpt_path = paths["checkpoint_dir"] / f"{iteration + 1}.pt"
+                    torch.save(checkpoint_tensor, ckpt_path)
+                    np.save(paths["errors"], np.array([cp.asnumpy(e) for e in rec_errors]))
+                    if fitness_scores:
+                        if isinstance(fitness_scores[-1], dict):
+                            with open(paths["fitness_json"], "w") as f:
+                                json.dump(fitness_scores, f, indent=2)
+                        else:
+                            np.save(paths["fitness"], np.array(fitness_scores, dtype=float))
+                    print(f"Resumable checkpoint saved to {ckpt_path}")
+                except KeyboardInterrupt:
+                    # Second Ctrl+C arrived mid-save: abort immediately.
+                    raise
+                except Exception as _save_err:
+                    print(f"Failed to save resumable checkpoint: {_save_err}")
+                break
+
+        # Restore whatever SIGINT handler was in place before this run.
+        if _sigint_installed:
+            signal.signal(signal.SIGINT, _original_sigint)
 
         if best_sem_iteration is not None:
             tensor = TuckerTensor((best_core, best_factors))
