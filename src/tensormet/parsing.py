@@ -423,20 +423,16 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
     parser.add_argument("--batch-size", type=int, dest="batch_size", default=None)
     parser.add_argument("--cpu-frac", type=float, dest="cpu_frac", default=None)
 
-    parser.add_argument(
-        "--pad-sequence",
-        dest="pad_sequence",
-        action="store_true",
-        default=None,
-        help="Wrap each sentence with bos/eos tokens and slide the n-gram window "
-             "across sentence boundaries within a document.",
-    )
-    parser.add_argument("--bos", type=str, dest="bos_token", default=None,
-                        help="Start-of-sentence token used with --pad-sequence.")
-    parser.add_argument("--eos", type=str, dest="eos_token", default=None,
-                        help="End-of-sentence token used with --pad-sequence.")
-
     parser.add_argument("--log-every-s", type=float, dest="log_every_s", default=None)
+
+    parser.add_argument(
+        "--pad-sentences",
+        type=_parse_bool,
+        dest="pad_sentences",
+        default=None,
+        help="Pad each sentence with n-1 <s> tokens and one </s> before extracting "
+             "n-grams (default: true). Padded output goes to a separate '-bos-eos' dir.",
+    )
 
     parser.add_argument(
         "--name",
@@ -466,10 +462,8 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
         "spacy_model",
         "batch_size",
         "cpu_frac",
-        "pad_sequence",
-        "bos_token",
-        "eos_token",
         "log_every_s",
+        "pad_sentences",
         "name",
     )
     for f in exp_fields:

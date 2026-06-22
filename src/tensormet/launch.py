@@ -236,7 +236,7 @@ def launch_nnt_decomposition(cfg):
         # print(vocab_path, "not found")
         vocab_path = os.path.join(
             _vdir,
-            vocab_filename_legacy(cfg.exp.dim, shared_factors=cfg.exp.shared_factors),
+            vocab_filename_legacy(cfg.exp.dim, shared_factors=cfg.exp.shared_factors, order=cfg.exp.order),
         )
         with open(vocab_path, "rb") as f:
             vocab = pickle.load(f)

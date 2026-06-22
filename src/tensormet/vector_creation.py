@@ -761,6 +761,12 @@ def extract_core_lemmas(text: str, nlp: spacy.Language) -> str:
 # Schema per n: (sent_id int64, w1 string, ..., wN string)
 # ---------------------------------------------------------------------------
 
+# Sentence-boundary padding tokens. Left-pad with n-1 BOS so the first real word
+# has a full-width context; right-pad with a single EOS so the model learns to stop.
+BOS_TOKEN = "<s>"
+EOS_TOKEN = "</s>"
+
+
 def _ngram_schema(n: int) -> pa.Schema:
     fields = [("sent_id", pa.int64())]
     for i in range(1, n + 1):
@@ -768,53 +774,29 @@ def _ngram_schema(n: int) -> pa.Schema:
     return pa.schema(fields)
 
 
-def _extract_ngrams_from_lemmas(lemmas: list[str], n: int, sent_id: int) -> list[dict]:
-    if len(lemmas) < n:
-        return []
+def _extract_ngrams_from_lemmas(
+    lemmas: list[str],
+    n: int,
+    sent_id: int,
+    *,
+    pad: bool = False,
+    bos: str = BOS_TOKEN,
+    eos: str = EOS_TOKEN,
+) -> list[dict]:
+    if pad:
+        # Skip empty sentences entirely; otherwise we'd emit pure-boundary n-grams.
+        if not lemmas:
+            return []
+        seq = [bos] * (n - 1) + lemmas + [eos]
+    else:
+        if len(lemmas) < n:
+            return []
+        seq = lemmas
     rows = []
-    for i in range(len(lemmas) - n + 1):
+    for i in range(len(seq) - n + 1):
         row: dict = {"sent_id": sent_id}
         for j in range(n):
-            row[f"w{j + 1}"] = lemmas[i + j]
-        rows.append(row)
-    return rows
-
-
-def _extract_ngrams_padded(
-    doc_sents: list[tuple[int, list[str]]],
-    n: int,
-    bos: str,
-    eos: str,
-) -> list[dict]:
-    """
-    Build one continuous, boundary-padded token stream for a single document and
-    slide an n-gram window across it.
-
-    Each sentence is wrapped as ``bos <lemmas...> eos`` and the sentences are
-    concatenated in order, so windows span sentence boundaries (… eos bos …).
-    Unlike `_extract_ngrams_from_lemmas`, this also captures sentences shorter
-    than n (their tokens still contribute via the boundary windows). The window
-    never crosses the document boundary — documents are processed independently.
-
-    Each emitted row carries the sent_id of its *first* token, which keeps a
-    sentence's rows contiguous and in write order.
-    """
-    tokens: list[str] = []
-    tok_sids: list[int] = []
-    for sid, lemmas in doc_sents:
-        tokens.append(bos)
-        tok_sids.append(sid)
-        for lem in lemmas:
-            tokens.append(lem)
-            tok_sids.append(sid)
-        tokens.append(eos)
-        tok_sids.append(sid)
-
-    rows: list[dict] = []
-    for i in range(len(tokens) - n + 1):
-        row: dict = {"sent_id": tok_sids[i]}
-        for j in range(n):
-            row[f"w{j + 1}"] = tokens[i + j]
+            row[f"w{j + 1}"] = seq[i + j]
         rows.append(row)
     return rows
 
@@ -846,15 +828,6 @@ def create_ngram_vectors_parquet_sharded(
             f"create_ngram_vectors_parquet_sharded called with non-ngram type '{cfg.exp.type}'"
         )
 
-    pad_sequence = cfg.exp.pad_sequence
-    bos_token = cfg.exp.bos_token
-    eos_token = cfg.exp.eos_token
-    if pad_sequence:
-        print(
-            f"[pad-sequence] Wrapping each sentence as '{bos_token} ... {eos_token}' and "
-            f"sliding the window across document boundaries."
-        )
-
     # base_dir is used only for logs (runs.jsonl, vector_creation_log.txt).
     # For single n, base_dir == n_dir (same location as parquets).
     base_dir = cfg.output_dir()
@@ -866,7 +839,7 @@ def create_ngram_vectors_parquet_sharded(
     # own _meta.json so there is no shared-state split.
     ns: dict[int, dict] = {}
     for n in ngram_orders:
-        n_dir = cfg.ngram_dir(n)
+        n_dir = cfg.ngram_dir(n, padded=cfg.exp.pad_sentences)
         n_dir.mkdir(parents=True, exist_ok=True)
         n_meta_path = n_dir / "_meta.json"
 
@@ -978,26 +951,19 @@ def create_ngram_vectors_parquet_sharded(
     try:
         for text_batch in chunked(gen_texts(), cfg.exp.batch_size * 8):
             for doc in nlp.pipe(text_batch, batch_size=cfg.exp.batch_size):
-                doc_sents: list[tuple[int, list[str]]] = []
                 for sent in doc.sents:
                     lemmas = [
                         tok.lemma_.lower()
                         for tok in sent
                         if not tok.is_punct and not tok.is_space and tok.lemma_.strip()
                     ]
-                    if lemmas:
-                        doc_sents.append((global_sent_id, lemmas))
+                    for n in ngram_orders:
+                        rows = _extract_ngrams_from_lemmas(
+                            lemmas, n, global_sent_id, pad=cfg.exp.pad_sentences
+                        )
+                        if rows:
+                            ns[n]["buffer"].extend(rows)
                     global_sent_id += 1
-
-                for n in ngram_orders:
-                    if pad_sequence:
-                        rows = _extract_ngrams_padded(doc_sents, n, bos_token, eos_token)
-                    else:
-                        rows = []
-                        for sid, lemmas in doc_sents:
-                            rows.extend(_extract_ngrams_from_lemmas(lemmas, n, sid))
-                    if rows:
-                        ns[n]["buffer"].extend(rows)
 
             # Flush any n whose buffer is full, then checkpoint together.
             flushed = False
@@ -1096,7 +1062,7 @@ def create_raw_ngram_vectors_parquet_sharded(
 
     ns: dict[int, dict] = {}
     for n in ngram_orders:
-        n_dir = cfg.ngram_dir(n, raw=True)
+        n_dir = cfg.ngram_dir(n, raw=True, padded=cfg.exp.pad_sentences)
         n_dir.mkdir(parents=True, exist_ok=True)
         n_meta_path = n_dir / "_meta.json"
 
@@ -1209,7 +1175,9 @@ def create_raw_ngram_vectors_parquet_sharded(
                         if not tok.is_punct and not tok.is_space and tok.text.strip()
                     ]
                     for n in ngram_orders:
-                        rows = _extract_ngrams_from_lemmas(tokens, n, global_sent_id)
+                        rows = _extract_ngrams_from_lemmas(
+                            tokens, n, global_sent_id, pad=cfg.exp.pad_sentences
+                        )
                         if rows:
                             ns[n]["buffer"].extend(rows)
                     global_sent_id += 1
