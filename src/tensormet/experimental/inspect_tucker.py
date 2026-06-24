@@ -336,6 +336,22 @@ def _diff_labels(insps):
     return " | ".join(shared), labels
 
 
+def _chain_key(rec):
+    """Structural identity shared by all segments of one resume chain.
+
+    A resumed run that runs to a higher ``n_iter_max`` lands in a new file whose
+    stem differs only in the iteration count, so grouping by everything *except*
+    ``iters`` collects a run and its continuations. Because the stem omits
+    non-structural fields, two runs with the same key and the same ``iters`` would
+    collide on disk — so within a key the ``iters`` values are always distinct and
+    sort into clean, contiguous segments.
+    """
+    insp = rec["ref"].insp
+    return (rec["dataset"], rec["name"], rec["divergence"], rec["method"],
+            rec["order"], rec["dim"], rec["rank"], rec["subsample_frac"],
+            frozenset(insp.shared_factors or ()))
+
+
 def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                      default_sem_keys=("average_rank_score", "simlex_all_rho")):
     """Interactive faceted browser for picking and comparing two runs.
@@ -351,6 +367,18 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     ``dataset`` sets which boxes start checked — a single name, a list of names,
     or ``None`` to check every discovered dataset. Hit *Refresh* after new runs
     land.
+
+    The *after* box takes a date (e.g. ``2026-06-01``, or anything pandas can
+    parse) and restricts the selectable runs to those whose config snapshot was
+    written on or after it; leave it empty for no cutoff. The cutoff only narrows
+    the picker — a recent resumed run is still stitched back to its earlier
+    segments even if those predate the cutoff.
+
+    Runs that were resumed to a higher ``n_iter_max`` are auto-detected and
+    stitched: with *stitch resume chains* ticked (the default), selecting a run
+    plots it together with its earlier segments, so the curve starts at 0 rather
+    than at the iteration the resume began. Chained entries are marked ``⛓×N``.
+    Untick to view a single segment (e.g. just the resumed tail) in isolation.
 
     The current plot can be exported two ways: type a path in the *save as* box
     and hit *Save* to write it to disk, or grab the live Figure object via
@@ -415,6 +443,10 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     sem_box = widgets.Text(value=",".join(default_sem_keys), description="sem_keys",
                            style={"description_width": "75px"}, layout=widgets.Layout(width="55%"))
     rec_chk = widgets.Checkbox(value=False, description="plot rec error", indent=False)
+    stitch_chk = widgets.Checkbox(value=True, description="stitch resume chains", indent=False)
+    after_box = widgets.Text(value="", description="after", placeholder="YYYY-MM-DD",
+                             style={"description_width": "45px"},
+                             layout=widgets.Layout(width="190px"))
     refresh_btn = widgets.Button(description="↻ Refresh", button_style="info",
                                  layout=widgets.Layout(width="110px"))
     save_name = widgets.Text(value="run_plot.png", description="save as",
@@ -424,12 +456,13 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                               layout=widgets.Layout(width="90px"))
     status = widgets.HTML()
 
-    def _label(rec):
+    def _label(rec, n_seg=1):
         when = _dt.datetime.fromtimestamp(rec["mtime"]).strftime("%b%d")
         flag = "" if rec["has_log"] else "  ⚠ no log"
+        chain = f'  ⛓×{n_seg} (→{rec["iters"]}i)' if n_seg > 1 else ""
         return (f'[{rec["dataset"]}] {rec["name"]} | {rec["divergence"]}/{rec["method"]} | '
                 f'{rec["dim"]}d r{rec["rank"]} ss{rec["subsample_frac"]} '
-                f'{rec["iters"]}i  [{when}]{flag}')
+                f'{rec["iters"]}i  [{when}]{flag}{chain}')
 
     def _selected_datasets():
         return {ds for ds, c in dataset_chk.items() if c.value}
@@ -439,8 +472,25 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         sel = _selected_datasets()
         return [r for r in state["records"] if r["dataset"] in sel]
 
+    def _after_ts():
+        """Parse the *after* box into a POSIX timestamp (cutoff for run mtime).
+
+        Returns the timestamp (``float``) for a valid date, ``None`` when the box
+        is empty (no filter), or ``False`` when the text can't be parsed.
+        """
+        s = after_box.value.strip()
+        if not s:
+            return None
+        try:
+            return pd.to_datetime(s).timestamp()
+        except Exception:
+            return False
+
     def _filtered():
         recs = _dataset_recs()
+        ts = _after_ts()
+        if isinstance(ts, float):
+            recs = [r for r in recs if r["mtime"] >= ts]
         for key, dd in facet_dd.items():
             if dd.value != "(any)":
                 recs = [r for r in recs if r[key] == dd.value]
@@ -455,36 +505,67 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
             dd.options = ["(any)"] + vals
             dd.value = cur if cur in dd.options else "(any)"
 
+    def _chain_index():
+        """Map each chain key to its segments (ascending by iters = resume order).
+
+        Built over the dataset-filtered records (not the facet-filtered ones) so
+        facet filters never truncate a chain, while dataset checkboxes still bound
+        it — every member of a key shares its dataset.
+        """
+        idx = {}
+        for r in _dataset_recs():
+            idx.setdefault(_chain_key(r), []).append(r)
+        for members in idx.values():
+            members.sort(key=lambda m: m["iters"])
+        return idx
+
     def _rebuild_ab():
         recs = _filtered()
-        opts = [(_label(r), r["ref"]) for r in recs]
+        chains = _chain_index() if stitch_chk.value else None
+        opts = []
+        for r in recs:
+            if chains is not None:
+                # this run plus all earlier segments of its resume chain
+                members = [m for m in chains[_chain_key(r)] if m["iters"] <= r["iters"]]
+                refs = tuple(m["ref"] for m in members)
+            else:
+                refs = (r["ref"],)
+            opts.append((_label(r, n_seg=len(refs)), refs))
         for dd, extra in ((run_a, []), (run_b, [("(none)", None)])):
             cur = dd.value
             dd.options = extra + opts
             vals = [v for _, v in dd.options]
             dd.value = cur if cur in vals else (dd.options[0][1] if dd.options else None)
         n_sel = len(_selected_datasets())
+        ts = _after_ts()
+        if ts is False:
+            date_note = " &nbsp;|&nbsp; <span style='color:#c00'>unparsable 'after' date — ignored</span>"
+        elif ts is not None:
+            date_note = f" &nbsp;|&nbsp; after {_dt.datetime.fromtimestamp(ts).strftime('%Y-%m-%d')}"
+        else:
+            date_note = ""
         status.value = (f"<b>{len(recs)}</b> run(s) match the filters "
                         f"&nbsp;|&nbsp; {len(_dataset_recs())} in {n_sel} dataset(s) "
-                        f"&nbsp;|&nbsp; {len(state['records'])} total")
+                        f"&nbsp;|&nbsp; {len(state['records'])} total{date_note}")
 
     def _redraw():
         with plot_out:
             clear_output(wait=True)
-            a = run_a.value
-            if a is None:
+            a = run_a.value          # tuple of RunRef (chain segments), or None
+            if not a:
                 print("No run selected for A (adjust the filters).")
                 return
             keys = tuple(k.strip() for k in sem_box.value.split(",") if k.strip())
-            b = run_b.value
+            b = run_b.value          # tuple of RunRef, or None for "(none)"
             fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
             try:
+                # a[-1] is the representative (latest) segment — used for titles/labels.
                 if b is None:
-                    plot_metrics(a, sem_keys=keys, plot_rec_error=rec_chk.value,
-                                 title=a.stem, ax=ax)
+                    plot_metrics(*a, sem_keys=keys, plot_rec_error=rec_chk.value,
+                                 title=a[-1].stem, ax=ax)
                 else:
-                    shared, (la, lb) = _diff_labels([a.insp, b.insp])
-                    compare_metrics(a, b, label_a=la, label_b=lb,
+                    shared, (la, lb) = _diff_labels([a[-1].insp, b[-1].insp])
+                    compare_metrics(list(a), list(b), label_a=la, label_b=lb,
                                     sem_keys=keys, plot_rec_error=rec_chk.value,
                                     title=shared, ax=ax)
             except FileNotFoundError as e:
@@ -560,6 +641,11 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     run_b.observe(_on_select, "value")
     sem_box.observe(_on_select, "value")
     rec_chk.observe(_on_select, "value")
+    # Toggling stitch changes the A/B option values (chains vs single runs), so it
+    # needs a rebuild — _on_filter does exactly that (rebuild + redraw).
+    stitch_chk.observe(_on_filter, "value")
+    # A date cutoff just narrows the selectable runs — same rebuild path as facets.
+    after_box.observe(_on_filter, "value")
     refresh_btn.on_click(_refresh)
     save_btn.on_click(_save)
 
@@ -570,7 +656,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         widgets.HBox(list(dataset_chk.values()), layout=widgets.Layout(flex_flow="row wrap")),
     ])
     filters = widgets.HBox(list(facet_dd.values()), layout=widgets.Layout(flex_flow="row wrap"))
-    controls = widgets.HBox([sem_box, rec_chk, refresh_btn, save_name, save_btn])
+    controls = widgets.HBox([sem_box, rec_chk, stitch_chk, after_box, refresh_btn, save_name, save_btn])
     ui = widgets.VBox([datasets_box, filters, status, run_a, run_b, controls, plot_out])
     # Expose the live state so callers can grab the current Figure out of the UI,
     # e.g. `fig = browser.get_figure(); fig.savefig(...)` or display it elsewhere.

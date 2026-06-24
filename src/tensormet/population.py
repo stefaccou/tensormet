@@ -5,6 +5,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import multiprocessing
 import torch
+import numpy as np
 from tqdm import tqdm
 from tensormet.utils import DATA_DIR, shared_factor_suffix, linked_factor_groups, SparseCOOTensor, _INT64_MAX, dim_spec_str
 import pickle
@@ -654,14 +655,10 @@ def populate_tensors_parquet(
     if remove_hapax:
         subset_counters = _hapax_report_and_filter(subset_counters)
 
-    # convert restricted joints to probabilities using global denominator
-    subset_probabilities = {
-        subset: Counter({k: v / total_len for k, v in counter.items()})
-        for subset, counter in subset_counters.items()
-    }
-
+    # NOTE: we deliberately do NOT materialise a probability dict here. Dividing
+    # counts by total_len on the fly (below) avoids duplicating the very large full
+    # joint counter, which doubled peak RAM and was the cause of the post-Pass-2 OOM.
     full_subset = tuple(cols_to_build)
-    p_full = subset_probabilities[full_subset]
 
     print("Probabilities computed for vocab-restricted subset marginals.")
     print("Probabilities computed for vocab-restricted joints.")
@@ -697,7 +694,7 @@ def populate_tensors_parquet(
                 if r == 1:
                     p = single_probs[subset[0]][key]
                 else:
-                    p = subset_probabilities[subset][key]
+                    p = subset_counters[subset].get(key, 0) / total_len
 
                 if p <= 0:
                     return float("-inf")
@@ -720,7 +717,7 @@ def populate_tensors_parquet(
         if len(col_realisations) != len(cols_to_build):
             raise ReferenceError("Same number of columns expected.")
 
-        joint = p_full[tuple(col_realisations)]
+        joint = subset_counters[full_subset].get(tuple(col_realisations), 0) / total_len
         if joint <= 0:
             return float("-inf")
 
@@ -756,42 +753,49 @@ def populate_tensors_parquet(
             )
 
         # filter tuples from max counter
-        indices = []
-        count_values     = [] if need_count     else None
-        prob_log_values  = [] if need_prob_log  else None
-        count_log_values = [] if need_count_log else None
-        count_log_eps_values = [] if need_count_log_eps else None
-        sii_values       = [] if need_sii       else None
-        sc_values        = [] if need_sc        else None
-
         full_counter = subset_counters[tuple(cols_to_build)]
+        ub = len(full_counter)  # upper bound on surviving (in-vocab) tuples
 
+        # Pre-sized buffers filled up to running index n, then sliced to [:n]. Avoids
+        # the tens-of-GB overhead of a Python list-of-lists plus the torch.tensor()
+        # conversion copy at 1B scale.
+        idx_arr = np.empty((ub, order), dtype=np.int64)
+        count_values     = np.empty(ub, dtype=np.float32) if need_count     else None
+        prob_log_values  = np.empty(ub, dtype=np.float32) if need_prob_log  else None
+        count_log_values = np.empty(ub, dtype=np.float32) if need_count_log else None
+        count_log_eps_values = np.empty(ub, dtype=np.float32) if need_count_log_eps else None
+        sii_values       = np.empty(ub, dtype=np.float32) if need_sii       else None
+        sc_values        = np.empty(ub, dtype=np.float32) if need_sc        else None
+
+        n = 0
         for els_to_check, cnt in tqdm(full_counter.items(), desc=f"nnz tuples ({dim_str})"):
             if not in_k(els_to_check):
                 continue
-            indices.append([col2i[cols_to_build[i]][el] for i, el in enumerate(els_to_check)])
+            for i, el in enumerate(els_to_check):
+                idx_arr[n, i] = col2i[cols_to_build[i]][el]
             if need_count:
-                count_values.append(float(cnt))
+                count_values[n] = cnt
             if need_prob_log:
                 # uses log of PROBABILITY --> Negative
-                prob_log_values.append(log(cnt / total_len))
+                prob_log_values[n] = log(cnt / total_len)
             if need_count_log:
                 # pure log of the raw COUNT --> non-negative; log(1)=0 kept as-is
-                count_log_values.append(log(cnt))
+                count_log_values[n] = log(cnt)
             if need_count_log_eps:
                 # uses log of the raw COUNT --> non-negative; eps keeps log(1) > 0
-                count_log_eps_values.append(log(cnt) + _COUNT_LOG_EPS)
+                count_log_eps_values[n] = log(cnt) + _COUNT_LOG_EPS
             # Use finite values instead of -inf to prevent coalesce/sorting issues
             if need_sii:
                 sii_val = specific_interaction_information(els_to_check)
-                sii_values.append(float(sii_val) if sii_val != float("-inf") else -1e38)
+                sii_values[n] = float(sii_val) if sii_val != float("-inf") else -1e38
             if need_sc:
                 sc_val = specific_correlation(els_to_check)
-                sc_values.append(float(sc_val) if sc_val != float("-inf") else -1e38)
+                sc_values[n] = float(sc_val) if sc_val != float("-inf") else -1e38
+            n += 1
 
         size = tuple(len(vocabs[col]) for col in cols_to_build)
 
-        if len(indices) == 0:
+        if n == 0:
             idx = torch.empty((order, 0), dtype=torch.long)
             empty = torch.empty((0,), dtype=torch.float32)
             if need_count:
@@ -807,39 +811,32 @@ def populate_tensors_parquet(
             if need_sc:
                 sc_tensor = _make_sparse_coo(idx, empty, size).coalesce()
         else:
-            # Convert to tensors and explicitly cast to long
-            idx = torch.tensor(indices, dtype=torch.long).t().contiguous()
+            # Build from pre-sized NumPy buffers (sliced to the n surviving rows).
+            # idx is an independent contiguous copy, so idx_arr is freed immediately.
+            # Each value channel is built, coalesced and freed before the next so only
+            # one channel's buffer is held at a time (torch.from_numpy shares the buffer
+            # until coalesce gives the tensor its own storage).
+            idx = torch.from_numpy(idx_arr[:n]).t().contiguous()
+            del idx_arr
 
-            # Create tensors
             if need_count:
-                count_tensor = _make_sparse_coo(idx, torch.tensor(count_values, dtype=torch.float32), size)
+                count_tensor = _make_sparse_coo(idx, torch.from_numpy(count_values[:n]), size).coalesce()
+                del count_values
             if need_prob_log:
-                prob_log_tensor = _make_sparse_coo(idx, torch.tensor(prob_log_values, dtype=torch.float32), size)
+                prob_log_tensor = _make_sparse_coo(idx, torch.from_numpy(prob_log_values[:n]), size).coalesce()
+                del prob_log_values
             if need_count_log:
-                count_log_tensor = _make_sparse_coo(idx, torch.tensor(count_log_values, dtype=torch.float32), size)
+                count_log_tensor = _make_sparse_coo(idx, torch.from_numpy(count_log_values[:n]), size).coalesce()
+                del count_log_values
             if need_count_log_eps:
-                count_log_eps_tensor = _make_sparse_coo(idx, torch.tensor(count_log_eps_values, dtype=torch.float32), size)
+                count_log_eps_tensor = _make_sparse_coo(idx, torch.from_numpy(count_log_eps_values[:n]), size).coalesce()
+                del count_log_eps_values
             if need_sii:
-                sii_tensor = _make_sparse_coo(idx, torch.tensor(sii_values, dtype=torch.float32), size)
+                sii_tensor = _make_sparse_coo(idx, torch.from_numpy(sii_values[:n]), size).coalesce()
+                del sii_values
             if need_sc:
-                sc_tensor = _make_sparse_coo(idx, torch.tensor(sc_values, dtype=torch.float32), size)
-
-            # CRITICAL: Clear Python lists from memory before coalescing
-            del indices
-            if need_count:     del count_values
-            if need_prob_log:  del prob_log_values
-            if need_count_log: del count_log_values
-            if need_count_log_eps: del count_log_eps_values
-            if need_sii:       del sii_values
-            if need_sc:        del sc_values
-
-            # Coalesce (this is the memory-intensive part)
-            if need_count:     count_tensor     = count_tensor.coalesce()
-            if need_prob_log:  prob_log_tensor  = prob_log_tensor.coalesce()
-            if need_count_log: count_log_tensor = count_log_tensor.coalesce()
-            if need_count_log_eps: count_log_eps_tensor = count_log_eps_tensor.coalesce()
-            if need_sii:       sii_tensor       = sii_tensor.coalesce()
-            if need_sc:        sc_tensor        = sc_tensor.coalesce()
+                sc_tensor = _make_sparse_coo(idx, torch.from_numpy(sc_values[:n]), size).coalesce()
+                del sc_values
 
         # countingLog: drop hapax legomena whose log(count) == 0 (cnt == 1), not stored explicit zeros.
         # the epsilon path avoids this by adding the small nonzero constant
