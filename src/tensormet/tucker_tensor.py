@@ -36,6 +36,7 @@ from tensormet.utils import (DATA_DIR,
                             np_dispatch,
                             np_sim,
                             resolve_checkpoint_path,
+                            _to_np,
                    )
 from tensormet.hpc_helpers import mirror_checkpoint
 from tensormet.sparse_ops import initialize_nonnegative_tucker
@@ -69,12 +70,6 @@ _SIMLEX_POS_MAP = {
 }
 _SIMLEX_PATH = DATA_DIR / "corpora" / "SimLex-999.txt"
 
-
-def _to_np(x):
-    # Accept NumPy arrays or torch tensors; return NumPy view/copy
-    if hasattr(x, "detach"):  # torch.Tensor
-        return x.detach().cpu().numpy()
-    return x
 
 # Old role index when all we had was VSO
 # def _role_index(role: str) -> int:
@@ -118,8 +113,8 @@ class TuckerDecomposition:
         self.factors = factors
         self.vocab = vocab
         self.shared_factors = shared_factors or set()
-        # If roles aren't provided explicitly, parse them from the vocab keys
-        self.roles = extract_roles_from_vocab(self.vocab)
+        # Honor explicitly provided roles; otherwise parse them from the vocab keys.
+        self.roles = roles if roles is not None else extract_roles_from_vocab(self.vocab)
         self.decomp_path = None
 
     def get_role_index(self, role: str) -> int:
@@ -358,7 +353,6 @@ class TuckerDecomposition:
         Prepare for inference by moving to gpu
         """
         if isinstance(self.core, torch.Tensor):
-            self.core = self.core.numpy()
             self.core = cp.array(_to_np(self.core))
         for i, f in enumerate(self.factors):
             if isinstance(f, torch.Tensor):
@@ -1304,6 +1298,7 @@ class SparseTupleTensor:
             rec_check_every = cfg.eval.rec_check_every
             sem_check_every = cfg.eval.sem_check_every
             sem_error_type = cfg.eval.sem_error_type
+            sem_softmax_temperature = cfg.eval.sem_softmax_temperature
             # logging
             rec_log_every = cfg.eval.rec_log_every
             rec_log_every = rec_log_every or rec_check_every
@@ -1314,7 +1309,6 @@ class SparseTupleTensor:
                 pool_trim_every = sem_check_every
             # saving
             save_intermediate = cfg.eval.save_intermediate
-            tier1 = cfg.train.tier1
 
 
         except Exception as e:
@@ -1739,6 +1733,7 @@ class SparseTupleTensor:
                     seed=random_state,
                     thread_budget=thread_budget,
                     return_type=sem_error_type,
+                    softmax_temperature=sem_softmax_temperature,
                 )
 
                 if simlex_pairs is not None:

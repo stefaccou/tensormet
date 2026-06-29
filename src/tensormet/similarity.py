@@ -1,7 +1,6 @@
-import multiprocessing
 import os
 import csv
-from tensormet.utils import ThreadBudget, DATA_DIR, voc_index
+from tensormet.utils import ThreadBudget, DATA_DIR, voc_index, available_cpus, _to_np
 import random
 import numpy as np
 from pathlib import Path
@@ -13,21 +12,14 @@ import pyarrow.parquet as pq
 import torch
 from scipy.stats import spearmanr
 
-def _to_np(x):
-    # Accept NumPy arrays or torch tensors; return NumPy view/copy
-    if hasattr(x, "detach"):  # torch.Tensor
-        return x.detach().cpu().numpy()
-    return x
-
 def get_eval_num_threads(fraction: float = 0.75, min_threads: int = 1) -> int:
-    """Return n_threads ≈ fraction * available CPUs (at least min_threads)."""
-    try:
-        n_cores = multiprocessing.cpu_count()
-    except NotImplementedError:
-        n_cores = os.cpu_count() or 1
+    """Return n_threads ≈ fraction * available CPUs (at least min_threads).
 
-    n_threads = max(min_threads, int(n_cores * fraction))
-    return n_threads
+    Uses the SLURM/cgroup-aware available_cpus() so the eval thread pool respects
+    the actual core allocation on an HPC node — multiprocessing.cpu_count()
+    ignores affinity/cgroup limits and would over-count.
+    """
+    return max(min_threads, int(available_cpus() * fraction))
 
 def load_og_sentences(vector_path, save=False, order=3):
     sentences = set()
@@ -55,12 +47,6 @@ def load_og_sentences(vector_path, save=False, order=3):
             pickle.dump(sentences, f)
 
     return list(sentences)
-
-def softmax(x, temperature=1.0):
-    x = x / temperature
-    x = x - np.max(x)          # numerical stability
-    exp_x = np.exp(x)
-    return exp_x / np.sum(exp_x)
 
 
 def evaluate_sample(tensor,
@@ -186,12 +172,6 @@ def evaluate_sample(tensor,
     if isinstance(return_type, (list, tuple)):
         return {k: scores[k] for k in return_type if k in scores}
     return scores.get(return_type, scores["average_rank_score"])
-
-def softmax_batch(x, temperature=1.0):
-    x = x / temperature
-    x_max = np.max(x, axis=1, keepdims=True)
-    exp_x = np.exp(x - x_max)
-    return exp_x / np.sum(exp_x, axis=1, keepdims=True)
 
 
 def load_eval_sentences_cached(

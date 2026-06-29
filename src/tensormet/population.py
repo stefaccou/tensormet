@@ -705,35 +705,6 @@ def _hapax_report_and_filter(subset_counters: dict) -> dict:
 
     return filtered
 
-def _hapax_filter_marginals_report(single_probs: dict, cols: list[str]) -> dict:
-    """
-    Remove count==1 entries from each marginal counter, before vocab selection.
-    Prints a per-column before/after report. Returns a new dict of counters.
-    """
-    print("\n── Marginal hapax removal ────────────────────────────────")
-    rows = []
-    filtered = {}
-    for col in cols:
-        c = single_probs[col]
-        types_before = len(c)
-        tokens_before = sum(c.values())
-        new_c = Counter({k: v for k, v in c.items() if v > 10})
-        types_after = len(new_c)
-        tokens_after = sum(new_c.values())
-        filtered[col] = new_c
-        rows.append((col, types_before, types_after, tokens_before, tokens_after))
-
-    col_w = max(len(r[0]) for r in rows)
-    header = (f"{'Column':<{col_w}}  {'Types before':>14}  {'Types after':>12}"
-              f"  {'% removed':>10}  {'Tokens before':>14}  {'Tokens after':>13}")
-    print(header)
-    print("-" * len(header))
-    for col, tb, ta, kb, ka in rows:
-        pct = 100 * (tb - ta) / tb if tb else 0.0
-        print(f"{col:<{col_w}}  {tb:>14,}  {ta:>12,}  {pct:>9.1f}%  {kb:>14,}  {ka:>13,}")
-    print("───────────────────────────────────────────────────────────\n")
-    return filtered
-
 def _most_common_keys(counter: Counter, k: int) -> list:
     # Counter.most_common is deterministic enough for our use;
     # ties will follow internal ordering—same behavior as original Counter use.
@@ -958,10 +929,6 @@ def populate_tensors_parquet(
         total_len = seen_rows
         _save_marginals_cache(cache_path, single_probs, total_len,
                                   cols_to_build, path_to_vectors)
-
-    # NEW: marginal hapax removal, before vocab selection
-    # if remove_hapax:
-    #     single_probs = _hapax_filter_marginals_report(single_probs, cols_to_build)
 
     # vocab for max_k (per-mode) once
     vocabs_max = {

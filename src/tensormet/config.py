@@ -104,7 +104,7 @@ class TrainingConfig:
 @dataclass(frozen=True)
 class EvalConfig:
     rec_check_every: int = 20
-    rec_log_every: int = 20 # defaults to rec_check_every if not passed
+    rec_log_every: Optional[int] = None  # None/0 → falls back to rec_check_every
     sem_check_every: int = 20
     sem_error_type: Union[str, Tuple[str, ...]] = "full" # updated 2026-03-04
     sem_primary_key: Optional[str] = None  # overrides auto-derived primary key for patience/diff/logging
@@ -151,6 +151,22 @@ class RunConfig:
     eval: EvalConfig
 
     def run_id(self) -> str:
+        """Fingerprint of the FULL invocation (every exp/train/eval field).
+
+        This is deliberately environment-inclusive: two runs that differ only in
+        execution context (``gpu_id``, ``n_gpus``, ``data_dir``, ``hpc``,
+        ``log_file``, …) get distinct ids. That is required by ``staging_root``,
+        which uses ``run_id`` to isolate concurrent array tasks that happen to
+        share a ``$TMPDIR`` — narrowing it to "scientific" fields would let two
+        such tasks collide. It also keeps ``run_id`` recomputable from the ``cfg``
+        stored alongside it in ``runs.jsonl`` / ``*_config.json`` (a 1:1 mapping
+        back to the exact invocation).
+
+        It is NOT the scientific/structural identity of an experiment. Artifact
+        retrieval is keyed by ``model_filename()`` (divergence/method/order/dim/
+        rank/iters/…), and resume-compatibility is decided by
+        ``get_resume_state()`` comparing structural fields — neither uses run_id.
+        """
         payload = json.dumps(asdict(self), sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha1(payload).hexdigest()[:10]
 

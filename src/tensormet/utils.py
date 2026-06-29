@@ -36,6 +36,13 @@ def np_sim(a: np.ndarray, b: np.ndarray) -> float:
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
+def _to_np(x):
+    """Accept NumPy arrays or torch tensors; return a NumPy view/copy."""
+    if hasattr(x, "detach"):  # torch.Tensor
+        return x.detach().cpu().numpy()
+    return x
+
+
 def guarded_cupy_import(check_cuda: bool = True) -> Tuple[Optional[object], Optional[object]]:
     """
     Try to import cupy and cupyx.scipy.sparse. If anything fails or no CUDA device is visible,
@@ -263,10 +270,7 @@ def torch_or_pickle_load(path, map_location="cpu"):
     """Tries to load a torch-saved file, if fails, tries pickle."""
     try:
         return torch.load(path, map_location=map_location, weights_only=False)
-        # Move tensors to the specified device if not CPU
-        device = torch.device(map_location)
-
-    except RuntimeError as e:
+    except RuntimeError:
         with open(path, "rb") as f:
             return pickle.load(f)
 
