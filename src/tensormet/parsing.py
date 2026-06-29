@@ -261,6 +261,10 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--resume", type=_parse_bool, default=None,
                         help="Resume training from the latest available checkpoint for this configuration.")
     # NEW: multi-gpu
+    parser.add_argument("--hpc", type=_parse_bool, default=None,
+                        help="Stage per-run artifact writes to node-local $TMPDIR during the "
+                             "run, copying back to data_dir at the end. Relieves shared-GPFS "
+                             "write contention when many array tasks run concurrently.")
     parser.add_argument("--n-gpus", type=int, dest="n_gpus", default=None)
     parser.add_argument("--gpu-id", type=_parse_gpu_id, dest="gpu_id", default=None,
                         help="Physical GPU(s) to pin, e.g. --gpu-id 0 or --gpu-id 0,1,2")
@@ -283,6 +287,9 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--remove-oov", type=_parse_bool, dest="remove_OOV", default=None)
     parser.add_argument("--time-iteration", type=_parse_bool, dest="time_iteration", default=None)
     parser.add_argument("--save-intermediate", type=_parse_bool, dest="save_intermediate", default=None)
+    parser.add_argument("--pool-trim-every", type=int, dest="pool_trim_every", default=None,
+                        help="Trim the CuPy memory pool every N iterations (per shard device). "
+                             "Defaults to --sem-check-every. Reclaims out-of-pool cuBLAS workspace headroom.")
     parser.add_argument("--log-file", type=str, dest="log_file", default=None)
 
     parsed = parser.parse_args(args=argv)
@@ -329,6 +336,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "tier1",
         "overwrite",
         "data_dir",
+        "hpc",
     )
     # argparse used dashes -> underscores mapping; check each
     for f in train_fields:
@@ -350,6 +358,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "remove_OOV",
         "time_iteration",
         "save_intermediate",
+        "pool_trim_every",
         "log_file",
     )
     for f in eval_fields:
@@ -549,7 +558,17 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
     parser.add_argument("--batch-readahead", type=int, dest="batch_readahead", default=None)
     parser.add_argument("--fragment-readahead", type=int, dest="fragment_readahead", default=None)
     parser.add_argument("--max-workers", type=int, dest="max_workers", default=None,
-                        help="Max parallel worker processes for Pass 2. 0 or omit = auto (~1 worker per 100 shards).")
+                        help="Max parallel worker processes for Pass 2. 0 or omit = auto "
+                             "(scale to cores via --cpu-frac, capped by the memory ceiling).")
+    parser.add_argument("--cpu-frac", type=float, dest="cpu_frac", default=None,
+                        help="Fraction of CPU cores to target when --max-workers is auto. "
+                             "Default 0.5 (polite locally); use 1.0 to fill a dedicated HPC node.")
+    parser.add_argument("--max-mem-gb", type=float, dest="max_mem_gb", default=None,
+                        help="Explicit RAM ceiling in GB used to cap the worker count so the run "
+                             "does not swap. Auto-detected (SLURM/cgroup/psutil) if omitted.")
+    parser.add_argument("--mem-per-worker-gb", type=float, dest="mem_per_worker_gb", default=None,
+                        help="Override the per-worker RAM estimate (GB). Tune from observed RSS "
+                             "if the shard-size-based estimate is off for your data.")
     parser.add_argument("--shards-per-task", type=int, dest="shards_per_task", default=None,
                         help="Shards bundled per submitted task. 1 = finest memory/ETA granularity (default).")
     parser.add_argument("--vectors-dir", type=Path, dest="vectors_dir_override", default=None,
@@ -593,6 +612,9 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
             "batch_readahead",
             "fragment_readahead",
             "max_workers",
+            "cpu_frac",
+            "max_mem_gb",
+            "mem_per_worker_gb",
             "shards_per_task",
             "vectors_dir_override",
             "data_dir",

@@ -373,7 +373,9 @@ def _partial_numerator_for_shard(
     # committed atomically (accumulators are touched only after every allocation
     # for the batch has succeeded), so a retry never double-counts.
     _retryable = [cp.cuda.memory.OutOfMemoryError]
+    _cublas_cls: tuple = ()
     try:
+        _cublas_cls = (cp.cuda.cublas.CUBLASError,)
         _retryable.append(cp.cuda.cublas.CUBLASError)
     except AttributeError:  # pragma: no cover - cuBLAS error class always present in practice
         pass
@@ -381,6 +383,12 @@ def _partial_numerator_for_shard(
 
     bc = int(batch_cols)
     batch_start = 0
+    # Track whether (and why) the batch had to shrink during this call so the
+    # caller can decide whether to persist the reduced width. A cuBLAS-only shrink
+    # reflects transient out-of-pool workspace pressure (recover next iteration); a
+    # genuine OutOfMemoryError reflects a stable VRAM ceiling (persist, as before).
+    shrank_via_cublas = False
+    shrank_via_oom = False
     while batch_start < n_ucols:
         batch_end = min(batch_start + bc, n_ucols)
         try:
@@ -478,11 +486,11 @@ def _partial_numerator_for_shard(
             # retry the *same* columns at half the width.
             Z_u = Z_rows = num_contrib = den_contrib = S_b = None
             mempool.free_all_blocks()
+            try:
+                free_b, total_b = cp.cuda.runtime.memGetInfo()
+            except Exception:
+                free_b = total_b = -1
             if bc <= 1:
-                try:
-                    free_b, total_b = cp.cuda.runtime.memGetInfo()
-                except Exception:
-                    free_b = total_b = -1
                 print(
                     f"[shard-diag] FAILED at bc=1 device={device_id} div={divergence} "
                     f"masked={masked} n_ucols={n_ucols} batch={batch_start}:{batch_end} "
@@ -491,17 +499,26 @@ def _partial_numerator_for_shard(
                     file=sys.stderr, flush=True,
                 )
                 raise
+            if _cublas_cls and isinstance(exc, _cublas_cls):
+                shrank_via_cublas = True
+            else:
+                shrank_via_oom = True
             new_bc = max(1, bc // 2)
             print(
                 f"[shard-diag] shrinking batch device={device_id} masked={masked} "
-                f"{bc}->{new_bc} at batch_start={batch_start} ({type(exc).__name__})",
+                f"{bc}->{new_bc} at batch_start={batch_start} "
+                f"free={free_b/1e9:.2f}GB/{total_b/1e9:.2f}GB ({type(exc).__name__})",
                 file=sys.stderr, flush=True,
             )
             bc = new_bc
 
-    # Report the batch width actually used (post-retry) so the caller can cache it.
+    # Report the batch width actually used (post-retry) so the caller can cache it,
+    # plus why it shrank (if it did) so the caller can skip persisting a transient
+    # cuBLAS-only reduction.
     if batch_sink is not None:
         batch_sink[0] = int(bc)
+        if len(batch_sink) > 1:
+            batch_sink[1] = "oom" if shrank_via_oom else ("cublas" if shrank_via_cublas else None)
     cp.cuda.Device(device_id).synchronize()
     return cp.asnumpy(numerator), (cp.asnumpy(denominator) if masked else None)
 
@@ -565,8 +582,8 @@ def _sharded_factor_update(
     partials: List[Optional[Tuple[np.ndarray, Optional[np.ndarray]]]] = [None] * len(device_ids)
     # CHANGED (Task 4): per-shard sinks collect the realized batch width so the
     # caller can cache it; one list per shard avoids a key collision when several
-    # shards share a device.
-    sinks: List[list] = [[None] for _ in device_ids]
+    # shards share a device. Slot 1 carries the shrink cause ("oom"/"cublas"/None).
+    sinks: List[list] = [[None, None] for _ in device_ids]
     _own_pool = pool is None
     _pool = ThreadPoolExecutor(max_workers=len(device_ids)) if _own_pool else pool
     try:
@@ -605,6 +622,11 @@ def _sharded_factor_update(
         realized = [s[0] for s in sinks if s[0] is not None]
         if realized:
             batch_box["batch_cols"] = min(realized)
+            # Persist only a genuine OOM shrink; a cuBLAS-only shrink is transient.
+            causes = {s[1] for s in sinks if len(s) > 1 and s[1] is not None}
+            batch_box["shrink_cause"] = (
+                "oom" if "oom" in causes else ("cublas" if "cublas" in causes else None)
+            )
 
     # CPU reduce + MU update
     numerator_np = np.add.reduce([p[0] for p in partials])
@@ -1286,6 +1308,24 @@ class ShardedSparseTensor:
                     _ = a3 @ a3
                 cp.cuda.Device(did).synchronize()
 
+    def trim_pools(self) -> None:
+        """Return cached-but-unused pool blocks to the driver on every shard device.
+
+        Called at a low cadence (``pool_trim_every``) from the training loop — NOT
+        per iteration. Per-iteration flushing was removed (see ``set_iter_seed``
+        and ``_gpu_free_bytes``) because the cudaFree/cudaMalloc churn stalled the
+        GPU 6-7×/iteration. At ~once per sem-check the cost is negligible, and it
+        reclaims the transient blocks left by the semantic-eval GPU→CPU copies so
+        the out-of-pool cuBLAS/cuSPARSE workspaces keep their headroom — the
+        device-0 ``CUBLASError`` starvation. ``free_all_blocks`` only frees the
+        *current* device's cached blocks, so we iterate the shard devices; the
+        pinned host pool is device-agnostic and freed once.
+        """
+        for did in self.device_ids:
+            with cp.cuda.Device(did):
+                cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+
     def __del__(self) -> None:
         pool = getattr(self, "_pool", None)
         if pool is not None:
@@ -1317,13 +1357,28 @@ class ShardedSparseTensor:
         """
         self._iter_seed = int(iteration)
 
-    def _record_factor_batch(self, key: Tuple[str, int], realized: Optional[int]) -> None:
-        """Cache the realized factor batch width, kept monotonically non-increasing.
+    def _record_factor_batch(
+        self,
+        key: Tuple[str, int],
+        realized: Optional[int],
+        shrink_cause: Optional[str] = None,
+    ) -> None:
+        """Cache the realized factor batch width.
 
         CHANGED (Task 4): once an OOM-retry shrinks a batch, the smaller value is
         persisted so later iterations start there instead of re-tripping the retry.
+
+        CHANGED (cuBLAS robustness): a shrink caused by a *transient* cuBLAS
+        workspace failure (``shrink_cause == "cublas"``) is NOT persisted. The
+        cache keeps the wider width the call started from, so the next iteration
+        retries at full speed — one cuBLAS hiccup costs a single slow iteration
+        instead of pinning the whole run at batch=1 via the monotonic floor. A
+        genuine ``OutOfMemoryError`` shrink (stable VRAM ceiling) is still
+        persisted monotonically.
         """
         if realized is None:
+            return
+        if shrink_cause == "cublas":
             return
         prev = self._factor_batch_cache.get(key)
         self._factor_batch_cache[key] = realized if prev is None else min(prev, int(realized))
@@ -1462,7 +1517,7 @@ class ShardedSparseTensor:
             groupings=self._mode_groupings(mode),
             batch_box=box,
         )
-        self._record_factor_batch(key, box.get("batch_cols"))
+        self._record_factor_batch(key, box.get("batch_cols"), box.get("shrink_cause"))
         return A_new
 
     def fr_factor_update(
@@ -1497,7 +1552,7 @@ class ShardedSparseTensor:
             groupings=self._mode_groupings(mode),
             batch_box=box,
         )
-        self._record_factor_batch(key, box.get("batch_cols"))
+        self._record_factor_batch(key, box.get("batch_cols"), box.get("shrink_cause"))
         return A_new
 
     # ------------------------------------------------------------------

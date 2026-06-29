@@ -37,6 +37,7 @@ from tensormet.utils import (DATA_DIR,
                             np_sim,
                             resolve_checkpoint_path,
                    )
+from tensormet.hpc_helpers import mirror_checkpoint
 from tensormet.sparse_ops import initialize_nonnegative_tucker
 from tensormet.naming import (
     candidate_stems,
@@ -1307,6 +1308,10 @@ class SparseTupleTensor:
             rec_log_every = cfg.eval.rec_log_every
             rec_log_every = rec_log_every or rec_check_every
             time_iteration = cfg.eval.time_iteration
+            # GPU pool trim cadence: explicit value, else default to the sem-check cadence.
+            pool_trim_every = cfg.eval.pool_trim_every
+            if pool_trim_every is None:
+                pool_trim_every = sem_check_every
             # saving
             save_intermediate = cfg.eval.save_intermediate
             tier1 = cfg.train.tier1
@@ -1321,6 +1326,13 @@ class SparseTupleTensor:
             raise ValueError("sparse_tensor must have sparsity_type 'cupy'.")
 
         paths = cfg.artifact_paths()
+
+        # Under HPC mode `paths` resolve to node-local $TMPDIR. mirror_paths is the
+        # canonical GPFS destination: periodic checkpoints are mirrored there
+        # during the run (via hpc_helpers.mirror_checkpoint) so a walltime kill —
+        # which never runs the end-of-job copy-back — loses at most one checkpoint
+        # interval and stays resumable.
+        mirror_paths = cfg.artifact_paths(staged=False) if cfg.train.hpc else None
 
         if checkpoint_saving:
             os.makedirs(paths["checkpoint_dir"], exist_ok=True)
@@ -1524,6 +1536,11 @@ class SparseTupleTensor:
             # Not running in the main thread; leave default interrupt behaviour intact.
             _sigint_installed = False
 
+        # Wall-clock of the decomposition loop itself (excludes data loading,
+        # sparse conversion and process startup — those are captured by
+        # launch.py's runtime_seconds). Persisted so benchmarks can report a
+        # decomposition time distinct from total process runtime.
+        _decomp_loop_start = time.time()
         for iteration in range(start_iteration, n_iter_max):
             if time_iteration:
                 start_time = time.time()
@@ -1844,6 +1861,8 @@ class SparseTupleTensor:
                     checkpoint_tensor = TuckerTensor((cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors]))
                     paths = cfg.artifact_paths()
                     torch.save(checkpoint_tensor, paths["checkpoint_dir"] / f"{iteration + 1}.pt")
+                    # Durably mirror this checkpoint to GPFS so a walltime kill stays resumable.
+                    mirror_checkpoint(paths, mirror_paths, f"{iteration + 1}.pt")
 
                     # we collect reconstruction and fitness scores if they exist and dump
                     if fitness_scores:
@@ -1868,6 +1887,16 @@ class SparseTupleTensor:
                             f"Sem_all: {fitness_dump}\n"
                         )
 
+            # ---- proactive GPU pool trim (low cadence; see trim_pools) ----
+            # Reclaims transient eval/copy blocks so out-of-pool cuBLAS/cuSPARSE
+            # workspaces keep their headroom. Deliberately NOT per iteration.
+            if pool_trim_every and (iteration + 1) % pool_trim_every == 0:
+                if _sst is not None:
+                    _sst.trim_pools()
+                else:
+                    cp.get_default_memory_pool().free_all_blocks()
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
+
             # ---- graceful stop: save a resumable checkpoint, then break ----
             # Triggered by the first Ctrl+C. We write the same artifacts the normal
             # checkpoint path does (a {iteration+1}.pt model plus errors/fitness),
@@ -1890,6 +1919,8 @@ class SparseTupleTensor:
                                 json.dump(fitness_scores, f, indent=2)
                         else:
                             np.save(paths["fitness"], np.array(fitness_scores, dtype=float))
+                    # Mirror to GPFS so the interrupt-saved checkpoint survives in HPC mode.
+                    mirror_checkpoint(paths, mirror_paths, f"{iteration + 1}.pt")
                     print(f"Resumable checkpoint saved to {ckpt_path}")
                 except KeyboardInterrupt:
                     # Second Ctrl+C arrived mid-save: abort immediately.
@@ -1897,6 +1928,8 @@ class SparseTupleTensor:
                 except Exception as _save_err:
                     print(f"Failed to save resumable checkpoint: {_save_err}")
                 break
+
+        decomp_seconds = time.time() - _decomp_loop_start
 
         # Restore whatever SIGINT handler was in place before this run.
         if _sigint_installed:
@@ -1917,6 +1950,7 @@ class SparseTupleTensor:
                 "sem_primary_key": sem_primary_key,
                 "iterations": iteration + 1,
                 "final_error": rec_errors[-1] if len(rec_errors) > 0 else None,
+                "decomp_seconds": decomp_seconds,
             }
         else:
             return tensor

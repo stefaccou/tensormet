@@ -5,7 +5,7 @@ Three layers, smallest to largest:
 * **loading**  -- :func:`load_metrics` / :func:`load_vocab` parse a run's log
   into (iters, rec_error, sem_dicts).
 * **plotting** -- :func:`plot_metrics` (one run) and :func:`compare_metrics`
-  (two runs overlaid) turn those into matplotlib figures.
+  (any number of runs overlaid) turn those into matplotlib figures.
 * **UI**       -- :func:`make_run_browser` scans the ``decomposition/`` directory
   of one or more datasets (:func:`discover_datasets` finds them) for
   ``*_config.json`` snapshots and offers dataset checkboxes plus faceted
@@ -27,6 +27,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 import random
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -88,6 +89,60 @@ def load_vocab(cfg):
         return pickle.load(f)
 
 
+def average_runs(configs, n_grid=500):
+    """Average rec_error and semantic metrics across multiple runs.
+
+    ``configs`` is a list of configs (or a dict whose values are configs); each
+    may also be a list/tuple of resume-chain segments as accepted by
+    :func:`load_metrics`. Runs whose log file does not exist are silently skipped.
+
+    Metrics are interpolated onto a shared integer grid that spans the iteration
+    range *common to all runs* (clipped at the shortest run), then averaged
+    point-wise. The result is a ``(iters, rec_avg, sem_avg)`` triple — the same
+    shape as :func:`load_metrics` output — and can be passed directly as a run
+    entry in :func:`compare_metrics`.
+    """
+    raw_configs = list(configs.values() if isinstance(configs, dict) else configs)
+    loaded = []
+    for cfg in raw_configs:
+        segs = _as_run(cfg)
+        try:
+            loaded.append(load_metrics(*segs))
+        except FileNotFoundError:
+            continue
+    if not loaded:
+        raise FileNotFoundError("No log files found for any of the provided configs.")
+
+    all_its = [its for its, _, _ in loaded if its]
+    grid_min = max(min(its) for its in all_its)
+    grid_max = min(max(its) for its in all_its)
+    grid = sorted(set(int(v) for v in np.linspace(grid_min, grid_max, n_grid)))
+
+    rec_avg = np.mean(
+        [np.interp(grid, its, rec) for its, rec, _ in loaded], axis=0
+    ).tolist()
+
+    all_keys: set[str] = set()
+    for _, _, sem in loaded:
+        for d in sem:
+            all_keys.update(d.keys())
+
+    sem_avg = []
+    for g_it in grid:
+        d = {}
+        for key in all_keys:
+            vals = []
+            for its, _, sem in loaded:
+                its_k, vals_k = _values_for_key(key, its, sem)
+                if its_k:
+                    vals.append(float(np.interp(g_it, its_k, vals_k)))
+            if vals:
+                d[key] = sum(vals) / len(vals)
+        sem_avg.append(d)
+
+    return grid, rec_avg, sem_avg
+
+
 # === plotting ==========================================================
 
 def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
@@ -138,58 +193,131 @@ def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
     return fig
 
 
-def compare_metrics(cfg_a, cfg_b, label_a="A", label_b="B",
-                    sem_keys=("average_rank_score",), plot_rec_error=True,
-                    title="Training Metrics Comparison", ax=None):
-    """Overlay two runs (A solid, B dashed) on a shared figure.
+# Line styles cycle over reconstruction error + the semantic keys within a run;
+# each run is told apart by color instead, so arbitrarily many runs stay legible.
+_LINESTYLES = ("-", "--", ":", "-.")
 
-    ``cfg_a`` / ``cfg_b`` may each be a single config or a list/tuple of configs
-    (concatenated as in :func:`load_metrics`). Returns the figure.
+
+def _as_run(run):
+    """Normalize one run argument into a tuple of segment configs.
+
+    A single config becomes a one-segment run; a list/tuple is taken as the
+    ordered segments of a resume chain (concatenated by :func:`load_metrics`).
     """
-    cfgs_a = cfg_a if isinstance(cfg_a, (list, tuple)) else (cfg_a,)
-    cfgs_b = cfg_b if isinstance(cfg_b, (list, tuple)) else (cfg_b,)
-    its_a, rec_a, sem_a = load_metrics(*cfgs_a)
-    its_b, rec_b, sem_b = load_metrics(*cfgs_b)
+    return tuple(run) if isinstance(run, (list, tuple)) else (run,)
+
+
+def _is_preloaded(run):
+    """Return True if *run* is already a (iters, rec, sem) triple from average_runs."""
+    return (isinstance(run, tuple) and len(run) == 3
+            and isinstance(run[0], list)
+            and (not run[0] or isinstance(run[0][0], int)))
+
+
+def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
+                    plot_rec_error=True, title="Training Metrics Comparison",
+                    ax=None, clip_common=False, color_by=None):
+    """Overlay any number of runs on a shared figure.
+
+    ``configs`` is the list of runs to plot and ``labels`` a parallel list of
+    legend names. Each *run* is either a single config or a list/tuple of configs
+    treated as resume-chain segments (concatenated as in :func:`load_metrics`), so
+    to overlay several chains pass a list of lists. A ``dict`` may be given instead
+    of ``configs``: its values become the runs and its keys the labels (an explicit
+    ``labels`` still overrides the keys). When a label is missing it falls back to
+    the run's ``stem``.
+
+    ``color_by`` controls how colors are assigned. When omitted each run gets its
+    own tab10 color. Pass either:
+
+    * a **callable** ``label -> group`` — e.g. ``lambda l: l.split(" rs")[0]``
+      to colour by the method name extracted from the label; or
+    * a **dict** ``{label: group}`` for explicit per-label group assignment.
+
+    Runs that map to the same group share a color; each distinct group gets a
+    different tab10 color. This lets you visually separate methods while keeping
+    random-state curves the same hue.
+
+    Reconstruction error and the semantic keys are told apart by line style.
+    Returns the figure.
+
+    With ``clip_common`` set, the x-axis is capped at the last iteration shared by
+    every run (the smallest of their final iterations), so short and long runs are
+    compared over their common range instead of being squashed.
+    """
+    if isinstance(configs, dict):
+        if labels is None:
+            labels = list(configs.keys())
+        configs = list(configs.values())
+
+    runs = [c if _is_preloaded(c) else _as_run(c) for c in configs]
+    if labels is None:
+        labels = [None] * len(runs)
+    labels = [str(lbl) if lbl is not None
+              else ("averaged" if _is_preloaded(run) else run[-1].stem)
+              for lbl, run in zip(labels, runs)]
+    loaded = [run if _is_preloaded(run) else load_metrics(*run)
+              for run in runs]  # [(its, rec, sem), ...]
+
+    # Build per-run color from color_by, falling back to run index.
+    palette = plt.cm.tab10.colors
+    if color_by is not None:
+        group_fn = color_by if callable(color_by) else color_by.__getitem__
+        groups = [group_fn(lbl) for lbl in labels]
+        # Preserve first-seen order so group→color is stable.
+        seen: dict = {}
+        for g in groups:
+            if g not in seen:
+                seen[g] = len(seen)
+        run_colors = [palette[seen[g] % len(palette)] for g in groups]
+    else:
+        run_colors = [palette[i % len(palette)] for i in range(len(labels))]
 
     ax1 = ax or plt.subplots()[1]
     fig = ax1.figure
     ax1.set_xlabel("Iteration")
     ax1.grid(True)
 
-    colors = plt.cm.tab10.colors
     all_lines = []
 
     split_axes = (not plot_rec_error) and (len(sem_keys) == 2)
 
     if split_axes:
+        # One semantic key per axis; runs separated by color, keys by axis.
         ax2 = ax1.twinx()
-        for ax_i, key, axis in zip(range(2), sem_keys, [ax1, ax2]):
-            c = colors[ax_i % len(colors)]
-            its_ka, vals_ka = _values_for_key(key, its_a, sem_a)
-            its_kb, vals_kb = _values_for_key(key, its_b, sem_b)
-            (la,) = axis.plot(its_ka, vals_ka, color=c, linestyle="-", label=f"{key} ({label_a})")
-            (lb,) = axis.plot(its_kb, vals_kb, color=c, linestyle="--", label=f"{key} ({label_b})")
-            axis.set_ylabel(key)
-            all_lines += [la, lb]
+        ax1.set_ylabel(sem_keys[0])
+        ax2.set_ylabel(sem_keys[1])
+        for (its, _rec, sem), lbl, c in zip(loaded, labels, run_colors):
+            for key, axis in zip(sem_keys, (ax1, ax2)):
+                its_k, vals_k = _values_for_key(key, its, sem)
+                (l,) = axis.plot(its_k, vals_k, color=c, label=f"{lbl} · {key}")
+                all_lines.append(l)
     else:
         if plot_rec_error:
-            (l,) = ax1.plot(its_a, rec_a, color="red", linestyle="-", label=f"Rec error ({label_a})")
-            (l2,) = ax1.plot(its_b, rec_b, color="darkred", linestyle="--", label=f"Rec error ({label_b})")
             ax1.set_ylabel("Reconstruction Error")
-            all_lines += [l, l2]
-
-        if sem_keys:
-            ax2 = ax1.twinx()
+        ax2 = ax1.twinx() if sem_keys else None
+        if ax2 is not None:
             ax2.set_ylabel("Score")
-            for i, key in enumerate(sem_keys):
-                its_ka, vals_ka = _values_for_key(key, its_a, sem_a)
-                its_kb, vals_kb = _values_for_key(key, its_b, sem_b)
-                c = colors[i % len(colors)]
-                (la,) = ax2.plot(its_ka, vals_ka, color=c, linestyle="-", label=f"{key} ({label_a})")
-                (lb,) = ax2.plot(its_kb, vals_kb, color=c, linestyle="--", label=f"{key} ({label_b})")
-                all_lines += [la, lb]
+        for (its, rec, sem), lbl, c in zip(loaded, labels, run_colors):
+            if plot_rec_error:
+                (l,) = ax1.plot(its, rec, color=c, linestyle=_LINESTYLES[0],
+                                label=f"{lbl} · Rec error")
+                all_lines.append(l)
+            for k_i, key in enumerate(sem_keys):
+                # Offset so the first score curve isn't solid like rec error.
+                ls = _LINESTYLES[(k_i + (1 if plot_rec_error else 0)) % len(_LINESTYLES)]
+                its_k, vals_k = _values_for_key(key, its, sem)
+                (l,) = ax2.plot(its_k, vals_k, color=c, linestyle=ls,
+                                label=f"{lbl} · {key}")
+                all_lines.append(l)
 
-    ax1.legend(all_lines, [l.get_label() for l in all_lines], loc="best")
+    if clip_common:
+        finals = [max(its) for its, _, _ in loaded if its]
+        if finals:
+            ax1.set_xlim(right=min(finals))
+
+    ax1.legend(all_lines, [l.get_label() for l in all_lines],
+               loc="center left", bbox_to_anchor=(1.12, 0.5), frameon=False)
     ax1.set_title(title)
     return fig
 
@@ -380,6 +508,10 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     than at the iteration the resume began. Chained entries are marked ``⛓×N``.
     Untick to view a single segment (e.g. just the resumed tail) in isolation.
 
+    When comparing two runs of unequal length, tick *clip to common iters* to cap
+    the x-axis at the shorter run's final iteration (e.g. 250 vs 2000 → x stops at
+    250), so the shared range is compared head-to-head rather than squashed.
+
     The current plot can be exported two ways: type a path in the *save as* box
     and hit *Save* to write it to disk, or grab the live Figure object via
     ``browser.get_figure()`` (returns ``None`` until the first plot is drawn).
@@ -444,6 +576,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                            style={"description_width": "75px"}, layout=widgets.Layout(width="55%"))
     rec_chk = widgets.Checkbox(value=False, description="plot rec error", indent=False)
     stitch_chk = widgets.Checkbox(value=True, description="stitch resume chains", indent=False)
+    clip_chk = widgets.Checkbox(value=False, description="clip to common iters", indent=False)
     after_box = widgets.Text(value="", description="after", placeholder="YYYY-MM-DD",
                              style={"description_width": "45px"},
                              layout=widgets.Layout(width="190px"))
@@ -565,9 +698,9 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                                  title=a[-1].stem, ax=ax)
                 else:
                     shared, (la, lb) = _diff_labels([a[-1].insp, b[-1].insp])
-                    compare_metrics(list(a), list(b), label_a=la, label_b=lb,
+                    compare_metrics([list(a), list(b)], [la, lb],
                                     sem_keys=keys, plot_rec_error=rec_chk.value,
-                                    title=shared, ax=ax)
+                                    title=shared, ax=ax, clip_common=clip_chk.value)
             except FileNotFoundError as e:
                 plt.close(fig)
                 state["fig"] = None
@@ -641,6 +774,8 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     run_b.observe(_on_select, "value")
     sem_box.observe(_on_select, "value")
     rec_chk.observe(_on_select, "value")
+    # Clipping only changes the x-axis limit on the existing curves — just redraw.
+    clip_chk.observe(_on_select, "value")
     # Toggling stitch changes the A/B option values (chains vs single runs), so it
     # needs a rebuild — _on_filter does exactly that (rebuild + redraw).
     stitch_chk.observe(_on_filter, "value")
@@ -656,7 +791,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         widgets.HBox(list(dataset_chk.values()), layout=widgets.Layout(flex_flow="row wrap")),
     ])
     filters = widgets.HBox(list(facet_dd.values()), layout=widgets.Layout(flex_flow="row wrap"))
-    controls = widgets.HBox([sem_box, rec_chk, stitch_chk, after_box, refresh_btn, save_name, save_btn])
+    controls = widgets.HBox([sem_box, rec_chk, stitch_chk, clip_chk, after_box, refresh_btn, save_name, save_btn])
     ui = widgets.VBox([datasets_box, filters, status, run_a, run_b, controls, plot_out])
     # Expose the live state so callers can grab the current Figure out of the UI,
     # e.g. `fig = browser.get_figure(); fig.savefig(...)` or display it elsewhere.

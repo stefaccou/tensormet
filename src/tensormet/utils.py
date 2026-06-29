@@ -338,13 +338,77 @@ class SparseCOOTensor:
             f"dtype={self._values.dtype})"
         )
 
-def compute_num_threads(max_cpu_frac: float = 0.75, min_threads: int = 1) -> int:
-    """Deterministic thread budget based on available CPUs."""
+def available_cpus() -> int:
+    """CPUs this process may actually use.
+
+    Prefers the SLURM allocation (``SLURM_CPUS_PER_TASK``) and the scheduler
+    affinity mask (``os.sched_getaffinity``) so that on an HPC node we see the
+    *allocated* cores, not the full node — ``multiprocessing.cpu_count()`` ignores
+    cgroup/affinity limits and would over-count under SLURM.
+    """
+    # Affinity mask is the ground truth under a SLURM cgroup (= allocated cores),
+    # and is correct whether the job uses --cpus-per-task or --ntasks.
     try:
-        n_cores = multiprocessing.cpu_count()
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        pass
+    val = os.getenv("SLURM_CPUS_PER_TASK")
+    if val:
+        try:
+            return max(1, int(val))
+        except ValueError:
+            pass
+    try:
+        return max(1, multiprocessing.cpu_count())
     except NotImplementedError:
-        n_cores = os.cpu_count() or 1
-    return max(min_threads, int(n_cores * max_cpu_frac))
+        return max(1, os.cpu_count() or 1)
+
+
+def compute_num_threads(max_cpu_frac: float = 0.75, min_threads: int = 1) -> int:
+    """Deterministic thread budget based on the *allocated* CPUs."""
+    return max(min_threads, int(available_cpus() * max_cpu_frac))
+
+
+def resolve_mem_budget_gb(max_mem_gb: Optional[float] = None) -> Tuple[float, str]:
+    """Resolve the RAM budget (in GiB) the run may use, with its source.
+
+    Precedence: explicit ``max_mem_gb`` → SLURM allocation (``SLURM_MEM_PER_NODE``,
+    in MiB) → cgroup v2 ``memory.max`` / v1 ``memory.limit_in_bytes`` → psutil
+    available RAM → a conservative fallback. HPC RAM auto-detection is unreliable
+    under SLURM/cgroups, so prefer passing ``--max-mem-gb`` explicitly.
+    """
+    if max_mem_gb is not None and max_mem_gb > 0:
+        return float(max_mem_gb), "explicit"
+
+    slurm = os.getenv("SLURM_MEM_PER_NODE")
+    if slurm:
+        try:
+            return int(slurm) / 1024.0, "SLURM_MEM_PER_NODE"
+        except ValueError:
+            pass
+
+    for path, name in (
+        ("/sys/fs/cgroup/memory.max", "cgroup-v2"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "cgroup-v1"),
+    ):
+        try:
+            with open(path) as f:
+                raw = f.read().strip()
+            if raw and raw != "max":
+                val = int(raw)
+                # cgroup "unlimited" sentinels are huge; ignore them.
+                if 0 < val < (1 << 62):
+                    return val / 1e9, name
+        except (OSError, ValueError):
+            pass
+
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1e9, "psutil-available"
+    except Exception:
+        pass
+
+    return 16.0, "fallback-default"
 
 @dataclass(frozen=True)
 class ThreadBudget:

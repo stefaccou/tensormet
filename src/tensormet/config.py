@@ -94,6 +94,12 @@ class TrainingConfig:
     tier1: bool = False
     overwrite: bool = False
     data_dir: Path = DATA_DIR
+    # HPC mode: stage all per-run artifact writes (model, errors, fitness,
+    # checkpoints, log) to node-local scratch ($TMPDIR) during the run, then
+    # copy them back to data_dir (shared GPFS) once at the end. Relieves the
+    # metadata-lock contention that explodes iteration times when many array
+    # tasks write to the same GPFS decomposition directory simultaneously.
+    hpc: bool = False
 
 @dataclass(frozen=True)
 class EvalConfig:
@@ -107,6 +113,12 @@ class EvalConfig:
     remove_OOV: bool = False # whether to set OOV in test set to OOV token (false ignores the sentences)
     time_iteration: bool = True # whether to print the time taken by an iteration
     save_intermediate: bool = True # whether to save the current best model (safety for interrupted code)
+    # Proactive GPU pool trim cadence (iterations). None -> default to sem_check_every.
+    # Every this-many iterations the CuPy memory pool's cached-but-unused blocks are
+    # returned to the driver on each shard device, reclaiming transient eval/copy
+    # memory so out-of-pool cuBLAS/cuSPARSE workspaces keep their headroom (the
+    # device-0 CUBLASError cascade). Kept off the per-iteration hot path on purpose.
+    pool_trim_every: Optional[int] = None
     log_file: Optional[Union[str, Path]] = None
 
 
@@ -142,7 +154,21 @@ class RunConfig:
         payload = json.dumps(asdict(self), sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha1(payload).hexdigest()[:10]
 
-    def output_dir(self) -> Path:
+    def staging_root(self) -> Path:
+        """Node-local scratch root used when ``train.hpc`` is set.
+
+        Prefers ``$TMPDIR`` (per-job node-local SSD on most schedulers, incl.
+        dodrio/Slurm), falling back to the OS temp dir. Runs are isolated by
+        ``run_id`` so concurrent tasks that happen to share a $TMPDIR never
+        collide.
+        """
+        import tempfile
+        base = os.environ.get("TMPDIR") or tempfile.gettempdir()
+        return Path(base) / "tensormet_stage" / self.run_id()
+
+    def output_dir(self, *, staged: bool = False) -> Path:
+        if staged:
+            return self.staging_root() / "tensors" / self.exp.dataset / "decomposition"
         return self.train.data_dir / "tensors" / self.exp.dataset / "decomposition"
 
     def model_filename(self) -> str:
@@ -158,13 +184,23 @@ class RunConfig:
     def model_path(self) -> Path:
         return self.output_dir() / self.model_filename()
 
-    def artifact_paths(self) -> Dict[str, Path]:
+    def artifact_paths(self, *, staged: Optional[bool] = None) -> Dict[str, Path]:
         """
-        Canonical artifact paths for this run.
-        Keep everything derived from model_path() so downstream code never re-invents paths.
+        Artifact paths for this run.
+
+        By default (``staged=None``) the location follows ``train.hpc``: when HPC
+        mode is on, paths resolve under node-local ``$TMPDIR`` so the hot-loop
+        writes (temp model, errors, fitness, checkpoints, log) never touch shared
+        GPFS. Pass ``staged=False`` to force the canonical GPFS destination
+        (e.g. for resume scans and the final copy-back target).
+
+        Keep everything derived from the resolved out_dir so downstream code
+        never re-invents paths.
         """
-        model = self.model_path()
-        out_dir = model.parent
+        if staged is None:
+            staged = self.train.hpc
+        out_dir = self.output_dir(staged=staged)
+        model = out_dir / self.model_filename()
 
         checkpoint_dir = out_dir / f"{model.stem}_checkpoints"
 
@@ -185,6 +221,8 @@ class RunConfig:
             "fitness": model.with_name(model.stem + "_fitness.npy"),
             "fitness_json": model.with_name(model.stem + "_fitness.json"),
 
+            "timing_json": model.with_name(model.stem + "_timing.json"),
+
             "config": model.with_name(model.stem + "_config.json"),
             "runs_jsonl": out_dir / "runs.jsonl",
             "log": log_path,
@@ -200,7 +238,9 @@ class RunConfig:
         if not self.train.resume:  # resume stays in TrainingConfig
             return {}
 
-        paths = self.artifact_paths()
+        # Resume always reads prior artifacts from the canonical GPFS location;
+        # under HPC mode the staged ($TMPDIR) tree is empty at job start.
+        paths = self.artifact_paths(staged=False)
         out_dir = paths["model"].parent
 
         # 1. Build wildcard patterns for the base name.
@@ -245,7 +285,11 @@ class RunConfig:
             old_train = old_cfg_data.get("train", {})
 
 
-            # These are the variables that MUST match to safely resume
+            # These are the variables that MUST match to safely resume.
+            # random_state is included because stochastic windows/sampling are a
+            # pure function of (random_state, iteration): resuming across runs with
+            # different seeds would splice together incompatible RNG streams.
+            # Old configs predating this field fall back to the dataclass default.
             is_compatible = (
                     old_exp.get("dataset") == self.exp.dataset and
                     old_exp.get("order") == self.exp.order and
@@ -254,6 +298,7 @@ class RunConfig:
                     _as_dim_tuple(old_exp.get("dim", [])) == _as_dim_tuple(self.exp.dim) and
                     tuple(old_exp.get("rank", [])) == tuple(self.exp.rank) and
                     old_exp.get("init") == self.exp.init and
+                    int(old_exp.get("random_state", 1)) == int(self.exp.random_state) and
                     _canonical_shared_factors(old_exp.get("shared_factors")) ==
                     _canonical_shared_factors(self.exp.shared_factors) and
                     float(old_exp.get("subsample_frac", 1.0)) == self.exp.subsample_frac
@@ -266,6 +311,7 @@ class RunConfig:
             old_exp.get("dim"), self.exp.dim, "\t",
             tuple(old_exp.get("rank", [])), tuple(self.exp.rank), "\t",
             old_exp.get("init"), self.exp.init, "\t",
+            old_exp.get("random_state", 1), self.exp.random_state, "\t",
             _canonical_shared_factors(old_exp.get("shared_factors")),
             _canonical_shared_factors(self.exp.shared_factors), "\t",
             float(old_exp.get("subsample_frac", 1.0)), self.exp.subsample_frac)
@@ -518,7 +564,10 @@ class PopulationExperimentConfig:
     batch_rows: int = 256_000
     batch_readahead: int = 4
     fragment_readahead: int = 2
-    max_workers: int = 0        # 0 = auto → ~1 worker per 100 shards
+    max_workers: int = 0        # 0 = auto → scale to cores (cpu_frac) under the mem ceiling
+    cpu_frac: float = 0.5       # fraction of cores to target when max_workers == 0 (1.0 = full node)
+    max_mem_gb: Optional[float] = None        # explicit RAM ceiling; auto-detected if None
+    mem_per_worker_gb: Optional[float] = None  # per-worker RAM estimate override (tune from RSS)
     shards_per_task: int = 1    # shards bundled per worker task; 1 = finest granularity
     vectors_dir_override: Optional[Path] = None  # bypass dataset-derived path
     data_dir: Path = DATA_DIR
