@@ -364,7 +364,7 @@ def gather_dense_at_block_nz(dense_nd: np.ndarray,
 
     dense_flat = dense_nd.reshape(size, order="C")
     coo = vec_tensor.tocoo()
-    flat = coo.row + coo.col * block_size
+    flat = coo.row.astype(cp.int64) + coo.col.astype(cp.int64) * cp.int64(block_size)
     return dense_flat[flat.get()]
 
 # def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=1e-12):

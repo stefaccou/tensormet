@@ -34,12 +34,13 @@ IMPORTS NEEDED WHEN METHODS ARE MOVED HERE
     # plus anything the specific method uses (see tucker_tensor.py method bodies)
 """
 
+from __future__ import annotations
+
 import numpy as np
 import matplotlib.pyplot as plt
 from tensormet.utils import einsum_letters, voc_index
 from tensormet.tucker_tensor import _to_np
 from typing import Tuple
-from __future__ import annotations
 
 
 class TuckerVizMixin:

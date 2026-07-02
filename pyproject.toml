@@ -7,19 +7,26 @@ Project utilities for tensor repo.
 requires-python = ">=3.9"
 dependencies = [
     "cupy",
+    "datasets",
     "matplotlib",
     "numpy",
     "nvidia-ml-py",
     "pyTensorlab",
     "requests",
+    "scipy",
     "sparse",
-    "tensorflow",
+    "submitit",  # Slurm dispatch for Tier-2 HPC jobs (tensormet.experimental.submit)
     "tensorly",
+    "threadpoolctl",
     "torch",
     "tqdm",
     "pyarrow",
     "spacy" # for vector creation
 ]
+
+[project.optional-dependencies]
+tf = ["tensorflow"]  # only used by the optional TF-sparse branch and experimental/sparse_tf.py
+experimental = ["pandas"]  # experimental/inspect_tucker.py
 
 [build-system]
 requires = ["setuptools>=61"]

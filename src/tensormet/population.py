@@ -11,6 +11,7 @@ from tensormet.utils import (
     DATA_DIR, shared_factor_suffix, linked_factor_groups, SparseCOOTensor,
     _INT64_MAX, dim_spec_str, compute_num_threads, resolve_mem_budget_gb,
 )
+from tensormet.naming import ALL_METHODS, DEFAULT_METHODS
 import pickle
 
 import pyarrow as pa
@@ -20,13 +21,9 @@ import pyarrow.dataset as ds
 from itertools import combinations
 from functools import reduce
 import hashlib, json
+import zipfile
 
-_ALL_TENSORS = [
-    "counting", "countingLog", "countingLogEps",
-    "probLog", "probLogSoftPlus", "probLogShifted",
-    "sii", "siiSoftPlus", "siiShifted",
-    "sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat",
-]
+_ALL_TENSORS = ALL_METHODS
 
 # epsilon added after log(count) so that singletons (count == 1) map to a small
 # non-zero value instead of log(1) == 0, keeping them in the sparse tensor.
@@ -49,6 +46,40 @@ _IN_FLIGHT_FACTOR = 2.0   # covers the n_workers + 4 in-flight result buffer
 _PASS2_AUTO_WORKER_CAP = 12
 # Minimum joint rows per post-processing chunk (avoid tiny parallel chunks).
 _PP_MIN_CHUNK = 200_000
+
+
+def _torch_save_atomic(obj, path: str) -> None:
+    """torch.save into a sibling .tmp, then os.replace into place.
+
+    A save that dies mid-write (scratch quota, Lustre I/O error, walltime kill)
+    then never leaves a truncated file at the canonical path, so the resume
+    check in populate_tensors_parquet can trust file existence.
+    """
+    tmp = f"{path}.tmp"
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)  # atomic same-fs rename
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _is_complete_pt(path: str) -> bool:
+    """True if ``path`` is a fully written torch.save zip archive.
+
+    The end-of-central-directory record is the last thing torch flushes, so a
+    save that died mid-write leaves a file that fails to open as a zip. Opening
+    reads only that trailing directory — cheap even for multi-GB tensors.
+    Guards resumes against truncated files written before saves were atomic.
+    """
+    try:
+        with zipfile.ZipFile(path):
+            return True
+    except (OSError, zipfile.BadZipFile):
+        return False
 
 
 # ── new top-level worker (must be picklable → module level) ─────
@@ -379,7 +410,8 @@ def _build_pp_arrays(subset_counters, single_probs, vocabs_max, ranks,
 # factor linking, and whether sii sub-counters were materialised.
 # ---------------------------------------------------------------------------
 def _pp_state_cache_path(path_to_tensors, path_to_vectors, cols_to_build,
-                         max_ks, shared_factors, need_sii):
+                         max_ks, shared_factors, need_sii, remove_hapax,
+                         min_mode_ks, ensured_vocab):
     key = json.dumps(
         {
             "src": os.fspath(path_to_vectors),
@@ -387,6 +419,9 @@ def _pp_state_cache_path(path_to_tensors, path_to_vectors, cols_to_build,
             "max_ks": list(max_ks),
             "shared_factors": shared_factors,
             "sii": bool(need_sii),
+            "remove_hapax": bool(remove_hapax),
+            "min_mode_ks": sorted((min_mode_ks or {}).items()),
+            "ensured_vocab": sorted(ensured_vocab) if ensured_vocab else None,
         },
         sort_keys=True,
     )
@@ -779,6 +814,12 @@ def _shared_topk_hmean(counters: list[Counter], k: int, eps: float = 0.0,
         guaranteed,
         key=lambda x: (-sum(c.get(x, 0) for c in counters), x)
     )
+    if len(guaranteed_sorted) > k:
+        print(f"  [_shared_topk_hmean] WARNING: min_ks/ensured_vocab guaranteed "
+              f"{len(guaranteed_sorted)} keys, exceeding k={k} — truncating to the "
+              f"top {k} guaranteed keys by count so the returned vocabulary stays at "
+              f"most k, per this function's contract.")
+        guaranteed_sorted = guaranteed_sorted[:k]
     return guaranteed_sorted + additional
 
 
@@ -810,7 +851,7 @@ def populate_tensors_parquet(
             raise ValueError(f"Unknown tensor names: {unknown}. Valid: {_ALL_TENSORS}")
         want = list(tensors_to_build)
     else:
-        want = _ALL_TENSORS
+        want = list(DEFAULT_METHODS)
 
     need_count     = "counting"    in want
     need_prob_log  = any(t in want for t in ("probLog", "probLogSoftPlus", "probLogShifted"))
@@ -998,12 +1039,26 @@ def populate_tensors_parquet(
     if use_fast:
         pp_cache_path = _pp_state_cache_path(
             path_to_tensors, path_to_vectors, cols_to_build,
-            max_ks, shared_factors, need_sii,
+            max_ks, shared_factors, need_sii, remove_hapax,
+            min_mode_ks, ensured_vocab,
         )
-        if pp_cache_path.exists():
-            print(f"Loading cached post-Pass-2 arrays from {pp_cache_path} "
+        load_path = pp_cache_path if pp_cache_path.exists() else None
+        if load_path is None and not need_sii:
+            # A checkpoint written with sii sub-counters is a strict superset of
+            # one without (sii only adds sub_keys/sub_counts arrays, and `need`
+            # overrides at load), so a run that dropped the sii variants can
+            # still reuse an earlier full-set checkpoint.
+            superset_path = _pp_state_cache_path(
+                path_to_tensors, path_to_vectors, cols_to_build,
+                max_ks, shared_factors, True, remove_hapax,
+                min_mode_ks, ensured_vocab,
+            )
+            if superset_path.exists():
+                load_path = superset_path
+        if load_path is not None:
+            print(f"Loading cached post-Pass-2 arrays from {load_path} "
                   f"(skipping Pass 2)...")
-            pp_state = _load_pp_state_cache(pp_cache_path, need)
+            pp_state = _load_pp_state_cache(load_path, need)
 
     if pp_state is None:
         subset_counters = _compute_subset_counters(
@@ -1190,7 +1245,7 @@ def populate_tensors_parquet(
             p_pop = f"{path_to_tensors}/populated"
             expected = [f"{p_pop}/{name}_{order}D_{dim_str}d{suffix}.pt" for name in want]
             vocab_pkl = f"{path_to_tensors}/vocabularies/{order}D_{dim_str}d{suffix}.pkl"
-            if all(os.path.exists(fp) for fp in expected) and os.path.exists(vocab_pkl):
+            if os.path.exists(vocab_pkl) and all(_is_complete_pt(fp) for fp in expected):
                 print(f"\nVariant {variant} (dim_str={dim_str}) already built "
                       f"({len(want)} tensors present) — skipping.")
                 continue
@@ -1313,10 +1368,15 @@ def populate_tensors_parquet(
             print(f"  {name} [{order}D {dim_str}d{suffix}]: {tens._nnz()} nonzero values")
 
         if save:
-            with open(f"{path_to_tensors}/vocabularies/{order}D_{dim_str}d{suffix}.pkl", "wb") as f:
-                pickle.dump(vocab, f)
             for name, tens in built.items():
-                torch.save(tens, f"{p}/{name}_{order}D_{dim_str}d{suffix}.pt")
+                _torch_save_atomic(tens, f"{p}/{name}_{order}D_{dim_str}d{suffix}.pt")
+            # Vocab last: with atomic tensor saves it doubles as the variant's
+            # completion marker for the resume check above.
+            vocab_path = f"{path_to_tensors}/vocabularies/{order}D_{dim_str}d{suffix}.pkl"
+            vocab_tmp = f"{vocab_path}.tmp"
+            with open(vocab_tmp, "wb") as f:
+                pickle.dump(vocab, f)
+            os.replace(vocab_tmp, vocab_path)  # atomic
 
         else:
             results[variant] = (built, vocab)

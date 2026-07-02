@@ -41,6 +41,7 @@ from tensormet.utils import (DATA_DIR,
 from tensormet.hpc_helpers import mirror_checkpoint
 from tensormet.sparse_ops import initialize_nonnegative_tucker
 from tensormet.naming import (
+    ALL_METHODS,
     candidate_stems,
     vocab_filename as _vocab_filename,
     vocab_filename_legacy as _vocab_filename_legacy,
@@ -157,12 +158,8 @@ class TuckerDecomposition:
                     factors: list[torch.Tensor]
                     vocab: dict with keys 'vocab_v','vocab_s','vocab_o','v2i','s2i','o2i'
         """
-        if method not in {"counting", "sc", "sii",
-                          "countingLog", "countingLogEps",
-                          "probLog", "probLogSoftPlus", "probLogShifted",
-                          "scSoftPlus", "scShifted", "scSoftPlusFlat",
-                          "siiSoftPlus", "siiShifted"}:
-            raise ValueError("method must be one of {'counting','sc','sii'}")
+        if method not in ALL_METHODS:
+            raise ValueError(f"method must be one of {set(ALL_METHODS)}")
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
 
@@ -836,7 +833,7 @@ def cupy_to_torch_sparse(
             int32_max = np.iinfo(np.int32).max
             block_size = min(size, int32_max)
 
-            flat = row_np + col_np * block_size
+            flat = row_np.astype(np.int64) + col_np.astype(np.int64) * np.int64(block_size)
             coords = np.unravel_index(flat, shape)
             indices_np = np.vstack(coords)
 
@@ -967,20 +964,8 @@ class SparseTupleTensor:
         If add_vocab=True, automatically loads the matching vocabulary file
         (derived from order, dims, shared_factors — same as TuckerDecomposition).
         """
-        if method not in {
-            "counting", "sc", "sii",
-            "countingLog", "countingLogEps",
-            "probLog", "probLogSoftPlus", "probLogShifted",
-            "siiSoftPlus", "siiShifted",
-            "scSoftPlus", "scShifted", "scSoftPlusFlat",
-        }:
-            raise ValueError(
-                "method must be one of "
-                "{'counting','sc','sii', \n"
-                "'countingLog', 'countingLogEps', \n"
-                "'probLog', 'probLogSoftPlus', 'probLogShifted'\n"
-                "'siiSoftPlus','siiShifted','scSoftPlus','scShifted','scSoftPlusFlat'}"
-            )
+        if method not in ALL_METHODS:
+            raise ValueError(f"method must be one of {set(ALL_METHODS)}")
 
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
@@ -1299,6 +1284,12 @@ class SparseTupleTensor:
             sem_check_every = cfg.eval.sem_check_every
             sem_error_type = cfg.eval.sem_error_type
             sem_softmax_temperature = cfg.eval.sem_softmax_temperature
+            # LLM-as-judge dimension-consistency scoring (default off). getattr so
+            # configs deserialized from before these fields existed keep working.
+            dim_consistency = getattr(cfg.eval, "dim_consistency", False)
+            dim_consistency_words = getattr(cfg.eval, "dim_consistency_words", 5)
+            dim_consistency_diversity = getattr(cfg.eval, "dim_consistency_diversity", True)
+            dim_consistency_model = getattr(cfg.eval, "dim_consistency_model", None)
             # logging
             rec_log_every = cfg.eval.rec_log_every
             rec_log_every = rec_log_every or rec_check_every
@@ -1465,7 +1456,12 @@ class SparseTupleTensor:
 
         sem_no_rec_improve_steps = 0
 
-        # Ensure 'best' variables are initialized safely so returning them at the end doesn't fail
+        # Ensure 'best' variables are initialized safely so returning them at the end doesn't fail.
+        # NOTE: on resume, best_core/best_factors start as the *checkpoint* tensors, not
+        # necessarily the historical best-scoring model on disk — they are only replaced
+        # below if semantics improve past the resumed best_sem_score. If semantics never
+        # improve during this run, the "best" tensor returned is just the latest checkpoint,
+        # labeled with the resumed score.
         best_core = core.copy()
         best_factors = [f.copy() for f in factors]
         best_sem_iteration = start_iteration if start_iteration > 0 else None
@@ -1489,6 +1485,29 @@ class SparseTupleTensor:
                 simlex_pairs = load_simlex(_SIMLEX_PATH)
             except Exception as _e:
                 print(f"Warning: could not load SimLex-999 from {_SIMLEX_PATH}: {_e}")
+
+        # --- dimension-consistency judge (optional, default off) ---
+        # Constructing the judge is free: the actual model (~1 GB fp16 on GPU for
+        # the default 0.5B judge) is only loaded at the FIRST semantic check, once
+        # the decomposition's own GPU footprint is established — and right after a
+        # CuPy pool trim below, so torch gets real headroom. Import is deferred so
+        # runs without the flag never touch transformers.
+        _dim_judge = None
+        if dim_consistency:
+            from tensormet.judge import DimConsistencyJudge, DEFAULT_JUDGE_MODEL
+            _judge_model_name = dim_consistency_model or DEFAULT_JUDGE_MODEL
+            _dim_judge = DimConsistencyJudge(
+                model_name=_judge_model_name,
+                num_dim_words=dim_consistency_words,
+                diversity_aware=dim_consistency_diversity,
+            )
+            print(
+                f"Dimension-consistency scoring enabled (judge={_judge_model_name!r}, "
+                f"words/dim={dim_consistency_words}, diversity_aware={dim_consistency_diversity}). "
+                f"The judge model will be loaded lazily at the first semantic check "
+                f"(every {sem_check_every} iterations) and adds ~1 GB of GPU memory "
+                f"on top of the decomposition."
+            )
 
         print(divergence, rank, _subsample_frac)
         # CHANGED (2026-06-12 review, Task 6): announce the routing family chosen by
@@ -1535,6 +1554,9 @@ class SparseTupleTensor:
         # launch.py's runtime_seconds). Persisted so benchmarks can report a
         # decomposition time distinct from total process runtime.
         _decomp_loop_start = time.time()
+        # Initialized so post-loop bookkeeping (e.g. "iterations": iteration + 1) is well
+        # defined even if the loop body never executes (start_iteration >= n_iter_max).
+        iteration = start_iteration - 1
         for iteration in range(start_iteration, n_iter_max):
             if time_iteration:
                 start_time = time.time()
@@ -1551,7 +1573,7 @@ class SparseTupleTensor:
                     routing = UpdateRouting(
                         factor_update=make_sharded_kl_factor_update(_sst),
                         core_update=make_sharded_kl_core_update(_sst),
-                        error_fn=make_sharded_kl_compute_errors(_sst),
+                        error_fn=make_sharded_kl_compute_errors(_sst) if log_step else null_compute_errors,
                         core_returns_error=routing.core_returns_error,
                     )
                 elif divergence == "fr":
@@ -1777,6 +1799,30 @@ class SparseTupleTensor:
                     except Exception as _simlex_err:
                         print(f"Warning: SimLex evaluation failed ({_simlex_err}); skipping.")
 
+                if _dim_judge is not None:
+                    try:
+                        if not _dim_judge.loaded:
+                            # Return CuPy's cached-but-unused blocks to the driver so
+                            # torch can claim ~1 GB for the judge on a GPU the
+                            # decomposition already fills (same calls as the periodic
+                            # pool trim below).
+                            print("Freeing cached GPU blocks before loading the "
+                                  "dimension-consistency judge model...")
+                            if _sst is not None:
+                                _sst.trim_pools()
+                            else:
+                                cp.get_default_memory_pool().free_all_blocks()
+                                cp.get_default_pinned_memory_pool().free_all_blocks()
+                        # tucker_decomp holds CPU copies of core/factors, so only the
+                        # judge model + token batches occupy GPU during scoring.
+                        _dim_out = _dim_judge.score(
+                            tucker_decomp, seed=random_state, verbose=False
+                        )
+                        if isinstance(sem_out, dict):
+                            sem_out = {**sem_out, **_dim_out}
+                    except Exception as _dim_err:
+                        print(f"Warning: dimension-consistency scoring failed ({_dim_err}); skipping.")
+
                 fitness_scores.append(sem_out)
                 # Primary value used for early stopping / diff
                 _sem_value_available = True
@@ -1785,6 +1831,16 @@ class SparseTupleTensor:
                         if sem_primary_key.startswith("simlex_") and simlex_pairs is not None:
                             print(f"Warning: '{sem_primary_key}' not available (all SimLex pairs OOV?); skipping sem check.")
                             _sem_value_available = False
+                        elif sem_primary_key.startswith("dim_consistency") and _dim_judge is not None:
+                            # Judge scoring failed this check (warning printed above);
+                            # skip the sem check instead of aborting the run.
+                            print(f"Warning: '{sem_primary_key}' not available (judge scoring failed?); skipping sem check.")
+                            _sem_value_available = False
+                        elif sem_primary_key.startswith("dim_consistency"):
+                            raise KeyError(
+                                f"Primary semantic key '{sem_primary_key}' requires dimension-consistency "
+                                f"scoring; enable it with --dim-consistency true."
+                            )
                         else:
                             raise KeyError(f"Primary semantic key '{sem_primary_key}' missing from returned scores.")
 

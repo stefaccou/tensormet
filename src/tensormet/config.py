@@ -110,6 +110,12 @@ class EvalConfig:
     sem_primary_key: Optional[str] = None  # overrides auto-derived primary key for patience/diff/logging
     sem_softmax_temperature: float = 0.1
     sem_fitness_target: int = 10_000
+    # LLM-as-judge "dimension consistency" scoring (see tensormet.judge). Default
+    # OFF: the judge model costs ~1 GB of GPU memory on top of the decomposition.
+    dim_consistency: bool = False
+    dim_consistency_words: int = 5          # top words per dimension shown to the judge
+    dim_consistency_diversity: bool = True  # rescale by distinct-top-word diversity
+    dim_consistency_model: str = "Qwen/Qwen2.5-0.5B-Instruct"
     remove_OOV: bool = False # whether to set OOV in test set to OOV token (false ignores the sentences)
     time_iteration: bool = True # whether to print the time taken by an iteration
     save_intermediate: bool = True # whether to save the current best model (safety for interrupted code)
@@ -588,7 +594,7 @@ class PopulationExperimentConfig:
     vectors_dir_override: Optional[Path] = None  # bypass dataset-derived path
     data_dir: Path = DATA_DIR
     remove_hapax: bool = False
-    tensors_to_build: Optional[Tuple[str, ...]] = None  # None = all tensors
+    tensors_to_build: Optional[Tuple[str, ...]] = None  # None = naming.DEFAULT_METHODS
 
     def vectors_dir(self) -> Path:
         if self.vectors_dir_override is not None:

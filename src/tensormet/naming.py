@@ -26,6 +26,26 @@ _SF    = Optional[Tuple[Tuple[int, int], ...]]
 
 
 # ---------------------------------------------------------------------------
+# Single source of truth for the set of valid tensor-variant method names.
+# Used by population.py (as the set of variants it can build) and by both
+# TuckerDecomposition.load_from_disk / SparseTupleTensor.load_from_disk (as
+# the whitelist for what can be loaded back).
+# ---------------------------------------------------------------------------
+ALL_METHODS = [
+    "counting", "countingLog", "countingLogEps",
+    "probLog", "probLogSoftPlus", "probLogShifted",
+    "sii", "siiSoftPlus", "siiShifted",
+    "sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat",
+]
+
+# Default subset population builds when tensors_to_build is not given. Kept
+# deliberately small: at the 1B-sentence scale every extra variant costs
+# ~36 bytes/nnz on scratch (the full 13-variant set exceeded the quota).
+# Pass --tensors-to-build explicitly to build anything outside this set.
+DEFAULT_METHODS = ["countingLog", "countingLogEps", "scSoftPlus"]
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 

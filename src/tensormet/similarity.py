@@ -423,19 +423,25 @@ def evaluate_simlex(
 
 def ensure_vocab(vocab, sample, roles):
     legacy_map = {"verb": "v", "subject": "s", "object": "o"}
+
+    # Resolve each role's {role}2i index-dict key once, up front — this only depends
+    # on `roles`, not on the sample, so it should not be redone per vector.
+    idx_keys = []
+    for role in roles:
+        candidates = [voc_index(role)]
+        if role in legacy_map:
+            candidates.append(voc_index(legacy_map[role]))
+
+        idx_key = next((k for k in candidates if k in vocab), None)
+        if idx_key is None:
+            raise KeyError(f"No vocab key found for role {role!r}")
+        idx_keys.append(idx_key)
+
     clean_sample = []
     for vector in tqdm(sample):
-        cleaned = []
-        for i, element in enumerate(vector):
-            role = roles[i]
-            candidates = [f"vocab_{role}"]
-            if role in legacy_map:
-                candidates.append(f"vocab_{legacy_map[role]}")
-
-            vocab_key = next((k for k in candidates if k in vocab), None)
-            if vocab_key is None:
-                raise KeyError(f"No vocab key found for role {role!r}")
-
-            cleaned.append(element if element in vocab[vocab_key] else "~")
+        cleaned = [
+            element if element in vocab[idx_keys[i]] else "~"
+            for i, element in enumerate(vector)
+        ]
         clean_sample.append(tuple(cleaned))
     return clean_sample
