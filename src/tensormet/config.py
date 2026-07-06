@@ -116,6 +116,12 @@ class EvalConfig:
     dim_consistency_words: int = 5          # top words per dimension shown to the judge
     dim_consistency_diversity: bool = True  # rescale by distinct-top-word diversity
     dim_consistency_model: str = "Qwen/Qwen3.5-2B"
+    # Which DimConsistencyJudge method(s) to run at each semantic check when
+    # dim_consistency is enabled:
+    #   "score"      -> score() (per-latent-dimension outlier task)
+    #   "similarity" -> score_similarity_consistency() (nearest-neighbour outlier task)
+    #   "both"       -> run both and merge their outputs into sem_out
+    dim_consistency_method: str = "both"
     remove_OOV: bool = False # whether to set OOV in test set to OOV token (false ignores the sentences)
     time_iteration: bool = True # whether to print the time taken by an iteration
     save_intermediate: bool = True # whether to save the current best model (safety for interrupted code)

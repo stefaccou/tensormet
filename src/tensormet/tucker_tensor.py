@@ -1290,6 +1290,12 @@ class SparseTupleTensor:
             dim_consistency_words = getattr(cfg.eval, "dim_consistency_words", 5)
             dim_consistency_diversity = getattr(cfg.eval, "dim_consistency_diversity", True)
             dim_consistency_model = getattr(cfg.eval, "dim_consistency_model", None)
+            dim_consistency_method = getattr(cfg.eval, "dim_consistency_method", "score")
+            if dim_consistency_method not in ("score", "similarity", "both"):
+                raise ValueError(
+                    f"cfg.eval.dim_consistency_method must be one of "
+                    f"'score', 'similarity', 'both'; got {dim_consistency_method!r}"
+                )
             # logging
             rec_log_every = cfg.eval.rec_log_every
             rec_log_every = rec_log_every or rec_check_every
@@ -1487,8 +1493,8 @@ class SparseTupleTensor:
                 print(f"Warning: could not load SimLex-999 from {_SIMLEX_PATH}: {_e}")
 
         # --- dimension-consistency judge (optional, default off) ---
-        # The judge model (~1 GB fp16 on GPU for the default 0.5B judge) is loaded
-        # HERE, before the iteration loop sizes any GPU batches — NOT lazily at the
+        # The judge model (~1 GB fp16 on GPU for the default 0.5B judge or 3.5 for the 2B one)
+        # is loaded HERE, before the iteration loop sizes any GPU batches — NOT lazily at the
         # first semantic check. The per-iteration batch estimators size against free
         # VRAM (_gpu_free_bytes); a judge added mid-run steals ~1 GB that batches
         # sized beforehand already assumed was free (acute on resumed runs, where
@@ -1505,10 +1511,11 @@ class SparseTupleTensor:
                 diversity_aware=dim_consistency_diversity,
             )
             print(
-                f"Dimension-consistency scoring enabled (judge={_judge_model_name!r}, "
-                f"words/dim={dim_consistency_words}, diversity_aware={dim_consistency_diversity}). "
-                f"Loading the judge now (~1 GB GPU) so the decomposition's batch "
-                f"sizing accounts for it from the first iteration."
+                f"Dimension-consistency scoring enabled (method={dim_consistency_method!r}, "
+                f"judge={_judge_model_name!r}, words/dim={dim_consistency_words}, "
+                f"diversity_aware={dim_consistency_diversity}). "
+                f"Loading the judge now so the decomposition's batch sizing "
+                f"accounts for its (model-dependent) GPU footprint from the first iteration."
             )
             # Return CuPy's cached-but-unused blocks to the driver so torch gets
             # real headroom, then load the model before the loop begins.
@@ -1811,15 +1818,42 @@ class SparseTupleTensor:
 
                 if _dim_judge is not None:
                     try:
-                        # The judge was loaded up-front (see setup) so its ~1 GB is
-                        # already reflected in every batch estimate; no mid-run pool
-                        # trim / lazy load here. score() re-checks loaded state and is
-                        # a no-op reload if the model is somehow absent.
-                        # tucker_decomp holds CPU copies of core/factors, so only the
-                        # judge model + token batches occupy GPU during scoring.
-                        _dim_out = _dim_judge.score(
-                            tucker_decomp, seed=random_state, verbose=False
-                        )
+                        # The judge was loaded up-front (see setup) so its measured
+                        # footprint is already reflected in every batch estimate; no
+                        # mid-run reload is needed here. But cp.asnumpy() above only
+                        # frees the CuPy *arrays* — CuPy's memory pool keeps the
+                        # underlying blocks cached rather than returning them to the
+                        # driver, so PyTorch's allocator can still fail to cudaMalloc
+                        # room for the judge's activations even though CuPy itself
+                        # has nothing live. Trim the pools right before scoring so the
+                        # freed decomposition memory is actually available to torch.
+                        if _sst is not None:
+                            _sst.trim_pools()
+                        else:
+                            cp.get_default_memory_pool().free_all_blocks()
+                            cp.get_default_pinned_memory_pool().free_all_blocks()
+                        try:
+                            _dim_out = {}
+                            if dim_consistency_method in ("score", "both"):
+                                _dim_out.update(_dim_judge.score(
+                                    tucker_decomp, seed=random_state, verbose=False
+                                ))
+                            if dim_consistency_method in ("similarity", "both"):
+                                _dim_out.update(_dim_judge.score_similarity_consistency(
+                                    tucker_decomp, seed=random_state, verbose=False
+                                ))
+                        finally:
+                            # score()'s forward passes leave PyTorch's caching
+                            # allocator holding "reserved" activation memory that
+                            # isn't returned to the driver on its own. The sharded
+                            # core update's batch_num is estimated once and then
+                            # cached across iterations (see kl_core_update), so if
+                            # that reservation lingers it silently shrinks the
+                            # headroom the NEXT core update assumed was free,
+                            # OOMing CuPy even though the judge is done with the
+                            # memory. Give it back right after scoring.
+                            if _dim_judge.device is not None and _dim_judge.device.type == "cuda":
+                                torch.cuda.empty_cache()
                         if isinstance(sem_out, dict):
                             sem_out = {**sem_out, **_dim_out}
                     except Exception as _dim_err:
@@ -1833,15 +1867,22 @@ class SparseTupleTensor:
                         if sem_primary_key.startswith("simlex_") and simlex_pairs is not None:
                             print(f"Warning: '{sem_primary_key}' not available (all SimLex pairs OOV?); skipping sem check.")
                             _sem_value_available = False
-                        elif sem_primary_key.startswith("dim_consistency") and _dim_judge is not None:
-                            # Judge scoring failed this check (warning printed above);
+                        elif (
+                            sem_primary_key.startswith(("dim_consistency", "similarity_consistency"))
+                            and _dim_judge is not None
+                        ):
+                            # Judge scoring failed this check (warning printed above), or the
+                            # configured dim_consistency_method doesn't produce this key;
                             # skip the sem check instead of aborting the run.
-                            print(f"Warning: '{sem_primary_key}' not available (judge scoring failed?); skipping sem check.")
+                            print(f"Warning: '{sem_primary_key}' not available (judge scoring failed, "
+                                  f"or dim_consistency_method={dim_consistency_method!r} doesn't produce it?); "
+                                  f"skipping sem check.")
                             _sem_value_available = False
-                        elif sem_primary_key.startswith("dim_consistency"):
+                        elif sem_primary_key.startswith(("dim_consistency", "similarity_consistency")):
                             raise KeyError(
                                 f"Primary semantic key '{sem_primary_key}' requires dimension-consistency "
-                                f"scoring; enable it with --dim-consistency true."
+                                f"judge scoring; enable it with --dim-consistency true and "
+                                f"--dim-consistency-method matching this key (score/similarity/both)."
                             )
                         else:
                             raise KeyError(f"Primary semantic key '{sem_primary_key}' missing from returned scores.")

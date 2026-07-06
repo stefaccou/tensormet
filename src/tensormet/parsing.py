@@ -295,6 +295,12 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="Rescale the score by top-word diversity across dimensions (default: true).")
     parser.add_argument("--dim-consistency-model", type=str, dest="dim_consistency_model", default=None,
                         help="HF model id of the judge (default: Qwen/Qwen2.5-0.5B-Instruct).")
+    parser.add_argument("--dim-consistency-method", type=str, dest="dim_consistency_method", default=None,
+                        choices=["score", "similarity", "both"],
+                        help="Which DimConsistencyJudge method(s) to run at each semantic check: "
+                             "'score' (per-dimension outlier task), 'similarity' "
+                             "(nearest-neighbour outlier task via score_similarity_consistency()), "
+                             "or 'both'.")
     parser.add_argument("--remove-oov", type=_parse_bool, dest="remove_OOV", default=None)
     parser.add_argument("--time-iteration", type=_parse_bool, dest="time_iteration", default=None)
     parser.add_argument("--save-intermediate", type=_parse_bool, dest="save_intermediate", default=None)
@@ -370,6 +376,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "dim_consistency_words",
         "dim_consistency_diversity",
         "dim_consistency_model",
+        "dim_consistency_method",
         "remove_OOV",
         "time_iteration",
         "save_intermediate",

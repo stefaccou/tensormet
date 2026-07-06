@@ -12,6 +12,7 @@ disabled (the default).
 """
 from __future__ import annotations
 
+import math
 import random
 from typing import Optional
 
@@ -20,6 +21,38 @@ import torch.nn.functional as F
 
 # DEFAULT_JUDGE_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_JUDGE_MODEL = "Qwen/Qwen3.5-2B" # heavier model, but needed for good performance
+
+def _gpu_free_bytes(device) -> int:
+    """Conservative 'free bytes now' estimate,
+    --> torch analogue of the CuPy-side``distance._gpu_free_bytes``:
+    the driver's own free figure (``cudaMemGetInfo``
+    via ``torch.cuda.mem_get_info``) plus the caching allocator's already-reserved
+    but currently-unallocated bytes, which are reusable without a fresh
+    cudaMalloc. Deliberately does not call ``torch.cuda.empty_cache()`` first —
+    same reasoning as the CuPy version: that flush is a synchronizing
+    cudaFree/cudaMalloc round trip, and this is called once per chunk.
+    """
+    free_b, _total_b = torch.cuda.mem_get_info(device)
+    reserved = torch.cuda.memory_reserved(device)
+    allocated = torch.cuda.memory_allocated(device)
+    pool_reusable = max(0, reserved - allocated)
+    return int(free_b) + int(pool_reusable)
+
+
+def _estimate_chunk_rows(vocab_size: int, seq_len: int, free_b: int,
+                          safety: float = 0.7, temp_mult: float = 6.0) -> int:
+    """Estimate how many rows of length ``seq_len`` fit in ``free_b`` bytes.
+
+    Mirrors ``distance._estimate_batch_*``: bytes-per-row times a safety
+    fraction of currently-free memory. The bottleneck is the logits/log-probs
+    tensors of shape ``[rows, seq_len, vocab_size]`` that ``score_sequences``
+    materializes in float32 — the fp16 model output, its ``.float()`` cast, and
+    ``log_softmax``'s own output tensor all briefly coexist, so temp_mult=6.0
+    (~1.5x a single fp32 copy) covers that overlap instead of just one copy.
+    """
+    bytes_per_row = int(math.ceil(seq_len * vocab_size * 4 * temp_mult))
+    budget_b = int(free_b * safety)
+    return max(1, budget_b // max(1, bytes_per_row))
 
 class DimConsistencyJudge:
     """Lazily-loaded judge model that scores dimension consistency of a
@@ -167,14 +200,38 @@ class DimConsistencyJudge:
 
         Right-padding is safe: with a causal model + attention mask, pad tokens sit to
         the right of every completion and never influence the scored positions.
+
+        The window size is capped at ``self.chunk`` but shrinks below it under GPU
+        memory pressure: each window is first probed at up to ``self.chunk`` rows
+        to find its worst-case padded length, then re-sized against currently-free
+        VRAM via ``_gpu_free_bytes``/``_estimate_chunk_rows`` (same machinery as
+        the CuPy-side batch estimators in distance.py). This is what keeps a
+        chunk from overshooting available memory when a batch happens to contain
+        an unusually long prompt/completion.
         """
         prefix_ids = [self.tokenizer(p, add_special_tokens=False).input_ids for p in prompts]
         comp_ids   = [self.tokenizer(c, add_special_tokens=False).input_ids for c in completions]
+        row_lens = [len(p) + len(c) for p, c in zip(prefix_ids, comp_ids)]
+
+        is_cuda = self.device.type == "cuda"
+        vocab_size = self.model.config.vocab_size if is_cuda else None
 
         out = [0.0] * len(prompts)
-        for s in range(0, len(prompts), self.chunk):
-            pref = prefix_ids[s:s + self.chunk]
-            comp = comp_ids[s:s + self.chunk]
+        n = len(prompts)
+        s = 0
+        while s < n:
+            if is_cuda:
+                probe_end = min(s + self.chunk, n)
+                probe_L = max(row_lens[s:probe_end])
+                free_b = _gpu_free_bytes(self.device)
+                max_rows = _estimate_chunk_rows(vocab_size, probe_L, free_b)
+                window = max(1, min(self.chunk, max_rows))
+            else:
+                window = self.chunk
+            e = min(s + window, n)
+
+            pref = prefix_ids[s:e]
+            comp = comp_ids[s:e]
             rows = [p + c for p, c in zip(pref, comp)]
             L = max(len(r) for r in rows)
 
@@ -195,6 +252,7 @@ class DimConsistencyJudge:
                 start = len(p) - 1          # -1 for the shift above
                 end = start + len(c)
                 out[s + i] = token_logps[i, start:end].mean().item()
+            s = e
         return out
 
     def _evaluate_tasks(self, tasks: list[dict], answer_key: str,
@@ -206,10 +264,12 @@ class DimConsistencyJudge:
         "scores" dict, a "predicted" pick, and a "correct" bool. Returns the
         number of tasks the judge got right.
 
-        Used by both `score()` (candidates = a Tucker dimension's top words
-        + one random vocab word) and `benchmark()` (candidates = a labelled
-        category's words + one word from a different category), so the
-        batched-sweep machinery is written once.
+        Used by `score()` (candidates = a Tucker dimension's top words + one
+        random vocab word), `score_similarity_consistency()` (candidates = a
+        query word's nearest neighbours + one random vocab word), and
+        `benchmark()` (candidates = a labelled category's words + one word
+        from a different category), so the batched-sweep machinery is
+        written once.
         """
         prompts, completions, owner = [], [], []
         for t_idx, t in enumerate(tasks):
@@ -348,6 +408,106 @@ class DimConsistencyJudge:
         if verbose:
             print(f"dimension consistency: {correct}/{rank} correct -> "
                   f"{ {k: v for k, v in out.items() if k != 'details'} }")
+        return out
+
+    def score_similarity_consistency(self,
+                                      tucker_decomp,
+                                      query_words: Optional[list[str]] = None,
+                                      role: Optional[str] = None,
+                                      top_k: Optional[int] = None,
+                                      seed: int = 1,
+                                      verbose: bool = False,
+                                      return_details: bool = False) -> dict:
+        """Score consistency of `get_most_similar_elements` neighbourhoods with
+        the same outlier-detection task as `score()`.
+
+        Where `score()` probes latent *dimensions* (top-k words by loading),
+        this probes the nearest-neighbour structure directly: for every word in
+        `query_words` that is present in the vocabulary, fetch its top-`top_k`
+        most similar words, inject one random vocab word absent from that
+        neighbourhood, and ask the judge which word does not belong.
+        Useful for checking neighbourhood quality on words that matter for downstream
+        analysis (e.g. concepts drawn from an external list like the Master
+        Metaphor List) rather than on arbitrary dimensions.
+
+        `query_words` entries missing from the vocabulary are skipped (reported
+        in `out["skipped"]` when `return_details`); `top_k` defaults to
+        `self.num_dim_words` if not given. If `query_words` is omitted entirely,
+        it defaults to the Master Metaphor List's concept words (fetched once
+        and cached to disk -- see `tensormet.experimental.parse_master_metaphor_list.load_concepts`). That import
+        is deferred here (like the judge model itself) so importing tensormet
+        never requires the scraper's `requests`/`bs4` dependencies -- only
+        calling this method without an explicit `query_words` does.
+
+        Returns a dict of [0,1] scores, mirroring `score()`:
+          similarity_consistency            final score (accuracy x diversity
+                                             multiplier when diversity_aware)
+          similarity_consistency_raw        plain accuracy before diversity rescaling
+          similarity_consistency_diversity  distinct neighbour words seen / max
+                                             possible (only when diversity_aware)
+          n_queries                         number of query words actually scored
+                                             (after skipping OOV words)
+        """
+        self._ensure_loaded()
+        rng = random.Random(seed)
+
+        if query_words is None:
+            from tensormet.experimental.parse_master_metaphor_list import load_concepts
+            query_words = load_concepts()
+
+        role = role if role is not None else tucker_decomp.roles[0]
+        k = top_k if top_k is not None else self.num_dim_words
+        vocab_list = tucker_decomp.vocab[f"vocab_{role}"]
+        vocab_set = set(vocab_list)
+
+        skipped = [w for w in query_words if w not in vocab_set]
+        kept = [w for w in query_words if w in vocab_set]
+        if verbose and skipped:
+            print(f"skipping {len(skipped)} query word(s) not in vocab: {skipped}")
+        if not kept:
+            raise ValueError("None of the query words were found in the vocabulary.")
+
+        # 1. Build one outlier task per query word.
+        tasks = []
+        all_neighbor_words = set() if self.diversity_aware else None
+        for w in kept:
+            neighbors = tucker_decomp.get_most_similar_elements(w, role, top_k=k)
+            if self.diversity_aware:
+                all_neighbor_words.update(neighbors)
+            # Outlier must be absent from the neighbour list (and from the
+            # query word itself, which get_most_similar_elements may return
+            # as its own nearest neighbour), otherwise the candidate list
+            # could contain a duplicate and the scores dict would silently
+            # collapse it.
+            pool = [v for v in vocab_list if v not in neighbors and v != w]
+            random_word = rng.choice(pool)
+
+            candidates = neighbors + [random_word]
+            rng.shuffle(candidates)
+            tasks.append({"query": w, "words": neighbors, "candidates": candidates,
+                          "random_word": random_word})
+
+        # 2. Batched scoring + evaluation (shared with score()/benchmark()).
+        correct = self._evaluate_tasks(tasks, answer_key="random_word", verbose=verbose)
+
+        n = len(tasks)
+        raw = correct / n
+        out = {"similarity_consistency": raw, "similarity_consistency_raw": raw,
+               "n_queries": n}
+        if self.diversity_aware:
+            mult = len(all_neighbor_words) / (n * k)
+            out["similarity_consistency"] = raw * mult
+            out["similarity_consistency_diversity"] = mult
+        if return_details:
+            out["details"] = [{
+                "query": t["query"], "words": t["words"], "outlier": t["random_word"],
+                "predicted": t["predicted"], "correct": t["correct"],
+                "scores": {kk: round(vv, 3) for kk, vv in t["scores"].items()},
+            } for t in tasks]
+            out["skipped"] = skipped
+        if verbose:
+            print(f"similarity consistency: {correct}/{n} correct -> "
+                  f"{ {kk: vv for kk, vv in out.items() if kk not in ('details', 'skipped')} }")
         return out
 
     def benchmark(self,
