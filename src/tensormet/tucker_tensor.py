@@ -1487,11 +1487,14 @@ class SparseTupleTensor:
                 print(f"Warning: could not load SimLex-999 from {_SIMLEX_PATH}: {_e}")
 
         # --- dimension-consistency judge (optional, default off) ---
-        # Constructing the judge is free: the actual model (~1 GB fp16 on GPU for
-        # the default 0.5B judge) is only loaded at the FIRST semantic check, once
-        # the decomposition's own GPU footprint is established — and right after a
-        # CuPy pool trim below, so torch gets real headroom. Import is deferred so
-        # runs without the flag never touch transformers.
+        # The judge model (~1 GB fp16 on GPU for the default 0.5B judge) is loaded
+        # HERE, before the iteration loop sizes any GPU batches — NOT lazily at the
+        # first semantic check. The per-iteration batch estimators size against free
+        # VRAM (_gpu_free_bytes); a judge added mid-run steals ~1 GB that batches
+        # sized beforehand already assumed was free (acute on resumed runs, where
+        # the pool is grown to fill the GPU before the first check), OOMing the next
+        # factor update. Loading up-front makes every batch estimate account for it.
+        # Import is deferred so runs without the flag never touch transformers.
         _dim_judge = None
         if dim_consistency:
             from tensormet.judge import DimConsistencyJudge, DEFAULT_JUDGE_MODEL
@@ -1504,10 +1507,17 @@ class SparseTupleTensor:
             print(
                 f"Dimension-consistency scoring enabled (judge={_judge_model_name!r}, "
                 f"words/dim={dim_consistency_words}, diversity_aware={dim_consistency_diversity}). "
-                f"The judge model will be loaded lazily at the first semantic check "
-                f"(every {sem_check_every} iterations) and adds ~1 GB of GPU memory "
-                f"on top of the decomposition."
+                f"Loading the judge now (~1 GB GPU) so the decomposition's batch "
+                f"sizing accounts for it from the first iteration."
             )
+            # Return CuPy's cached-but-unused blocks to the driver so torch gets
+            # real headroom, then load the model before the loop begins.
+            if _sst is not None:
+                _sst.trim_pools()
+            else:
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            _dim_judge.ensure_loaded()
 
         print(divergence, rank, _subsample_frac)
         # CHANGED (2026-06-12 review, Task 6): announce the routing family chosen by
@@ -1801,18 +1811,10 @@ class SparseTupleTensor:
 
                 if _dim_judge is not None:
                     try:
-                        if not _dim_judge.loaded:
-                            # Return CuPy's cached-but-unused blocks to the driver so
-                            # torch can claim ~1 GB for the judge on a GPU the
-                            # decomposition already fills (same calls as the periodic
-                            # pool trim below).
-                            print("Freeing cached GPU blocks before loading the "
-                                  "dimension-consistency judge model...")
-                            if _sst is not None:
-                                _sst.trim_pools()
-                            else:
-                                cp.get_default_memory_pool().free_all_blocks()
-                                cp.get_default_pinned_memory_pool().free_all_blocks()
+                        # The judge was loaded up-front (see setup) so its ~1 GB is
+                        # already reflected in every batch estimate; no mid-run pool
+                        # trim / lazy load here. score() re-checks loaded state and is
+                        # a no-op reload if the model is somehow absent.
                         # tucker_decomp holds CPU copies of core/factors, so only the
                         # judge model + token batches occupy GPU during scoring.
                         _dim_out = _dim_judge.score(

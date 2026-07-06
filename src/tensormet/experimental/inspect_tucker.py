@@ -182,8 +182,11 @@ def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
             ax2 = ax1.twinx()
             ax2.set_ylabel("Score")
             for i, key in enumerate(sem_keys):
+                # Offset so the first score curve isn't solid like rec error.
+                ls = _LINESTYLES[(i + (1 if plot_rec_error else 0)) % len(_LINESTYLES)]
                 its_k, vals_k = _values_for_key(key, all_its, all_sem)
-                (l,) = ax2.plot(its_k, vals_k, label=key, color=colors[i % len(colors)])
+                (l,) = ax2.plot(its_k, vals_k, label=key, color=colors[i % len(colors)],
+                                linestyle=ls)
                 all_lines.append(l)
 
     # Park the legend outside the axes so it never sits on top of the curves.
@@ -283,14 +286,16 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
     split_axes = (not plot_rec_error) and (len(sem_keys) == 2)
 
     if split_axes:
-        # One semantic key per axis; runs separated by color, keys by axis.
+        # One semantic key per axis; runs separated by color, keys by axis and style.
         ax2 = ax1.twinx()
         ax1.set_ylabel(sem_keys[0])
         ax2.set_ylabel(sem_keys[1])
         for (its, _rec, sem), lbl, c in zip(loaded, labels, run_colors):
-            for key, axis in zip(sem_keys, (ax1, ax2)):
+            for k_i, (key, axis) in enumerate(zip(sem_keys, (ax1, ax2))):
+                ls = _LINESTYLES[k_i % len(_LINESTYLES)]
                 its_k, vals_k = _values_for_key(key, its, sem)
-                (l,) = axis.plot(its_k, vals_k, color=c, label=f"{lbl} · {key}")
+                (l,) = axis.plot(its_k, vals_k, color=c, linestyle=ls,
+                                 label=f"{lbl} · {key}")
                 all_lines.append(l)
     else:
         if plot_rec_error:
@@ -343,6 +348,35 @@ def _sf_to_set(sf):
     return {tuple(p) for p in sf} if sf else set()
 
 
+# One token per linked group, single digit per mode (see shared_factor_suffix):
+# "..._shared12_..." links modes 1 and 2, "..._shared012_..." links 0, 1 and 2.
+_SHARED_STEM_RE = re.compile(r"(?:^|_)shared(\d+)(?=_|$)")
+
+# "..._0p25ss_..." → subsample_frac 0.25 (see naming._ss; absent means 1.0).
+_SS_STEM_RE = re.compile(r"_(\d+(?:p\d+)?)ss(?=_|$)")
+
+
+def _ss_from_stem(stem):
+    """Recover subsample_frac from a run's filename stem, or None if absent."""
+    m = _SS_STEM_RE.search(stem)
+    return float(m.group(1).replace("p", ".")) if m else None
+
+
+def _sf_from_stem(stem):
+    """Recover shared-factor links from a run's filename stem.
+
+    Config snapshots from before shared_factors was recorded lack the field, but
+    the model stem always carries the ``_shared..`` suffix — so the stem is the
+    authoritative fallback when the snapshot has nothing. Each group token is
+    expanded back into the pairwise links load_from_disk expects.
+    """
+    pairs = set()
+    for grp in _SHARED_STEM_RE.findall(stem):
+        modes = [int(ch) for ch in grp]
+        pairs.update((a, b) for i, a in enumerate(modes) for b in modes[i + 1:])
+    return pairs
+
+
 def discover_datasets(data_dir=DATA_DIR):
     """List dataset dirs under ``tensors/`` that hold decomposition snapshots.
 
@@ -379,10 +413,14 @@ def _discover_one(dataset, data_dir):
         rank0 = rank[0] if isinstance(rank, (list, tuple)) and rank else int(rank)
         dim = exp.get("dim")
         dim = tuple(dim) if isinstance(dim, list) else dim
-        sf = _sf_to_set(exp.get("shared_factors"))
+        stem = cfg_path.name.replace("_config.json", "")
+        sf = _sf_to_set(exp.get("shared_factors")) or _sf_from_stem(stem)
         name = exp.get("name") or "(unnamed)"
         iters = train.get("n_iter_max", 2000)
-        ss = exp.get("subsample_frac", 1.0)
+        # Old config snapshots stored subsample_frac under "train" (alongside
+        # shared_factors/init); the stem's "_0p25ss" token is the last resort.
+        ss = float(exp.get("subsample_frac") or train.get("subsample_frac")
+                   or _ss_from_stem(stem) or 1.0)
 
         insp = InspectionConfig(
             dim=dim, name=exp.get("name"), dataset=exp.get("dataset", dataset),
@@ -390,7 +428,6 @@ def _discover_one(dataset, data_dir):
             order=exp.get("order", 3), iters=iters, rank=rank0,
             shared_factors=sf, subsample_frac=ss,
         )
-        stem = cfg_path.name.replace("_config.json", "")
         log_path = decomp_dir / f"{stem}_log.txt"
         yield {
             "stem": stem,

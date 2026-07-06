@@ -18,8 +18,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-DEFAULT_JUDGE_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-
+# DEFAULT_JUDGE_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_JUDGE_MODEL = "Qwen/Qwen3.5-2B" # heavier model, but needed for good performance
 
 class DimConsistencyJudge:
     """Lazily-loaded judge model that scores dimension consistency of a
@@ -36,22 +36,38 @@ class DimConsistencyJudge:
                  model_name: str = DEFAULT_JUDGE_MODEL,
                  num_dim_words: int = 5,
                  diversity_aware: bool = True,
-                 chunk: int = 64):
+                 chunk: int = 64,
+                 device=None):
         self.model_name = model_name
         self.num_dim_words = num_dim_words
         self.diversity_aware = diversity_aware
         self.chunk = chunk
+        # Where to load the model when it's time (e.g. select_gpu()'s pick);
+        # None = auto (cuda:0 if available, else CPU). Survives unload().
+        self.target_device = torch.device(device) if device is not None else None
         self.model = None
         self.tokenizer = None
         self.device = None
         self._pad_id = None
+        # Measured (not guessed) GPU footprint of the loaded weights, set by
+        # _load_on(); None until loaded, and None again once loaded on CPU.
+        self.gpu_memory_bytes: Optional[int] = None
 
     @property
     def loaded(self) -> bool:
         return self.model is not None
 
+    @property
+    def gpu_memory_gb(self) -> Optional[float]:
+        """Measured GPU memory used by the loaded weights (None if not CUDA-resident)."""
+        return None if self.gpu_memory_bytes is None else self.gpu_memory_bytes / (1024 ** 3)
+
     def _load_on(self, device) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        is_cuda = device.type == "cuda"
+        if is_cuda:
+            torch.cuda.synchronize(device)
+            mem_before = torch.cuda.memory_allocated(device)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name, dtype=torch.float16
         ).to(device)
@@ -61,14 +77,20 @@ class DimConsistencyJudge:
                         if self.tokenizer.pad_token_id is not None
                         else self.tokenizer.eos_token_id)
         self.device = device
+        if is_cuda:
+            torch.cuda.synchronize(device)
+            self.gpu_memory_bytes = torch.cuda.memory_allocated(device) - mem_before
+        else:
+            self.gpu_memory_bytes = None
 
     def _ensure_loaded(self) -> None:
         if self.loaded:
             return
-        want_cuda = torch.cuda.is_available()
-        target = torch.device(0) if want_cuda else torch.device("cpu")
-        print(f"Loading dimension-consistency judge {self.model_name!r} onto {target} "
-              f"(fp16, ~1 GB for the default 0.5B model)...")
+        if self.target_device is not None:
+            target = self.target_device
+        else:
+            target = torch.device(0) if torch.cuda.is_available() else torch.device("cpu")
+        print(f"Loading dimension-consistency judge {self.model_name!r} onto {target} (fp16)...")
         try:
             self._load_on(target)
         except torch.cuda.OutOfMemoryError:
@@ -77,15 +99,31 @@ class DimConsistencyJudge:
             self.model = None
             torch.cuda.empty_cache()
             self._load_on(torch.device("cpu"))
-        print(f"Judge model loaded on {self.device}.")
+        if self.gpu_memory_gb is not None:
+            print(f"Judge model loaded on {self.device} using {self.gpu_memory_gb:.2f} GB GPU memory.")
+        else:
+            print(f"Judge model loaded on {self.device}.")
+
+    def ensure_loaded(self) -> None:
+        """Load the model now if it isn't already (idempotent).
+
+        Call this *before* the decomposition starts sizing its per-iteration GPU
+        batches, so the judge's GPU footprint (see `gpu_memory_gb` once loaded) is
+        already resident and reflected in every free-VRAM estimate. Loading it
+        lazily instead lets batches sized beforehand (e.g. on a resumed run) be
+        computed against memory the judge later steals, OOMing the next factor
+        update.
+        """
+        self._ensure_loaded()
 
     def unload(self) -> None:
-        """Release the judge model (frees ~1 GB of GPU memory when CUDA-resident)."""
+        """Release the judge model (frees its measured `gpu_memory_gb` when CUDA-resident)."""
         was_cuda = self.device is not None and self.device.type == "cuda"
         self.model = None
         self.tokenizer = None
         self.device = None
         self._pad_id = None
+        self.gpu_memory_bytes = None
         if was_cuda:
             torch.cuda.empty_cache()
 
@@ -96,10 +134,26 @@ class DimConsistencyJudge:
         messages = [
             {"role": "user",
              "content": f"Which word does not belong with the others? {listing}. "
-                        "Answer with only the word."},
+                        "Answer with only the word."
+             },
         ]
+        # messages = [
+        #     {"role": "system",
+        #      "content": "You are a helpful assistant tasked with identifying the outlier in a list of words."},
+        #     {"role": "user", "content": "Which word does not belong? apple, banana, orange, car, grape."},
+        #     {"role": "assistant", "content": "car"},
+        #     {"role": "user", "content": "Which word does not belong? like, love, message, adore, hate."},
+        #     {"role": "assistant", "content": "message"},
+        #     {"role": "user", "content": "Which word does not belong? similar, mail, same, equal, different."},
+        #     {"role": "assistant", "content": "mail"},
+        #     {"role": "user", "content": f"Which word does not belong? {listing}. Answer with only the word."},
+        # ]
         return self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True,
+            temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0,
+            extra_body={
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
         )
 
     @torch.no_grad()
@@ -143,11 +197,57 @@ class DimConsistencyJudge:
                 out[s + i] = token_logps[i, start:end].mean().item()
         return out
 
+    def _evaluate_tasks(self, tasks: list[dict], answer_key: str,
+                        verbose: bool = False) -> int:
+        """Shared batched scoring + evaluation for a list of outlier tasks.
+
+        Each task must carry a "candidates" list; `answer_key` names the task
+        key holding the true outlier. Tasks are mutated in place with a
+        "scores" dict, a "predicted" pick, and a "correct" bool. Returns the
+        number of tasks the judge got right.
+
+        Used by both `score()` (candidates = a Tucker dimension's top words
+        + one random vocab word) and `benchmark()` (candidates = a labelled
+        category's words + one word from a different category), so the
+        batched-sweep machinery is written once.
+        """
+        prompts, completions, owner = [], [], []
+        for t_idx, t in enumerate(tasks):
+            prompt = self.build_prompt(t["candidates"])
+            for c in t["candidates"]:
+                prompts.append(prompt)
+                completions.append(c)
+                owner.append(t_idx)
+
+        flat_scores = self.score_sequences(prompts, completions)
+
+        for t in tasks:
+            t["scores"] = {}
+        for t_idx, comp, sc in zip(owner, completions, flat_scores):
+            tasks[t_idx]["scores"][comp] = sc
+
+        # The model is *asked* to name the word that doesn't belong, so the
+        # candidate it is most likely to emit (highest log-prob) is the
+        # predicted outlier -> max, not min.
+        correct = 0
+        for t in tasks:
+            scores = t["scores"]
+            predicted = max(scores, key=scores.get)
+            t["predicted"] = predicted
+            t["correct"] = predicted == t[answer_key]
+            correct += t["correct"]
+            if verbose:
+                print(f"  {t[answer_key]!r} added to {t['candidates']}")
+                print("  scores:", {k: round(v, 3) for k, v in scores.items()})
+                print("  predicted:", predicted)
+        return correct
+
     def score(self,
               tucker_decomp,
               seed: int = 1,
               role: Optional[str] = None,
-              verbose: bool = False) -> dict:
+              verbose: bool = False,
+              return_details: bool = False) -> dict:
         """Score every dimension of `role` (default: first role) with the outlier task.
 
         The candidate/outlier draws come from a local RNG seeded with `seed`, so the
@@ -161,6 +261,11 @@ class DimConsistencyJudge:
           dim_consistency_raw       plain accuracy before diversity rescaling
           dim_consistency_diversity distinct top words seen / max possible
                                     (only when diversity_aware)
+
+        With `return_details` the dict additionally carries a "details" list with one
+        entry per dimension (top words, injected outlier, the judge's pick, verdict,
+        per-candidate log-probs) for inspection UIs. Keep it off inside the training
+        loop, where the returned dict is merged into sem_out and JSON-dumped whole.
         """
         self._ensure_loaded()
         rng = random.Random(seed)
@@ -186,7 +291,8 @@ class DimConsistencyJudge:
 
             candidates = words + [random_word]
             rng.shuffle(candidates)
-            tasks.append({"dim": i, "candidates": candidates, "random_word": random_word})
+            tasks.append({"dim": i, "words": words, "candidates": candidates,
+                          "random_word": random_word})
 
         # 2. Flatten to parallel (prompt, completion) lists, remembering the owning task.
         prompts, completions, owner = [], [], []
@@ -210,6 +316,7 @@ class DimConsistencyJudge:
         # so the candidate it is most likely to emit (highest log-prob) is the
         # predicted outlier -> max, not min.
         correct = 0
+        details = []
         for t in tasks:
             scores = t["scores"]
             outlier = max(scores, key=scores.get)
@@ -217,8 +324,18 @@ class DimConsistencyJudge:
                 print(f"dim {t['dim']}: {t['random_word']} added to {t['candidates']}")
                 print("  scores:", {k: round(v, 3) for k, v in scores.items()})
                 print("  outlier:", outlier)
-            if outlier == t["random_word"]:
+            is_correct = outlier == t["random_word"]
+            if is_correct:
                 correct += 1
+            if return_details:
+                details.append({
+                    "dim": t["dim"],
+                    "words": t["words"],
+                    "outlier": t["random_word"],
+                    "predicted": outlier,
+                    "correct": is_correct,
+                    "scores": {k: round(v, 3) for k, v in scores.items()},
+                })
 
         raw = correct / rank
         out = {"dim_consistency": raw, "dim_consistency_raw": raw}
@@ -226,6 +343,63 @@ class DimConsistencyJudge:
             mult = len(all_dim_words) / (rank * self.num_dim_words)
             out["dim_consistency"] = raw * mult
             out["dim_consistency_diversity"] = mult
+        if return_details:
+            out["details"] = details
         if verbose:
-            print(f"dimension consistency: {correct}/{rank} correct -> {out}")
+            print(f"dimension consistency: {correct}/{rank} correct -> "
+                  f"{ {k: v for k, v in out.items() if k != 'details'} }")
+        return out
+
+    def benchmark(self,
+                  categories: dict,
+                  num_words: Optional[int] = None,
+                  n_trials: int = 50,
+                  seed: int = 1,
+                  verbose: bool = False,
+                  return_details: bool = False) -> dict:
+        """
+        Benchmark on some pre-defined categories
+        """
+        self._ensure_loaded()
+        k = num_words if num_words is not None else self.num_dim_words
+        too_small = [name for name, words in categories.items() if len(words) < k]
+        if too_small:
+            raise ValueError(f"num_words={k} exceeds category size for: {too_small}")
+
+        rng = random.Random(seed)
+        names = list(categories.keys())
+        tasks = []
+        for i in range(n_trials):
+            cat = rng.choice(names)
+            words = rng.sample(categories[cat], k)
+            outlier_cat = rng.choice([n for n in names if n != cat])
+            outlier = rng.choice(categories[outlier_cat])
+            candidates = words + [outlier]
+            rng.shuffle(candidates)
+            tasks.append({"trial": i, "category": cat, "outlier_category": outlier_cat,
+                          "words": words, "candidates": candidates, "random_word": outlier})
+
+        correct = self._evaluate_tasks(tasks, answer_key="random_word", verbose=verbose)
+
+        per_cat: dict = {}
+        for t in tasks:
+            stats = per_cat.setdefault(t["category"], [0, 0])
+            stats[0] += t["correct"]
+            stats[1] += 1
+
+        out = {
+            "accuracy": correct / n_trials,
+            "n_trials": n_trials,
+            "per_category": {c: n_ok / n for c, (n_ok, n) in per_cat.items()},
+        }
+        if return_details:
+            out["details"] = [{
+                "trial": t["trial"], "category": t["category"],
+                "outlier_category": t["outlier_category"], "words": t["words"],
+                "outlier": t["random_word"], "predicted": t["predicted"],
+                "correct": t["correct"],
+                "scores": {k: round(v, 3) for k, v in t["scores"].items()},
+            } for t in tasks]
+        if verbose:
+            print(f"benchmark accuracy: {correct}/{n_trials} -> {out['accuracy']:.3f}")
         return out
