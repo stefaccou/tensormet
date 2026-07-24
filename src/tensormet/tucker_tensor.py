@@ -140,6 +140,7 @@ class TuckerDecomposition:
                        name: Optional[str]=None,
                        tier1: bool=False,
                        subsample_frac: float=1.0,
+                       max_nnz: Optional[int]=None,
                           ) -> "TuckerDecomposition":
 
         """Loads a precomputed tucker decomposition from disk.
@@ -201,6 +202,7 @@ class TuckerDecomposition:
         stems = candidate_stems(
             divergence, method, order, dims, rank,
             name=name, shared_factors=parsed_shared, subsample_frac=subsample_frac,
+            max_nnz=max_nnz,
         )
         new_file_prefix      = stems[0]
         new_file_prefix_no_sf = stems[1] if len(stems) > 2 else stems[0]
@@ -1407,6 +1409,22 @@ class SparseTupleTensor:
         _subsample_frac = getattr(cfg.exp, "subsample_frac", 1.0)
         _subsample_warmup = getattr(cfg.train, "subsample_warmup", 0)
 
+        # --- max_nnz: hard global ceiling on NNZ per update step ---
+        # Resolved here into an effective fraction: every downstream frac<1.0
+        # gate, the one-time shuffles, the rotating windows and the 1/frac
+        # rescales all key off _subsample_frac, and per-shard sampling of
+        # frac_eff sums to ~max_nnz regardless of shard count (overshoot is at
+        # most 1 element per shard from rounding). Filenames and resume checks
+        # carry the raw max_nnz int, never this derived value.
+        _max_nnz = int(getattr(cfg.exp, "max_nnz", None) or 0)
+        if _max_nnz < 0:
+            raise ValueError(f"cfg.exp.max_nnz must be >= 0, got {_max_nnz}")
+        _full_nnz = int(self.tensor.tocoo().row.size)
+        if _max_nnz and _full_nnz > _max_nnz:
+            _subsample_frac = min(_subsample_frac, _max_nnz / _full_nnz)
+            print(f"max_nnz={_max_nnz}: effective subsample_frac -> "
+                  f"{_subsample_frac:.6g} (nnz={_full_nnz})")
+
         # Masked / completion objective: fit only observed entries (see RunConfig.exp.objective).
         if objective not in ("full", "masked"):
             raise ValueError(f"cfg.exp.objective must be 'full' or 'masked', got {objective!r}")
@@ -1428,8 +1446,9 @@ class SparseTupleTensor:
         # path handles this rescaling internally, so masked+subsample is supported there.
         if masked and _n_gpus == 1 and _subsample_frac < 1.0:
             raise NotImplementedError(
-                "objective='masked' with subsample_frac < 1.0 is only supported on the "
-                "multi-GPU sharded path (n_gpus > 1). Use subsample_frac=1.0 on a single GPU."
+                "objective='masked' with subsampling (subsample_frac < 1.0 or a binding "
+                "max_nnz) is only supported on the multi-GPU sharded path (n_gpus > 1). "
+                "Use subsample_frac=1.0 and max_nnz=0 on a single GPU."
             )
 
         # --- CP guard rails (plan Phase 2): explicit rejections for paths the
@@ -1505,7 +1524,7 @@ class SparseTupleTensor:
         # to the KL single-GPU largedim path (FR/sharded/plain kernels size
         # themselves; the SST owns its own batching). nnz_live reserves the
         # kernels' transient decode arrays so hoisting keeps Task 1's headroom.
-        _full_nnz = int(self.tensor.tocoo().row.size)
+        # (_full_nnz is computed once above, alongside the max_nnz resolution.)
         _nnz_live = _iter_sampler.n_sample if _iter_sampler is not None else _full_nnz
         _largedim_batches = (
             precompute_largedim_batches(core, factors, modes, masked=masked, nnz_live=_nnz_live)

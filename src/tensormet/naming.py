@@ -3,7 +3,7 @@ Single source of truth for artifact filename conventions.
 
 Naming contract
 ---------------
-Model file :  {prefix}{div}_{method}_{order}D_{dims}d{sf}{ss}_{rank0}r_{iters}i.pt
+Model file :  {prefix}{div}_{method}_{order}D_{dims}d{sf}_{rank0}r{ss}{mn}_{iters}i.pt
               (experimental CP family: '{order}D' → 'CP{order}D'; Tucker
                filenames are byte-identical to before the CP feature existed)
 Vocab file :  {order}D_{dims}d{sf}.pkl          (legacy: {dims}{sf}.pkl)
@@ -13,6 +13,7 @@ where:
   prefix = "{name}_"  if name is not None, else ""
   sf     = shared_factor_suffix(nontrivial_linked_groups(...))   e.g. "_01" or ""
   ss     = "_{frac_str}ss"  if subsample_frac != 1.0, else ""
+  mn     = "_{max_nnz}mn"   if max_nnz, else ""
   dims   = dim_spec_str(dim)                                     e.g. "1000" or "500-1000-500"
   rank0  = rank if int, else rank[0]
 """
@@ -59,6 +60,10 @@ def _ss(subsample_frac: float) -> str:
     return f"_{str(subsample_frac).replace('.', 'p')}ss" if subsample_frac != 1.0 else ""
 
 
+def _mn(max_nnz: Optional[int]) -> str:
+    return f"_{int(max_nnz)}mn" if max_nnz else ""
+
+
 def _sf(shared_factors: _SF, order: int) -> str:
     return shared_factor_suffix(nontrivial_linked_groups(shared_factors, num_factors=order))
 
@@ -92,13 +97,14 @@ def model_stem(
     name: Optional[str] = None,
     shared_factors: _SF = None,
     subsample_frac: float = 1.0,
+    max_nnz: Optional[int] = None,
     decomposition: str = "tucker",
 ) -> str:
     """Return the model filename stem (without .pt extension)."""
     return (
         f"{_prefix(name)}{divergence}_{method}_{_order_tag(order, decomposition)}_"
         f"{dim_spec_str(dim)}d{_sf(shared_factors, order)}_"
-        f"{_r0(rank)}r{_ss(subsample_frac)}_{n_iter_max}i"
+        f"{_r0(rank)}r{_ss(subsample_frac)}{_mn(max_nnz)}_{n_iter_max}i"
     )
 
 
@@ -113,13 +119,14 @@ def model_filename(
     name: Optional[str] = None,
     shared_factors: _SF = None,
     subsample_frac: float = 1.0,
+    max_nnz: Optional[int] = None,
     decomposition: str = "tucker",
 ) -> str:
     """Return the full model filename (e.g. 'fr_siiSoftPlus_3D_1000d_100r_300i.pt')."""
     return model_stem(
         divergence, method, order, dim, rank, n_iter_max,
         name=name, shared_factors=shared_factors, subsample_frac=subsample_frac,
-        decomposition=decomposition,
+        max_nnz=max_nnz, decomposition=decomposition,
     ) + ".pt"
 
 
@@ -133,6 +140,7 @@ def candidate_stems(
     name: Optional[str] = None,
     shared_factors: _SF = None,
     subsample_frac: float = 1.0,
+    max_nnz: Optional[int] = None,
     decomposition: str = "tucker",
 ) -> list[str]:
     """
@@ -152,12 +160,13 @@ def candidate_stems(
     p   = _prefix(name)
     sf  = _sf(shared_factors, order)
     ss  = _ss(subsample_frac)
+    mn  = _mn(max_nnz)
     d   = dim_spec_str(dim)
     r0  = _r0(rank)
     ot  = _order_tag(order, decomposition)
 
-    new        = f"{p}{divergence}_{method}_{ot}_{d}d{sf}_{r0}r{ss}_"
-    new_no_sf  = f"{p}{divergence}_{method}_{ot}_{d}d_{r0}r{ss}_"
+    new        = f"{p}{divergence}_{method}_{ot}_{d}d{sf}_{r0}r{ss}{mn}_"
+    new_no_sf  = f"{p}{divergence}_{method}_{ot}_{d}d_{r0}r{ss}{mn}_"
     legacy     = f"{p}{divergence}_{method}_{d}d_{r0}r_"
 
     # When sf is empty, new == new_no_sf; deduplicate.

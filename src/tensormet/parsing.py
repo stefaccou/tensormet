@@ -269,6 +269,11 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--gpu-id", type=_parse_gpu_id, dest="gpu_id", default=None,
                         help="Physical GPU(s) to pin, e.g. --gpu-id 0 or --gpu-id 0,1,2")
     parser.add_argument("--subsample-frac", type=float, dest="subsample_frac", default=None)
+    parser.add_argument("--max-nnz", type=int, dest="max_nnz", default=None,
+                        help="Hard ceiling on NNZ entries used per update step (global across "
+                             "all GPU shards). Combines with --subsample-frac as "
+                             "min(round(frac*nnz), max_nnz). 0 disables. Note: "
+                             "--subsample-warmup iterations still use the full tensor.")
     parser.add_argument("--subsample-warmup", type=int, dest="subsample_warmup", default=None)
     parser.add_argument("--objective", type=str, default=None,
                         choices=["full", "masked"],
@@ -331,7 +336,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     exp_kwargs = {}
     for field in ("dataset", "method", "order", "divergence", "dim", "name",
                   "random_state", "epsilon", "init", "normalize_factors",
-                  "shared_factors", "subsample_frac", "objective",
+                  "shared_factors", "subsample_frac", "max_nnz", "objective",
                   "decomposition", "cp_inner_iters", "cp_scooch_kappa"):
         v = parsed_dict.get(field, None)
         if v is not None:

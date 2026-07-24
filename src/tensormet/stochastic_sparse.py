@@ -33,6 +33,9 @@ also fixes review finding I-3).
 Wall-clock time per iteration scales as O(p) on the NNZ-bound operations.
 Typical useful range: p = 0.1–0.3 for large NNZ counts.
 
+``cfg.exp.max_nnz`` (hard NNZ ceiling) is applied upstream in tucker_tensor.py
+as an effective fraction, so the *p* received here may already embed it.
+
 Usage
 -----
 In the main decomposition loop (tucker_tensor.py), build the sampler once

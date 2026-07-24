@@ -149,6 +149,12 @@ class ExperimentConfig:
     normalize_factors: bool = False
     shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None
     subsample_frac: float = 1.0
+    # Hard ceiling on the number of NNZ entries used per update step, global
+    # across all GPU shards (each shard gets ~max_nnz/n_shards). Combines with
+    # subsample_frac as min(round(frac*nnz), max_nnz); None/0 = off. Applied as
+    # an effective fraction at fit time (tucker_tensor.py); the raw int is the
+    # identity carried by filenames ("_{max_nnz}mn") and resume checks.
+    max_nnz: Optional[int] = None
     # "full"   -> fit the entire (zero-filled) tensor; correct for count/co-occurrence data
     #             where an unobserved entry genuinely means 0.
     # "masked" -> fit ONLY observed (nonzero) entries; treat the rest as missing
@@ -219,6 +225,7 @@ class RunConfig:
             name=self.exp.name,
             shared_factors=self.exp.shared_factors,
             subsample_frac=self.exp.subsample_frac,
+            max_nnz=getattr(self.exp, "max_nnz", None),
             decomposition=getattr(self.exp, "decomposition", "tucker"),
         )
 
@@ -292,6 +299,7 @@ class RunConfig:
             name=self.exp.name,
             shared_factors=self.exp.shared_factors,
             subsample_frac=self.exp.subsample_frac,
+            max_nnz=getattr(self.exp, "max_nnz", None),
             decomposition=getattr(self.exp, "decomposition", "tucker"),
         )
 
@@ -348,7 +356,11 @@ class RunConfig:
                     int(old_exp.get("random_state", 1)) == int(self.exp.random_state) and
                     _canonical_shared_factors(old_exp.get("shared_factors")) ==
                     _canonical_shared_factors(self.exp.shared_factors) and
-                    float(old_exp.get("subsample_frac", 1.0)) == self.exp.subsample_frac
+                    float(old_exp.get("subsample_frac", 1.0)) == self.exp.subsample_frac and
+                    # Old configs predating max_nnz fall back to off; 0 and None
+                    # are the same identity (ceiling disabled) by design.
+                    int(old_exp.get("max_nnz") or 0) ==
+                    int(getattr(self.exp, "max_nnz", None) or 0)
             )
 
             print(old_exp.get("dataset"), self.exp.dataset, "\t",
@@ -361,7 +373,8 @@ class RunConfig:
             old_exp.get("random_state", 1), self.exp.random_state, "\t",
             _canonical_shared_factors(old_exp.get("shared_factors")),
             _canonical_shared_factors(self.exp.shared_factors), "\t",
-            float(old_exp.get("subsample_frac", 1.0)), self.exp.subsample_frac)
+            float(old_exp.get("subsample_frac", 1.0)), self.exp.subsample_frac, "\t",
+            int(old_exp.get("max_nnz") or 0), int(getattr(self.exp, "max_nnz", None) or 0))
 
 
             if is_compatible:
@@ -471,6 +484,7 @@ class InspectionConfig:
     rank: int = 150
     shared_factors: Set[Tuple[int, int]] = field(default_factory=lambda: {(1, 2)})
     subsample_frac: float = 0.25
+    max_nnz: Optional[int] = None
 
     def _norm_dim(self):
         return tuple(int(x) for x in self.dim.split("-")) if isinstance(self.dim, str) else self.dim
@@ -485,6 +499,7 @@ class InspectionConfig:
               method=self.method, divergence=self.divergence, order=self.order,
               rank=(self.rank,) * self.order,
               subsample_frac=self.subsample_frac,
+              max_nnz=self.max_nnz,
               shared_factors=self._norm_sf(),
             ),
             train=TrainingConfig(
@@ -521,6 +536,7 @@ class InspectionConfig:
             order=self.order,
             shared_factors=self.shared_factors,
             subsample_frac=self.subsample_frac,
+            max_nnz=self.max_nnz,
             iterations=self.iters,
             rank=self.rank,
             map_location=map_location,

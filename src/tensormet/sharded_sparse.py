@@ -25,6 +25,11 @@ per-iteration index allocation (the old per-iteration ``rng.permutation(nnz)``
 allocated and sorted 8·nnz bytes on the GPU every call).  Samples are a pure
 function of (construction seed, iteration): deterministic and resume-safe.
 
+``cfg.exp.max_nnz`` (hard global NNZ ceiling) is applied upstream in
+tucker_tensor.py as an effective fraction, so the ``subsample_frac`` received
+here may already embed it; per-shard sampling of that fraction sums to
+~max_nnz across shards.
+
 Call ``sst.set_iter_seed(iteration)`` once at the top of each iteration so
 the SST knows which window to take — wrapper function signatures are unchanged.
 

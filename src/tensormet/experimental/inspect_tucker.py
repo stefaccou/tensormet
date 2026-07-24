@@ -355,6 +355,9 @@ _SHARED_STEM_RE = re.compile(r"(?:^|_)shared(\d+)(?=_|$)")
 # "..._0p25ss_..." → subsample_frac 0.25 (see naming._ss; absent means 1.0).
 _SS_STEM_RE = re.compile(r"_(\d+(?:p\d+)?)ss(?=_|$)")
 
+# "..._500000mn_..." → max_nnz 500000 (see naming._mn; absent means off).
+_MN_STEM_RE = re.compile(r"_(\d+)mn(?=_|$)")
+
 # "..._CP3D_..." marks the experimental CP family (see naming._order_tag);
 # Tucker stems carry the bare "..._3D_..." tag instead.
 _DECOMP_STEM_RE = re.compile(r"_CP\d+D(?=_|$)")
@@ -364,6 +367,12 @@ def _ss_from_stem(stem):
     """Recover subsample_frac from a run's filename stem, or None if absent."""
     m = _SS_STEM_RE.search(stem)
     return float(m.group(1).replace("p", ".")) if m else None
+
+
+def _mn_from_stem(stem):
+    """Recover max_nnz from a run's filename stem, or None if absent."""
+    m = _MN_STEM_RE.search(stem)
+    return int(m.group(1)) if m else None
 
 
 def _decomp_from_stem(stem):
@@ -435,6 +444,8 @@ def _discover_one(dataset, data_dir):
         # shared_factors/init); the stem's "_0p25ss" token is the last resort.
         ss = float(exp.get("subsample_frac") or train.get("subsample_frac")
                    or _ss_from_stem(stem) or 1.0)
+        # max_nnz never lived under "train"; config exp → stem token → off.
+        mn = int(exp.get("max_nnz") or _mn_from_stem(stem) or 0)
         # Snapshots predating the CP feature lack "decomposition"; fall back to
         # the "CP{order}D" stem tag (naming._order_tag).
         decomposition = exp.get("decomposition") or _decomp_from_stem(stem)
@@ -443,7 +454,7 @@ def _discover_one(dataset, data_dir):
             dim=dim, name=exp.get("name"), dataset=exp.get("dataset", dataset),
             method=exp.get("method", "siiSoftPlus"), divergence=exp.get("divergence", "kl"),
             order=exp.get("order", 3), iters=iters, rank=rank0,
-            shared_factors=sf, subsample_frac=ss,
+            shared_factors=sf, subsample_frac=ss, max_nnz=(mn or None),
         )
         # InspectionConfig has no declared "decomposition" field (it predates the
         # CP feature); duck-type it on like RunRef does for legacy-named runs, so
@@ -458,7 +469,7 @@ def _discover_one(dataset, data_dir):
                           f"{decomp_tag}{dataset}|{name}|{insp.method}|{dim}d|r{rank0}|{iters}i", insp),
             "name": name, "divergence": insp.divergence, "method": insp.method,
             "order": insp.order, "dim": dim, "rank": rank0,
-            "subsample_frac": ss, "iters": iters, "decomposition": decomposition,
+            "subsample_frac": ss, "max_nnz": mn, "iters": iters, "decomposition": decomposition,
             "has_log": log_path.exists() and log_path.stat().st_size > 0,
             "mtime": cfg_path.stat().st_mtime,
         }
@@ -483,7 +494,8 @@ def discover_runs(datasets="fineweb-en", data_dir=DATA_DIR):
 
 _FACETS = [("Name", "name"), ("Decomposition", "decomposition"),
            ("Divergence", "divergence"), ("Method", "method"),
-           ("Dim", "dim"), ("Rank", "rank"), ("Subsample", "subsample_frac"), ("Iters", "iters")]
+           ("Dim", "dim"), ("Rank", "rank"), ("Subsample", "subsample_frac"),
+           ("MaxNNZ", "max_nnz"), ("Iters", "iters")]
 
 
 def _sortkey(v):
@@ -501,6 +513,7 @@ _LABEL_FIELDS = [
     ("dim", lambda i: f"{i.dim}d"),
     ("rank", lambda i: f"r{i.rank}"),
     ("ss", lambda i: f"ss{i.subsample_frac}"),
+    ("mn", lambda i: f"mn{getattr(i, 'max_nnz', None) or 0}"),
     ("iters", lambda i: f"{i.iters}i"),
 ]
 
@@ -537,7 +550,7 @@ def _chain_key(rec):
     """
     insp = rec["ref"].insp
     return (rec["dataset"], rec["name"], rec["decomposition"], rec["divergence"], rec["method"],
-            rec["order"], rec["dim"], rec["rank"], rec["subsample_frac"],
+            rec["order"], rec["dim"], rec["rank"], rec["subsample_frac"], rec.get("max_nnz", 0),
             frozenset(insp.shared_factors or ()))
 
 
@@ -655,8 +668,9 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         flag = "" if rec["has_log"] else "  ⚠ no log"
         chain = f'  ⛓×{n_seg} (→{rec["iters"]}i)' if n_seg > 1 else ""
         decomp = "" if rec["decomposition"] == "tucker" else f'[{rec["decomposition"].upper()}] '
+        mn = f' mn{rec["max_nnz"]}' if rec.get("max_nnz") else ""
         return (f'{decomp}[{rec["dataset"]}] {rec["name"]} | {rec["divergence"]}/{rec["method"]} | '
-                f'{rec["dim"]}d r{rec["rank"]} ss{rec["subsample_frac"]} '
+                f'{rec["dim"]}d r{rec["rank"]} ss{rec["subsample_frac"]}{mn} '
                 f'{rec["iters"]}i  [{when}]{flag}{chain}')
 
     def _selected_datasets():
