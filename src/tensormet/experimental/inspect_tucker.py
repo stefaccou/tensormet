@@ -355,11 +355,25 @@ _SHARED_STEM_RE = re.compile(r"(?:^|_)shared(\d+)(?=_|$)")
 # "..._0p25ss_..." → subsample_frac 0.25 (see naming._ss; absent means 1.0).
 _SS_STEM_RE = re.compile(r"_(\d+(?:p\d+)?)ss(?=_|$)")
 
+# "..._CP3D_..." marks the experimental CP family (see naming._order_tag);
+# Tucker stems carry the bare "..._3D_..." tag instead.
+_DECOMP_STEM_RE = re.compile(r"_CP\d+D(?=_|$)")
+
 
 def _ss_from_stem(stem):
     """Recover subsample_frac from a run's filename stem, or None if absent."""
     m = _SS_STEM_RE.search(stem)
     return float(m.group(1).replace("p", ".")) if m else None
+
+
+def _decomp_from_stem(stem):
+    """Recover the decomposition family ("cp" or "tucker") from a run's stem.
+
+    Config snapshots from before ``decomposition`` was recorded lack the field,
+    but the model stem always carries the ``CP{order}D`` tag for CP runs (see
+    naming._order_tag) — so the stem is the authoritative fallback.
+    """
+    return "cp" if _DECOMP_STEM_RE.search(stem) else "tucker"
 
 
 def _sf_from_stem(stem):
@@ -421,6 +435,9 @@ def _discover_one(dataset, data_dir):
         # shared_factors/init); the stem's "_0p25ss" token is the last resort.
         ss = float(exp.get("subsample_frac") or train.get("subsample_frac")
                    or _ss_from_stem(stem) or 1.0)
+        # Snapshots predating the CP feature lack "decomposition"; fall back to
+        # the "CP{order}D" stem tag (naming._order_tag).
+        decomposition = exp.get("decomposition") or _decomp_from_stem(stem)
 
         insp = InspectionConfig(
             dim=dim, name=exp.get("name"), dataset=exp.get("dataset", dataset),
@@ -428,15 +445,20 @@ def _discover_one(dataset, data_dir):
             order=exp.get("order", 3), iters=iters, rank=rank0,
             shared_factors=sf, subsample_frac=ss,
         )
+        # InspectionConfig has no declared "decomposition" field (it predates the
+        # CP feature); duck-type it on like RunRef does for legacy-named runs, so
+        # downstream label/facet code can read it uniformly off `insp`.
+        insp.decomposition = decomposition
+        decomp_tag = "" if decomposition == "tucker" else f"[{decomposition.upper()}] "
         log_path = decomp_dir / f"{stem}_log.txt"
         yield {
             "stem": stem,
             "dataset": dataset,
             "ref": RunRef(stem, log_path,
-                          f"{dataset}|{name}|{insp.method}|{dim}d|r{rank0}|{iters}i", insp),
+                          f"{decomp_tag}{dataset}|{name}|{insp.method}|{dim}d|r{rank0}|{iters}i", insp),
             "name": name, "divergence": insp.divergence, "method": insp.method,
             "order": insp.order, "dim": dim, "rank": rank0,
-            "subsample_frac": ss, "iters": iters,
+            "subsample_frac": ss, "iters": iters, "decomposition": decomposition,
             "has_log": log_path.exists() and log_path.stat().st_size > 0,
             "mtime": cfg_path.stat().st_mtime,
         }
@@ -459,7 +481,8 @@ def discover_runs(datasets="fineweb-en", data_dir=DATA_DIR):
 
 # === interactive browser ===============================================
 
-_FACETS = [("Name", "name"), ("Divergence", "divergence"), ("Method", "method"),
+_FACETS = [("Name", "name"), ("Decomposition", "decomposition"),
+           ("Divergence", "divergence"), ("Method", "method"),
            ("Dim", "dim"), ("Rank", "rank"), ("Subsample", "subsample_frac"), ("Iters", "iters")]
 
 
@@ -472,6 +495,7 @@ def _sortkey(v):
 _LABEL_FIELDS = [
     ("dataset", lambda i: i.dataset),
     ("name", lambda i: i.name or "(unnamed)"),
+    ("decomp", lambda i: getattr(i, "decomposition", "tucker")),
     ("method", lambda i: i.method),
     ("div", lambda i: i.divergence),
     ("dim", lambda i: f"{i.dim}d"),
@@ -512,7 +536,7 @@ def _chain_key(rec):
     sort into clean, contiguous segments.
     """
     insp = rec["ref"].insp
-    return (rec["dataset"], rec["name"], rec["divergence"], rec["method"],
+    return (rec["dataset"], rec["name"], rec["decomposition"], rec["divergence"], rec["method"],
             rec["order"], rec["dim"], rec["rank"], rec["subsample_frac"],
             frozenset(insp.shared_factors or ()))
 
@@ -630,7 +654,8 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         when = _dt.datetime.fromtimestamp(rec["mtime"]).strftime("%b%d")
         flag = "" if rec["has_log"] else "  ⚠ no log"
         chain = f'  ⛓×{n_seg} (→{rec["iters"]}i)' if n_seg > 1 else ""
-        return (f'[{rec["dataset"]}] {rec["name"]} | {rec["divergence"]}/{rec["method"]} | '
+        decomp = "" if rec["decomposition"] == "tucker" else f'[{rec["decomposition"].upper()}] '
+        return (f'{decomp}[{rec["dataset"]}] {rec["name"]} | {rec["divergence"]}/{rec["method"]} | '
                 f'{rec["dim"]}d r{rec["rank"]} ss{rec["subsample_frac"]} '
                 f'{rec["iters"]}i  [{when}]{flag}{chain}')
 

@@ -25,6 +25,8 @@ if data_path is None:
 DATA_DIR = Path(data_path)
 
 def np_dispatch(el):
+    if isinstance(el, (list, tuple)):
+        return type(el)(np_dispatch(e) for e in el)
     try:
         element = el.get()
     except AttributeError:

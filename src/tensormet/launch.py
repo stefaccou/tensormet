@@ -330,7 +330,11 @@ def launch_nnt_decomposition(cfg):
 
         end_time = time.time()
 
-        # Save model + metrics using cfg paths
+        # Save model + metrics using cfg paths.
+        # For the EXPERIMENTAL CP family, `tensor` is a tensorly CPTensor whose
+        # first element is the λ weight vector — unpacking is identical, only
+        # the saved container type differs (load_from_disk dispatches on the
+        # CP filename tag).
         tl.set_backend("pytorch")
         core, factors = tucker_decomp_info["tensor"]
         errors = tucker_decomp_info["errors"]
@@ -338,7 +342,12 @@ def launch_nnt_decomposition(cfg):
 
         core_t = tl.tensor(cp.asnumpy(core))
         factors_t = [tl.tensor(cp.asnumpy(f)) for f in factors]
-        tucker_decomp_torch = TuckerTensor((core_t, factors_t))
+        _decomposition = getattr(cfg.exp, "decomposition", "tucker")
+        if _decomposition == "cp":
+            from tensorly.cp_tensor import CPTensor
+            tucker_decomp_torch = CPTensor((core_t, factors_t))
+        else:
+            tucker_decomp_torch = TuckerTensor((core_t, factors_t))
 
         torch.save(tucker_decomp_torch, paths["model"])
         np.save(paths["errors"], np.array([e.get() if hasattr(e, "get") else float(e) for e in errors], dtype=float))
@@ -397,7 +406,8 @@ def launch_nnt_decomposition(cfg):
         )
         if not (cfg.exp.name and "bench" in cfg.exp.name):
             notify_discord(
-                f"Saved Tucker decomposition {cfg.exp.method} - {cfg.exp.dim}/{cfg.exp.rank[0]} to {final_paths['model']}"
+                f"Saved {_decomposition.capitalize()} decomposition {cfg.exp.method} - "
+                f"{cfg.exp.dim}/{cfg.exp.rank[0]} to {final_paths['model']}"
                 f" in {end_time - start_time:.2f} seconds."
             )
         print("model, errors and config saved")

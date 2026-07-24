@@ -1279,6 +1279,16 @@ class SparseTupleTensor:
             epsilon = cfg.exp.epsilon
             normalize_factors = cfg.exp.normalize_factors
             objective = getattr(cfg.exp, "objective", "full")
+            # EXPERIMENTAL CP support (reviews/CP_IMPLEMENTATION_PLAN.md).
+            # getattr so configs deserialized from before these fields existed
+            # keep working; the default reproduces the Tucker pipeline exactly.
+            decomposition = getattr(cfg.exp, "decomposition", "tucker")
+            cp_inner_iters = getattr(cfg.exp, "cp_inner_iters", 1)
+            cp_scooch_kappa = getattr(cfg.exp, "cp_scooch_kappa", 0.0)
+            if decomposition not in ("tucker", "cp"):
+                raise ValueError(
+                    f"cfg.exp.decomposition must be 'tucker' or 'cp'; got {decomposition!r}"
+                )
 
             rec_check_every = cfg.eval.rec_check_every
             sem_check_every = cfg.eval.sem_check_every
@@ -1316,6 +1326,17 @@ class SparseTupleTensor:
         if not self.sparsity_type == "cupy":
             raise ValueError("sparse_tensor must have sparsity_type 'cupy'.")
 
+        # --- EXPERIMENTAL CP swap points -----------------------------------
+        # When decomposition == "cp", the `core` variable below holds the CP
+        # weight vector λ (R,) — the CP kernels accept it through the same
+        # UpdateRouting seam, so this 750-line loop is reused, not forked.
+        # Checkpoints/best/final containers become tensorly CPTensor payloads.
+        _is_cp = decomposition == "cp"
+        if _is_cp:
+            from tensorly.cp_tensor import CPTensor as _Container
+        else:
+            _Container = TuckerTensor
+
         paths = cfg.artifact_paths()
 
         # Under HPC mode `paths` resolve to node-local $TMPDIR. mirror_paths is the
@@ -1337,14 +1358,31 @@ class SparseTupleTensor:
         checkpoint_tensor = resume_state.get("checkpoint_tensor", None)
 
         shape = tuple(self.shape)
-        rank = validate_tucker_rank(shape, rank=rank)
-        modes = list(range(len(rank)))
+        if _is_cp:
+            # CP uses a single rank R (no per-mode core dimensions). Accept the
+            # config's per-mode tuple only when uniform.
+            from tensorly.cp_tensor import validate_cp_rank
+            if isinstance(rank, (list, tuple)):
+                if len(set(rank)) > 1:
+                    raise ValueError(
+                        f"CP decomposition uses a single rank; got per-mode ranks {tuple(rank)}. "
+                        f"Pass a uniform --rank."
+                    )
+                rank = rank[0]
+            rank = validate_cp_rank(shape, rank=int(rank))
+            modes = list(range(len(shape)))
+        else:
+            rank = validate_tucker_rank(shape, rank=rank)
+            modes = list(range(len(rank)))
         # NOTE (Task 6): the routing size decision is centralised in
         # needs_largedim(dim, ...) (see _largedim_selected below); no local
         # max(shape) threshold variable is needed here anymore.
         if checkpoint_tensor is not None:
             if isinstance(checkpoint_tensor, tuple):
-                # if TensorLy TuckerTensor
+                # if TensorLy TuckerTensor / plain (core|weights, factors) tuple
+                ckpt_core, ckpt_factors = checkpoint_tensor
+            elif _is_cp:
+                # tensorly CPTensor payload: iterable as (weights, factors)
                 ckpt_core, ckpt_factors = checkpoint_tensor
             else:
                 # if our TuckerDecomposition class
@@ -1352,6 +1390,13 @@ class SparseTupleTensor:
 
             core = cp.asarray(ckpt_core)
             factors = [cp.asarray(factor) for factor in ckpt_factors]
+        elif _is_cp:
+            from tensormet.experimental.CP.cp_ops import initialize_nonnegative_cp
+            # `core` = λ weight vector; see the CP swap-points note above.
+            core, factors = initialize_nonnegative_cp(
+                self.tensor, shape, rank, modes, init, random_state,
+                thread_budget=thread_budget, divergence=divergence, epsilon=epsilon,
+            )
         else:
             core, factors = initialize_nonnegative_tucker(self.tensor, shape, rank, modes, init,
                                                            random_state, thread_budget=thread_budget)
@@ -1370,7 +1415,7 @@ class SparseTupleTensor:
         # which is the same "full" assumption the masked objective is meant to avoid.
         # Masked-aware SVD init is not implemented; warn that this combination is
         # likely to hurt rather than help and that random init is the safer choice.
-        if masked and isinstance(init, str) and init.startswith("svd"):
+        if masked and isinstance(init, str) and "svd" in init:
             print(
                 f"WARNING: init={init!r} with objective='masked' is not implemented. "
                 "SVD init fits a zero-filled HOSVD (unobserved entries treated as 0), "
@@ -1385,6 +1430,19 @@ class SparseTupleTensor:
             raise NotImplementedError(
                 "objective='masked' with subsample_frac < 1.0 is only supported on the "
                 "multi-GPU sharded path (n_gpus > 1). Use subsample_frac=1.0 on a single GPU."
+            )
+
+        # --- CP guard rails (plan Phase 2): explicit rejections for paths the
+        # experimental CP family does not implement yet (both are Phase-5 work).
+        if _is_cp and masked:
+            raise NotImplementedError(
+                "decomposition='cp' does not support objective='masked' yet "
+                "(CP_IMPLEMENTATION_PLAN.md §1.8 / Phase 5). Use objective='full'."
+            )
+        if _is_cp and _n_gpus > 1:
+            raise NotImplementedError(
+                "decomposition='cp' does not support the multi-GPU sharded path yet "
+                "(CP_IMPLEMENTATION_PLAN.md Phase 5). Use n_gpus=1."
             )
 
         if _n_gpus > 1:
@@ -1426,9 +1484,14 @@ class SparseTupleTensor:
         # literals that could disagree with routing for FR dims in (3000, 4000]).
         _largedim_selected = needs_largedim(dim, largedim=largedim, masked=masked)
         _factor_is_largedim = _largedim_selected
+        # CP note: the grouping cache and the precomputed largedim batch sizes
+        # below are Tucker-largedim-kernel optimizations; the CP kernels stream
+        # NNZ directly (no column grouping, own batch estimator), so both stay
+        # None for CP and their kwargs are never injected into _factor_kwargs.
         _grouping_cache = (
             NNZGroupingCache(self.tensor, shape)
-            if (_sst is None and _subsample_frac >= 1.0 and _factor_is_largedim)
+            if (_sst is None and _subsample_frac >= 1.0 and _factor_is_largedim
+                and not _is_cp)
             else None
         )
 
@@ -1446,7 +1509,8 @@ class SparseTupleTensor:
         _nnz_live = _iter_sampler.n_sample if _iter_sampler is not None else _full_nnz
         _largedim_batches = (
             precompute_largedim_batches(core, factors, modes, masked=masked, nnz_live=_nnz_live)
-            if (divergence == "kl" and _sst is None and _factor_is_largedim)
+            if (divergence == "kl" and _sst is None and _factor_is_largedim
+                and not _is_cp)
             else None
         )
 
@@ -1579,7 +1643,10 @@ class SparseTupleTensor:
                 start_time = time.time()
             log_step = get_log_step(iteration, rec_log_every, rec_check_every)
             routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step,
-                                              largedim=largedim, masked=masked)
+                                              largedim=largedim, masked=masked,
+                                              decomposition=decomposition,
+                                              cp_inner_iters=cp_inner_iters,
+                                              cp_scooch_kappa=cp_scooch_kappa)
             # --- multi-GPU routing override (largedim variants only) ---
             # CHANGED (2026-06-12 review, Task 6): gate on the same needs_largedim()
             # predicate as routing (via _largedim_selected) instead of re-deriving
@@ -1700,8 +1767,10 @@ class SparseTupleTensor:
                 if _largedim_batches is not None and log_step:
                     _err_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
                 rel_err = routing.error_fn(**_err_kwargs)
-            # Normalize if desired
-            if normalize_factors:
+            # Normalize if desired (Tucker only: the CP kernels already keep the
+            # factors column-normalized with the scale absorbed into λ —
+            # cp_normalize semantics are built into every factor update).
+            if normalize_factors and not _is_cp:
                 core, factors = tucker_normalize((core, factors))
 
             if log_step:
@@ -1763,7 +1832,15 @@ class SparseTupleTensor:
                 core_cpu = tl.tensor(cp.asnumpy(core))
                 factors_cpu = [tl.tensor(cp.asnumpy(f)) for f in factors]
                 roles = extract_roles_from_vocab(vocab)
-                tucker_decomp = TuckerDecomposition(core=core_cpu, factors=factors_cpu, vocab=vocab, roles=roles)
+                if _is_cp:
+                    # CPDecomposition implements the same eval contract
+                    # (batch_excluded_role_vector, judge/SimLex accessors), so
+                    # everything downstream of this variable stays unchanged.
+                    from tensormet.experimental.CP.cp_decomposition import CPDecomposition
+                    tucker_decomp = CPDecomposition(weights=core_cpu, factors=factors_cpu,
+                                                    vocab=vocab, roles=roles)
+                else:
+                    tucker_decomp = TuckerDecomposition(core=core_cpu, factors=factors_cpu, vocab=vocab, roles=roles)
 
                 sem_out = evaluate_sample(
                     tucker_decomp,
@@ -1916,8 +1993,14 @@ class SparseTupleTensor:
                         if verbose:
                             print("New best semantic score; saving current best core and factors.")
                         if save_intermediate:
-
-                            temp_tensor = TuckerTensor((best_core, best_factors))
+                            # Save host arrays (like the checkpoint path below):
+                            # pickled CuPy arrays can only be loaded where CuPy +
+                            # a GPU are available, and this file is what
+                            # judge_eval/inspect_tucker later load on CPU.
+                            temp_tensor = _Container(
+                                (cp.asnumpy(best_core),
+                                 [cp.asnumpy(factor) for factor in best_factors])
+                            )
                             torch.save(temp_tensor, paths["model"])
                             print("saving temp model to", paths["model"])
 
@@ -1952,7 +2035,7 @@ class SparseTupleTensor:
             if checkpoint_saving: # only trigger if this is not 0 -> True
                 if (iteration + 1) % cfg.train.checkpoint_saving_steps == 0:
                     print(f"saving model at iteration {iteration}")
-                    checkpoint_tensor = TuckerTensor((cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors]))
+                    checkpoint_tensor = _Container((cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors]))
                     paths = cfg.artifact_paths()
                     torch.save(checkpoint_tensor, paths["checkpoint_dir"] / f"{iteration + 1}.pt")
                     # Durably mirror this checkpoint to GPFS so a walltime kill stays resumable.
@@ -2001,7 +2084,7 @@ class SparseTupleTensor:
                 print(f"Saving resumable checkpoint at iteration {iteration} before stopping...")
                 try:
                     os.makedirs(paths["checkpoint_dir"], exist_ok=True)
-                    checkpoint_tensor = TuckerTensor(
+                    checkpoint_tensor = _Container(
                         (cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors])
                     )
                     ckpt_path = paths["checkpoint_dir"] / f"{iteration + 1}.pt"
@@ -2030,10 +2113,10 @@ class SparseTupleTensor:
             signal.signal(signal.SIGINT, _original_sigint)
 
         if best_sem_iteration is not None:
-            tensor = TuckerTensor((best_core, best_factors))
+            tensor = _Container((best_core, best_factors))
             iteration = best_sem_iteration
         else:
-            tensor = TuckerTensor((core, factors))
+            tensor = _Container((core, factors))
         if return_errors == "simple":
             return tensor, rec_errors
         elif return_errors == "full":

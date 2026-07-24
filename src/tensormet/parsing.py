@@ -274,6 +274,15 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         choices=["full", "masked"],
                         help="'full' fits the zero-filled tensor (count data); "
                              "'masked' fits only observed entries (completion/rating data).")
+    # EXPERIMENTAL (reviews/CP_IMPLEMENTATION_PLAN.md): CP decomposition family.
+    parser.add_argument("--decomposition", type=str, default=None,
+                        choices=["tucker", "cp"],
+                        help="Decomposition family: 'tucker' (default, existing pipeline) or "
+                             "'cp' (EXPERIMENTAL nonnegative CP; single-GPU, objective=full only).")
+    parser.add_argument("--cp-inner-iters", type=int, dest="cp_inner_iters", default=None,
+                        help="CP only: CP-APR inner iterations per mode per sweep (default 1).")
+    parser.add_argument("--cp-scooch-kappa", type=float, dest="cp_scooch_kappa", default=None,
+                        help="CP only: CP-APR 'scooch' nudge for inadmissible zeros (default 0 = off).")
 
     # Eval-level args
     parser.add_argument("--rec-check-every", type=int, dest="rec_check_every", default=None)
@@ -322,7 +331,8 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     exp_kwargs = {}
     for field in ("dataset", "method", "order", "divergence", "dim", "name",
                   "random_state", "epsilon", "init", "normalize_factors",
-                  "shared_factors", "subsample_frac", "objective"):
+                  "shared_factors", "subsample_frac", "objective",
+                  "decomposition", "cp_inner_iters", "cp_scooch_kappa"):
         v = parsed_dict.get(field, None)
         if v is not None:
             exp_kwargs[field] = v

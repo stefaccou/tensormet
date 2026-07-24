@@ -403,18 +403,37 @@ def _build_pp_arrays(subset_counters, single_probs, vocabs_max, ranks,
     }
 
 
+def _source_fingerprint(parquet_files):
+    """Fingerprint of the source parquet shards: newest mtime + total bytes + count.
+
+    Same triple ``similarity.load_eval_sentences_cached_parquet`` uses. Vector
+    creation is resumable and appends part files into the same directory, so
+    caches keyed on the *path* alone would silently reuse marginals/joint counts
+    from the smaller corpus after an extension; keying on this triple makes them
+    miss once and rebuild instead.
+    """
+    stats = [p.stat() for p in parquet_files]
+    return {
+        "mtime_ns": max(s.st_mtime_ns for s in stats),
+        "bytes": sum(s.st_size for s in stats),
+        "nfiles": len(stats),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pass-2 checkpoint: persist the post-Pass-2 _PP_STATE arrays so a re-run skips
 # the (very expensive, multi-hour) joint-count pass. Keyed on everything that
-# determines the arrays' contents: source vectors, columns, per-mode max_ks,
-# factor linking, and whether sii sub-counters were materialised.
+# determines the arrays' contents: source vectors (path + data fingerprint),
+# columns, per-mode max_ks, factor linking, and whether sii sub-counters were
+# materialised.
 # ---------------------------------------------------------------------------
 def _pp_state_cache_path(path_to_tensors, path_to_vectors, cols_to_build,
                          max_ks, shared_factors, need_sii, remove_hapax,
-                         min_mode_ks, ensured_vocab):
+                         min_mode_ks, ensured_vocab, src_fingerprint):
     key = json.dumps(
         {
             "src": os.fspath(path_to_vectors),
+            "src_data": src_fingerprint,
             "cols": list(cols_to_build),
             "max_ks": list(max_ks),
             "shared_factors": shared_factors,
@@ -637,9 +656,14 @@ def _normalize_str_array(arr: pa.Array) -> pa.Array:
 
 
 
-def _marginals_cache_path(path_to_tensors, path_to_vectors, cols_to_build):
+def _marginals_cache_path(path_to_tensors, path_to_vectors, cols_to_build,
+                          src_fingerprint):
     key = json.dumps(
-        {"src": os.fspath(path_to_vectors), "cols": list(cols_to_build)},
+        {
+            "src": os.fspath(path_to_vectors),
+            "src_data": src_fingerprint,
+            "cols": list(cols_to_build),
+        },
         sort_keys=True,
     )
     h = hashlib.sha1(key.encode()).hexdigest()[:12]
@@ -899,6 +923,8 @@ def populate_tensors_parquet(
     if not parquet_files:
         raise FileNotFoundError(f"No parquet shards found in {vector_dir}")
 
+    src_fingerprint = _source_fingerprint(parquet_files)
+
     dataset = ds.dataset(parquet_files, format="parquet")
 
     # dataset = ds.dataset(path_to_vectors, format="parquet")
@@ -937,7 +963,8 @@ def populate_tensors_parquet(
     #     raise ValueError("No rows found in the parquet dataset.")
     # total_len = seen_rows  # global denominator for probabilities
 
-    cache_path = _marginals_cache_path(path_to_tensors, path_to_vectors, cols_to_build)
+    cache_path = _marginals_cache_path(path_to_tensors, path_to_vectors,
+                                       cols_to_build, src_fingerprint)
 
     if cache_path.exists():
         print(f"Loading cached marginals from {cache_path}")
@@ -1040,7 +1067,7 @@ def populate_tensors_parquet(
         pp_cache_path = _pp_state_cache_path(
             path_to_tensors, path_to_vectors, cols_to_build,
             max_ks, shared_factors, need_sii, remove_hapax,
-            min_mode_ks, ensured_vocab,
+            min_mode_ks, ensured_vocab, src_fingerprint,
         )
         load_path = pp_cache_path if pp_cache_path.exists() else None
         if load_path is None and not need_sii:
@@ -1051,7 +1078,7 @@ def populate_tensors_parquet(
             superset_path = _pp_state_cache_path(
                 path_to_tensors, path_to_vectors, cols_to_build,
                 max_ks, shared_factors, True, remove_hapax,
-                min_mode_ks, ensured_vocab,
+                min_mode_ks, ensured_vocab, src_fingerprint,
             )
             if superset_path.exists():
                 load_path = superset_path
@@ -1432,8 +1459,15 @@ def rebuild_vocabularies(
     vocab_dir = Path(path_to_tensors) / "vocabularies"
     vocab_dir.mkdir(parents=True, exist_ok=True)
 
-    # Marginals must already be cached (Pass 1 of the original run).
-    cache_path = _marginals_cache_path(path_to_tensors, path_to_vectors, cols_to_build)
+    # Marginals must already be cached (Pass 1 of the original run). The cache
+    # key includes the source-data fingerprint, so marginals computed on an
+    # older/smaller version of the vectors dir miss here too.
+    parquet_files = sorted(Path(path_to_vectors).glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet shards found in {path_to_vectors}")
+    src_fingerprint = _source_fingerprint(parquet_files)
+    cache_path = _marginals_cache_path(path_to_tensors, path_to_vectors,
+                                       cols_to_build, src_fingerprint)
     if not cache_path.exists():
         raise FileNotFoundError(
             f"No cached marginals at {cache_path}. Vocabulary rebuild needs the "

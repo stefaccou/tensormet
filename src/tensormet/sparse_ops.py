@@ -465,8 +465,22 @@ def _nndsvd_factors_gpu(U, s):
     return direction * sqrt_scale[cp.newaxis, :]
 
 
+# init="svd_loose": ARPACK relative Ritz-value tolerance. The SVD only seeds an
+# NNDSVD initialization, so machine precision (tol=0, the eigsh default) buys
+# nothing; 1e-4 typically cuts the restart count substantially.
+_LOOSE_SVD_TOL = 1e-4
+
+# init="randomised_svd": subspace-iteration knobs shared between the worker and
+# the main process (which uses them to precompute the exact tqdm total).
+_RSVD_OVERSAMPLING = 10
+_RSVD_POWER_ITER = 2
+# Cap on the dense (n × chunk) intermediate produced by A.T @ block — matches
+# the single n-vector footprint of the eigsh path within a small factor.
+_RSVD_BLOCK_BYTES = 4 * 1024**3
+
+
 def _svd_worker(row_np, col_np, data_np, sp_shape, rank_i, random_state_i, threads_per_mode,
-                write_conn):
+                write_conn, tol=0.0):
     """Top-level worker for ProcessPoolExecutor: truncated SVD on one mode unfolding.
 
     Uses eigsh on the Gram operator A @ A.T (shape m × m, always small) instead
@@ -478,6 +492,9 @@ def _svd_worker(row_np, col_np, data_np, sp_shape, rank_i, random_state_i, threa
     Each Gram mat-vec calls A.T @ x (producing an n-vector) then A @ y, and
     sends one increment via write_conn for live tqdm tracking in the main process.
     Pipe connections clean up with os.close() on exit — no IPC, no hang risk.
+
+    tol is ARPACK's relative Ritz-value tolerance (0 = machine precision);
+    init="svd_loose" passes _LOOSE_SVD_TOL.
     """
     import scipy.sparse
     import scipy.sparse.linalg
@@ -502,7 +519,7 @@ def _svd_worker(row_np, col_np, data_np, sp_shape, rank_i, random_state_i, threa
 
     ctx = threadpool_limits(threads_per_mode) if threads_per_mode is not None else nullcontext()
     with ctx:
-        eigvals, eigvecs = scipy.sparse.linalg.eigsh(gram_op, k=k, which='LM', v0=v0)
+        eigvals, eigvecs = scipy.sparse.linalg.eigsh(gram_op, k=k, which='LM', v0=v0, tol=tol)
 
     desc = np.argsort(eigvals)[::-1]
     U = eigvecs[:, desc]                              # (m, k) left singular vectors
@@ -510,7 +527,92 @@ def _svd_worker(row_np, col_np, data_np, sp_shape, rank_i, random_state_i, threa
     return _nndsvd_factors(U, s)
 
 
-def _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state, thread_budget=None):
+def _rsvd_gram_matvec_total(sp_shape, rank_i):
+    """Exact number of Gram mat-vecs the randomised SVD worker will perform.
+
+    Computed in the main process too, so the tqdm bar gets a true total:
+    (2·q + 2) block applications of the Gram operator — one for the initial
+    projection, two per power iteration, one for Rayleigh-Ritz — each costing
+    p = k + oversampling column mat-vecs.
+    """
+    m = sp_shape[0]
+    k = min(rank_i, m - 1)
+    p = min(k + _RSVD_OVERSAMPLING, m)
+    return (2 * _RSVD_POWER_ITER + 2) * p
+
+
+def _randomised_svd_worker(row_np, col_np, data_np, sp_shape, rank_i, random_state_i,
+                           threads_per_mode, write_conn):
+    """Top-level worker for ProcessPoolExecutor: randomised truncated SVD on one
+    mode unfolding, with a deterministic operation count.
+
+    CPU port of _gpu_top_k_eig applied to the implicit Gram operator A @ A.T:
+    randomized subspace iteration + CholeskyQR + Rayleigh-Ritz. Unlike ARPACK
+    (init="svd"), the total work is fixed in advance — see
+    _rsvd_gram_matvec_total — so the main process can give tqdm a real total.
+
+    The Gram operator is applied to blocks of vectors, chunked so the dense
+    (n × chunk) intermediate from A.T @ block stays under _RSVD_BLOCK_BYTES
+    (n = product of the other mode dims can reach ~1e8+). One increment is
+    sent per column, matching the "mv" unit of the eigsh path.
+    """
+    import scipy.sparse
+    import scipy.linalg
+    from contextlib import nullcontext
+    from threadpoolctl import threadpool_limits
+
+    sp_cpu = scipy.sparse.coo_matrix(
+        (data_np, (row_np, col_np)), shape=sp_shape
+    ).tocsr()
+    m, n = sp_shape
+    k = min(rank_i, m - 1)
+    p = min(k + _RSVD_OVERSAMPLING, m)
+    dtype = sp_cpu.dtype
+    chunk = max(1, min(p, int(_RSVD_BLOCK_BYTES // (n * dtype.itemsize))))
+
+    def _gram_block(X):
+        out = np.empty_like(X)
+        for j0 in range(0, X.shape[1], chunk):
+            j1 = min(j0 + chunk, X.shape[1])
+            out[:, j0:j1] = sp_cpu @ (sp_cpu.T @ X[:, j0:j1])
+            write_conn.send(j1 - j0)
+        return out
+
+    rng = np.random.RandomState(random_state_i)
+    ctx = threadpool_limits(threads_per_mode) if threads_per_mode is not None else nullcontext()
+    with ctx:
+        Y = _gram_block(rng.standard_normal((m, p)).astype(dtype))
+        for _ in range(_RSVD_POWER_ITER):
+            Y = _gram_block(_gram_block(Y))
+            # Normalise columns to prevent overflow/underflow across iterations;
+            # the column span — all that matters — is unchanged.
+            col_norms = np.sqrt(np.sum(Y.astype(np.float64) ** 2, axis=0, keepdims=True))
+            Y = (Y / np.maximum(col_norms, 1e-100)).astype(dtype)
+
+        # CholeskyQR; tiny (p × p) algebra in float64 like the GPU path
+        G = (Y.astype(np.float64).T @ Y.astype(np.float64))
+        G = (G + G.T) * 0.5
+        G += np.eye(p) * (np.abs(np.diag(G)).mean() * 1e-10 + 1e-100)
+        L = scipy.linalg.cholesky(G, lower=True)
+        L_inv = scipy.linalg.solve_triangular(L, np.eye(p), lower=True)
+        # Y^T Y = L L^T  ⇒  Q = Y L^{-T} is orthonormal (Rayleigh-Ritz below
+        # relies on this; note _gpu_top_k_eig uses Y @ L^{-1}, which only
+        # preserves the span).
+        Q = (Y @ L_inv.T.astype(dtype))                    # (m, p) orthonormal
+
+        # Rayleigh-Ritz: one more Gram application, then a tiny eigh
+        B = Q.astype(np.float64).T @ _gram_block(Q).astype(np.float64)
+        B = (B + B.T) * 0.5
+        eigvals, eigvecs = np.linalg.eigh(B)               # ascending
+
+    V = np.ascontiguousarray(eigvecs[:, -k:][:, ::-1])     # top-k, descending
+    U = (Q @ V.astype(dtype))                              # (m, k) left singular vectors
+    s = np.sqrt(np.maximum(eigvals[-k:][::-1], 0.0)).astype(dtype)
+    return _nndsvd_factors(U, s)
+
+
+def _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state, thread_budget=None,
+                               variant="svd"):
     """Tucker init via truncated SVD of each mode unfolding (CPU/scipy path).
 
     Extracts COO data for all mode unfoldings in the main process (sequential,
@@ -519,6 +621,13 @@ def _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state, 
     n_threads // n_modes, so all CPUs are saturated without oversubscription.
     A tqdm bar per mode tracks ARPACK mat-vec iterations via a Queue drained by
     a background thread. Core is computed on GPU after all factors are collected.
+
+    variant :
+        "svd"            — ARPACK eigsh at machine precision (tol=0).
+        "svd_loose"      — ARPACK eigsh with tol=_LOOSE_SVD_TOL; plenty for an
+                           NNDSVD init, converges in fewer restarts.
+        "randomised_svd" — randomized subspace iteration with a fixed,
+                           precomputable mat-vec count (tqdm bars get a total).
     """
     import multiprocessing
     import threading
@@ -554,10 +663,11 @@ def _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state, 
     def _drain(read_conn, pbar):
         # Exits when the write end of the pipe is fully closed (worker exits +
         # main process closes its copy), which raises EOFError on recv().
+        # Workers send the number of mat-vecs per increment (1 for eigsh,
+        # chunk width for the randomised worker).
         try:
             while True:
-                read_conn.recv()
-                pbar.update(1)
+                pbar.update(read_conn.recv())
         except EOFError:
             pass
 
@@ -565,8 +675,16 @@ def _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state, 
     # Cleanup is a plain os.close() — no manager process, no RPC, no hang risk.
     pipe_pairs = [multiprocessing.Pipe(duplex=False) for _ in range(n_modes)]
 
+    randomised = variant == "randomised_svd"
+    # ARPACK's iteration count is convergence-dependent (no total); the
+    # randomised worker's is fixed in advance.
+    totals = [
+        _rsvd_gram_matvec_total(mode_arrays[i][3], rank[i]) if randomised else None
+        for i in range(n_modes)
+    ]
     bars = [
-        tqdm(desc=f"SVD mode {i}", position=i, leave=True, unit="mv", dynamic_ncols=True)
+        tqdm(desc=f"SVD mode {i}", position=i, leave=True, unit="mv", dynamic_ncols=True,
+             total=totals[i])
         for i in range(n_modes)
     ]
     drain_threads = [
@@ -577,12 +695,15 @@ def _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state, 
         t.start()
 
     factors = [None] * n_modes
+    worker = _randomised_svd_worker if randomised else _svd_worker
+    worker_extra = () if randomised else (_LOOSE_SVD_TOL if variant == "svd_loose" else 0.0,)
     with ProcessPoolExecutor(max_workers=n_modes) as pool:
         futures = {
             pool.submit(
-                _svd_worker,
+                worker,
                 row, col, data, sp_shape,
                 rank[i], random_state + i, threads_per_mode, pipe_pairs[i][1],
+                *worker_extra,
             ): i
             for i, (row, col, data, sp_shape) in enumerate(mode_arrays)
         }
@@ -744,9 +865,13 @@ def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, rando
             tl.tensor(rng.random_sample((shape[mode], rank[i])), **tl.context(sparse_tensor))
             for i, mode in enumerate(modes)
         ]
-    elif init in ("svd", "svd_cpu"):
+    elif init in ("svd", "svd_cpu", "svd_loose", "randomised_svd", "randomized_svd"):
+        variant = {
+            "svd": "svd", "svd_cpu": "svd", "svd_loose": "svd_loose",
+            "randomised_svd": "randomised_svd", "randomized_svd": "randomised_svd",
+        }[init]
         return _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state,
-                                          thread_budget=thread_budget)
+                                          thread_budget=thread_budget, variant=variant)
     elif init == "svd_gpu":
         return _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state)
     else:

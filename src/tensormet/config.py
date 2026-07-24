@@ -155,6 +155,18 @@ class ExperimentConfig:
     #             (weighted/completion objective). Correct for recommendation/generalisation
     #             data (e.g. Netflix) where "unobserved" != "rated 0".
     objective: str = "full"
+    # EXPERIMENTAL (reviews/CP_IMPLEMENTATION_PLAN.md): which decomposition
+    # family to fit. "tucker" (default) is the existing pipeline, unchanged;
+    # "cp" routes to the nonnegative CP kernels in experimental/CP/ (single-GPU,
+    # objective="full" only for now). Validated at unpack time in the loop.
+    decomposition: str = "tucker"
+    # CP-only knobs (ignored for decomposition="tucker"):
+    #   cp_inner_iters   — CP-APR 'maxinner': Φ/B repetitions per mode per sweep
+    #                      (default 1 = plain sweep, matching the Tucker loop).
+    #   cp_scooch_kappa  — CP-APR §4.1 nudge for inadmissible zeros (default 0 =
+    #                      off; the ε-clip already prevents exact zeros).
+    cp_inner_iters: int = 1
+    cp_scooch_kappa: float = 0.0
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -207,6 +219,7 @@ class RunConfig:
             name=self.exp.name,
             shared_factors=self.exp.shared_factors,
             subsample_frac=self.exp.subsample_frac,
+            decomposition=getattr(self.exp, "decomposition", "tucker"),
         )
 
     def model_path(self) -> Path:
@@ -279,6 +292,7 @@ class RunConfig:
             name=self.exp.name,
             shared_factors=self.exp.shared_factors,
             subsample_frac=self.exp.subsample_frac,
+            decomposition=getattr(self.exp, "decomposition", "tucker"),
         )
 
         # Find all JSON config files: new (with sf) → new (without sf) → legacy
@@ -319,6 +333,11 @@ class RunConfig:
             # different seeds would splice together incompatible RNG streams.
             # Old configs predating this field fall back to the dataclass default.
             is_compatible = (
+                    # Correctness-critical: a CP run must never silently resume
+                    # from a Tucker checkpoint of identical dims/rank (or vice
+                    # versa). Old configs predating the field default to "tucker".
+                    old_exp.get("decomposition", "tucker") ==
+                    getattr(self.exp, "decomposition", "tucker") and
                     old_exp.get("dataset") == self.exp.dataset and
                     old_exp.get("order") == self.exp.order and
                     old_exp.get("method") == self.exp.method and

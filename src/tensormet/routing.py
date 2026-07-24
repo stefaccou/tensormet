@@ -47,7 +47,9 @@ class UpdateRouting:
 
 
 def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedim=False,
-                            masked: bool = False) -> UpdateRouting:
+                            masked: bool = False, decomposition: str = "tucker",
+                            cp_inner_iters: int = 1,
+                            cp_scooch_kappa: float = 0.0) -> UpdateRouting:
     """Return the correct update functions for the step if logging is active.
 
     masked : bool
@@ -55,7 +57,20 @@ def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedi
         observed (nonzero) entries. The masked branches live exclusively in the
         largedim NNZ-streaming kernels (they work for any dimensionality), so we
         always route to those and bind ``masked=True`` via functools.partial.
+    decomposition : str
+        EXPERIMENTAL: "cp" routes to the nonnegative CP kernel family in
+        tensormet.experimental.CP (imported lazily so Tucker runs never touch
+        it). CP has a single NNZ-streaming family, so dim/largedim/masked do
+        not apply there (masked CP is rejected upstream by the training loop).
+        cp_inner_iters / cp_scooch_kappa are CP-APR knobs, ignored for Tucker.
     """
+    if decomposition == "cp":
+        from tensormet.experimental.CP.cp_routing import get_cp_update_routing_step
+        return get_cp_update_routing_step(
+            divergence=divergence, log_step=log_step,
+            inner_iters=cp_inner_iters, scooch_kappa=cp_scooch_kappa,
+        )
+
     # Single decision for the whole step: factor, core and error all follow the
     # same family. `masked` is folded in by needs_largedim (masked kernels stream
     # over NNZ and are correct at any size, so they force the largedim path).

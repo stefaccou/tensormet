@@ -4,6 +4,8 @@ Single source of truth for artifact filename conventions.
 Naming contract
 ---------------
 Model file :  {prefix}{div}_{method}_{order}D_{dims}d{sf}{ss}_{rank0}r_{iters}i.pt
+              (experimental CP family: '{order}D' → 'CP{order}D'; Tucker
+               filenames are byte-identical to before the CP feature existed)
 Vocab file :  {order}D_{dims}d{sf}.pkl          (legacy: {dims}{sf}.pkl)
 Populated  :  {method}_{order}D_{dims}d{sf}.pt  (legacy: {method}_{dims}{sf}.pt)
 
@@ -68,6 +70,13 @@ def _r0(rank: _Rank) -> int:
     return rank[0] if rank else 0
 
 
+def _order_tag(order: int, decomposition: str = "tucker") -> str:
+    """Order fragment of the model stem: '{order}D' for Tucker (unchanged,
+    keeps every existing filename byte-identical), 'CP{order}D' for the
+    experimental CP family so the two artifact families never collide."""
+    return f"CP{order}D" if decomposition == "cp" else f"{order}D"
+
+
 # ---------------------------------------------------------------------------
 # Model filenames
 # ---------------------------------------------------------------------------
@@ -83,10 +92,11 @@ def model_stem(
     name: Optional[str] = None,
     shared_factors: _SF = None,
     subsample_frac: float = 1.0,
+    decomposition: str = "tucker",
 ) -> str:
     """Return the model filename stem (without .pt extension)."""
     return (
-        f"{_prefix(name)}{divergence}_{method}_{order}D_"
+        f"{_prefix(name)}{divergence}_{method}_{_order_tag(order, decomposition)}_"
         f"{dim_spec_str(dim)}d{_sf(shared_factors, order)}_"
         f"{_r0(rank)}r{_ss(subsample_frac)}_{n_iter_max}i"
     )
@@ -103,11 +113,13 @@ def model_filename(
     name: Optional[str] = None,
     shared_factors: _SF = None,
     subsample_frac: float = 1.0,
+    decomposition: str = "tucker",
 ) -> str:
     """Return the full model filename (e.g. 'fr_siiSoftPlus_3D_1000d_100r_300i.pt')."""
     return model_stem(
         divergence, method, order, dim, rank, n_iter_max,
         name=name, shared_factors=shared_factors, subsample_frac=subsample_frac,
+        decomposition=decomposition,
     ) + ".pt"
 
 
@@ -121,6 +133,7 @@ def candidate_stems(
     name: Optional[str] = None,
     shared_factors: _SF = None,
     subsample_frac: float = 1.0,
+    decomposition: str = "tucker",
 ) -> list[str]:
     """
     Return filename prefixes in descending priority order for directory scans.
@@ -131,22 +144,28 @@ def candidate_stems(
       1. new naming with shared-factor suffix   (canonical)
       2. new naming without shared-factor suffix (fallback when sf was added later)
       3. legacy naming: no order prefix          (pre-{order}D era)
+
+    For decomposition="cp" the order fragment becomes 'CP{order}D' and there
+    is no legacy fallback (no CP artifacts predate this naming), so the list
+    is just [new] (+ [new_no_sf] when a shared-factor suffix applies).
     """
     p   = _prefix(name)
     sf  = _sf(shared_factors, order)
     ss  = _ss(subsample_frac)
     d   = dim_spec_str(dim)
     r0  = _r0(rank)
+    ot  = _order_tag(order, decomposition)
 
-    new        = f"{p}{divergence}_{method}_{order}D_{d}d{sf}_{r0}r{ss}_"
-    new_no_sf  = f"{p}{divergence}_{method}_{order}D_{d}d_{r0}r{ss}_"
+    new        = f"{p}{divergence}_{method}_{ot}_{d}d{sf}_{r0}r{ss}_"
+    new_no_sf  = f"{p}{divergence}_{method}_{ot}_{d}d_{r0}r{ss}_"
     legacy     = f"{p}{divergence}_{method}_{d}d_{r0}r_"
 
     # When sf is empty, new == new_no_sf; deduplicate.
     stems = [new]
     if sf:
         stems.append(new_no_sf)
-    stems.append(legacy)
+    if decomposition != "cp":
+        stems.append(legacy)
     return stems
 
 
