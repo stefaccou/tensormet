@@ -288,6 +288,30 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="CP only: CP-APR inner iterations per mode per sweep (default 1).")
     parser.add_argument("--cp-scooch-kappa", type=float, dest="cp_scooch_kappa", default=None,
                         help="CP only: CP-APR 'scooch' nudge for inadmissible zeros (default 0 = off).")
+    # EXPERIMENTAL (experimental/SGD/README.md): torch minibatch SGD solver.
+    parser.add_argument("--solver", type=str, default=None,
+                        choices=["mu", "sgd"],
+                        help="Optimizer family: 'mu' (default, multiplicative updates) or 'sgd' "
+                             "(EXPERIMENTAL torch minibatch Adam/SGD; Tucker only). One loop "
+                             "iteration = --sgd-steps-per-iteration optimizer steps, so all "
+                             "iteration-based knobs keep their meaning.")
+    parser.add_argument("--sgd-lr", type=float, dest="sgd_lr", default=None,
+                        help="SGD only: learning rate (default 1e-2; loss is normalized by "
+                             "sum(X) / ||X||^2 so it transfers across datasets).")
+    parser.add_argument("--sgd-batch-size", type=int, dest="sgd_batch_size", default=None,
+                        help="SGD only: NNZ entries per optimizer step (default 4096).")
+    parser.add_argument("--sgd-optimizer", type=str, dest="sgd_optimizer", default=None,
+                        choices=["adam", "sgd"],
+                        help="SGD only: torch optimizer (default adam).")
+    parser.add_argument("--sgd-parametrization", type=str, dest="sgd_parametrization", default=None,
+                        choices=["softplus", "clamp"],
+                        help="SGD only: non-negativity via softplus reparametrization (default) "
+                             "or clamp+projection (apples-to-apples with MU's clip).")
+    parser.add_argument("--sgd-steps-per-iteration", type=int, dest="sgd_steps_per_iteration", default=None,
+                        help="SGD only: optimizer steps per loop iteration (default 100).")
+    parser.add_argument("--sgd-warm-start", type=str, dest="sgd_warm_start", default=None,
+                        help="SGD only: path to an MU model .pt used as init (warm start; "
+                             "optimizer state starts fresh, unlike --resume).")
 
     # Eval-level args
     parser.add_argument("--rec-check-every", type=int, dest="rec_check_every", default=None)
@@ -337,7 +361,9 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     for field in ("dataset", "method", "order", "divergence", "dim", "name",
                   "random_state", "epsilon", "init", "normalize_factors",
                   "shared_factors", "subsample_frac", "max_nnz", "objective",
-                  "decomposition", "cp_inner_iters", "cp_scooch_kappa"):
+                  "decomposition", "cp_inner_iters", "cp_scooch_kappa",
+                  "solver", "sgd_lr", "sgd_batch_size", "sgd_optimizer",
+                  "sgd_parametrization", "sgd_steps_per_iteration", "sgd_warm_start"):
         v = parsed_dict.get(field, None)
         if v is not None:
             exp_kwargs[field] = v

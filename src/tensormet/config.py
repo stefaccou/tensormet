@@ -173,6 +173,25 @@ class ExperimentConfig:
     #                      off; the ε-clip already prevents exact zeros).
     cp_inner_iters: int = 1
     cp_scooch_kappa: float = 0.0
+    # EXPERIMENTAL (reviews/ + experimental/SGD/README.md): which optimizer
+    # family fits the model. "mu" (default) is the existing multiplicative-update
+    # pipeline, unchanged; "sgd" routes to the torch minibatch trainer in
+    # experimental/SGD/ (Tucker only for now). Orthogonal to `decomposition`.
+    # Validated at unpack time in the loop.
+    solver: str = "mu"
+    # SGD-only knobs (ignored for solver="mu"). One loop "iteration" is a block
+    # of sgd_steps_per_iteration optimizer steps, so every iteration-based knob
+    # (n_iter_max, rec/sem_check_every, checkpoint_saving_steps, patience, ...)
+    # keeps its meaning at block granularity.
+    sgd_lr: float = 1e-2
+    sgd_batch_size: int = 4096
+    sgd_optimizer: str = "adam"            # "adam" | "sgd"
+    sgd_parametrization: str = "softplus"  # "softplus" | "clamp"
+    sgd_steps_per_iteration: int = 100
+    # Path to an MU model .pt used as INIT (warm start). Distinct from resume:
+    # optimizer state starts fresh and the step counter starts at 0. Part of the
+    # resume-compatibility identity because it changes the whole trajectory.
+    sgd_warm_start: Optional[str] = None
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -227,6 +246,7 @@ class RunConfig:
             subsample_frac=self.exp.subsample_frac,
             max_nnz=getattr(self.exp, "max_nnz", None),
             decomposition=getattr(self.exp, "decomposition", "tucker"),
+            solver=getattr(self.exp, "solver", "mu"),
         )
 
     def model_path(self) -> Path:
@@ -301,6 +321,7 @@ class RunConfig:
             subsample_frac=self.exp.subsample_frac,
             max_nnz=getattr(self.exp, "max_nnz", None),
             decomposition=getattr(self.exp, "decomposition", "tucker"),
+            solver=getattr(self.exp, "solver", "mu"),
         )
 
         # Find all JSON config files: new (with sf) → new (without sf) → legacy
@@ -360,7 +381,28 @@ class RunConfig:
                     # Old configs predating max_nnz fall back to off; 0 and None
                     # are the same identity (ceiling disabled) by design.
                     int(old_exp.get("max_nnz") or 0) ==
-                    int(getattr(self.exp, "max_nnz", None) or 0)
+                    int(getattr(self.exp, "max_nnz", None) or 0) and
+                    # Correctness-critical, like decomposition: an SGD run must
+                    # never resume an MU checkpoint (payloads differ) and vice
+                    # versa. The sgd_* knobs are part of the identity because
+                    # batches and optimizer moments are a pure function of
+                    # (seed, step, batch_size, lr, ...): splicing streams with
+                    # different values would silently change the trajectory.
+                    # All compared with defaults so pre-existing configs work.
+                    old_exp.get("solver", "mu") ==
+                    getattr(self.exp, "solver", "mu") and
+                    float(old_exp.get("sgd_lr", 1e-2)) ==
+                    float(getattr(self.exp, "sgd_lr", 1e-2)) and
+                    int(old_exp.get("sgd_batch_size", 4096)) ==
+                    int(getattr(self.exp, "sgd_batch_size", 4096)) and
+                    old_exp.get("sgd_optimizer", "adam") ==
+                    getattr(self.exp, "sgd_optimizer", "adam") and
+                    old_exp.get("sgd_parametrization", "softplus") ==
+                    getattr(self.exp, "sgd_parametrization", "softplus") and
+                    int(old_exp.get("sgd_steps_per_iteration", 100)) ==
+                    int(getattr(self.exp, "sgd_steps_per_iteration", 100)) and
+                    (old_exp.get("sgd_warm_start") or None) ==
+                    (getattr(self.exp, "sgd_warm_start", None) or None)
             )
 
             print(old_exp.get("dataset"), self.exp.dataset, "\t",
@@ -485,6 +527,7 @@ class InspectionConfig:
     shared_factors: Set[Tuple[int, int]] = field(default_factory=lambda: {(1, 2)})
     subsample_frac: float = 0.25
     max_nnz: Optional[int] = None
+    solver: str = "mu"
 
     def _norm_dim(self):
         return tuple(int(x) for x in self.dim.split("-")) if isinstance(self.dim, str) else self.dim
@@ -500,6 +543,7 @@ class InspectionConfig:
               rank=(self.rank,) * self.order,
               subsample_frac=self.subsample_frac,
               max_nnz=self.max_nnz,
+              solver=self.solver,
               shared_factors=self._norm_sf(),
             ),
             train=TrainingConfig(
@@ -537,6 +581,7 @@ class InspectionConfig:
             shared_factors=self.shared_factors,
             subsample_frac=self.subsample_frac,
             max_nnz=self.max_nnz,
+            solver=self.solver,
             iterations=self.iters,
             rank=self.rank,
             map_location=map_location,

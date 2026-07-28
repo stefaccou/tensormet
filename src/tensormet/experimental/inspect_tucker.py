@@ -3,7 +3,10 @@
 Three layers, smallest to largest:
 
 * **loading**  -- :func:`load_metrics` / :func:`load_vocab` parse a run's log
-  into (iters, rec_error, sem_dicts).
+  into (iters, rec_error, sem_dicts). :func:`resume_chain` expands one config
+  into the log segments a resumed run is split across (a resumed run's own log
+  holds only the tail), and :func:`describe_run` prints what a config resolves
+  to when a curve looks wrong.
 * **plotting** -- :func:`plot_metrics` (one run) and :func:`compare_metrics`
   (any number of runs overlaid) turn those into matplotlib figures.
 * **UI**       -- :func:`make_run_browser` scans the ``decomposition/`` directory
@@ -24,7 +27,7 @@ import datetime as _dt
 import json
 import pickle
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import random
 import numpy as np
@@ -65,22 +68,44 @@ def _read_log(cfg):
     return iters, rec, sem
 
 
+def _monotonic(iters, rec, sem):
+    """Sort a parsed series by iteration and drop duplicate iterations.
+
+    Two things make a raw parse non-monotonic, and a line plot of a
+    non-monotonic x doubles back on itself instead of reading left-to-right:
+
+    * ``tee_output`` opens the log in append mode (utils.py), so relaunching an
+      identical config writes a second pass into the same file with iteration
+      numbers restarting from 1;
+    * concatenated resume segments are only ordered if their files were.
+
+    Duplicated iterations keep their **last** occurrence (the most recent pass).
+    ``average_runs`` also depends on this: ``np.interp`` silently returns
+    nonsense when its ``xp`` is not increasing.
+    """
+    by_iter = {}
+    for it, r, s in zip(iters, rec, sem):
+        by_iter[it] = (r, s)
+    order = sorted(by_iter)
+    return (order,
+            [by_iter[i][0] for i in order],
+            [by_iter[i][1] for i in order])
+
+
 def load_metrics(*cfgs):
     """Parse one or more run logs into (iters, rec_error, sem_dicts).
 
     A single config yields its own three lists; several configs are
-    concatenated (useful for resumed runs split across files).
+    concatenated (useful for resumed runs split across files). The result is
+    always sorted by iteration and de-duplicated (see :func:`_monotonic`).
     """
-    if len(cfgs) == 1:
-        return _read_log(cfgs[0])
-
     all_iters, all_rec, all_sem = [], [], []
     for cfg in cfgs:
         iters, rec, sem = _read_log(cfg)
         all_iters.extend(iters)
         all_rec.extend(rec)
         all_sem.extend(sem)
-    return all_iters, all_rec, all_sem
+    return _monotonic(all_iters, all_rec, all_sem)
 
 
 def load_vocab(cfg):
@@ -89,12 +114,13 @@ def load_vocab(cfg):
         return pickle.load(f)
 
 
-def average_runs(configs, n_grid=500):
+def average_runs(configs, n_grid=500, stitch=True):
     """Average rec_error and semantic metrics across multiple runs.
 
     ``configs`` is a list of configs (or a dict whose values are configs); each
     may also be a list/tuple of resume-chain segments as accepted by
-    :func:`load_metrics`. Runs whose log file does not exist are silently skipped.
+    :func:`load_metrics`; a lone config is expanded into its chain unless
+    ``stitch`` is off. Runs whose log file does not exist are silently skipped.
 
     Metrics are interpolated onto a shared integer grid that spans the iteration
     range *common to all runs* (clipped at the shortest run), then averaged
@@ -106,6 +132,8 @@ def average_runs(configs, n_grid=500):
     loaded = []
     for cfg in raw_configs:
         segs = _as_run(cfg)
+        if stitch and len(segs) == 1:
+            segs = resume_chain(segs[0])
         try:
             loaded.append(load_metrics(*segs))
         except FileNotFoundError:
@@ -146,12 +174,19 @@ def average_runs(configs, n_grid=500):
 # === plotting ==========================================================
 
 def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
-                 plot_rec_error=True, title="", ax=None):
+                 plot_rec_error=True, title="", ax=None, stitch=True):
     """Plot reconstruction error and/or semantic scores for one run.
 
     Pass ``ax`` to draw into an existing axis (a twin axis is created
     internally for the score curves). Returns the figure.
+
+    With ``stitch`` (the default), a single config is expanded into its resume
+    chain via :func:`resume_chain`, so a run that was resumed to a higher
+    ``n_iter_max`` plots from iteration 0 rather than from where the resume
+    began. Pass ``stitch=False`` to plot exactly the segment(s) given.
     """
+    if stitch and len(cfgs) == 1:
+        cfgs = resume_chain(cfgs[0])
     all_its, all_rec, all_sem = load_metrics(*cfgs)
 
     ax1 = ax or plt.subplots()[1]
@@ -210,6 +245,101 @@ def _as_run(run):
     return tuple(run) if isinstance(run, (list, tuple)) else (run,)
 
 
+# Model stems end in "_{n_iter_max}i"; everything before it is the structural
+# identity a run shares with its own resume segments (see naming.model_stem).
+_ITERS_STEM_RE = re.compile(r"_(\d+)i$")
+
+
+def _chain_prefix(stem):
+    """Stem with its trailing ``_{iters}i`` removed — the resume-chain identity."""
+    return _ITERS_STEM_RE.sub("", stem)
+
+
+def resume_chain(cfg):
+    """Expand one config into its resume chain: earlier segments, then ``cfg``.
+
+    A run resumed to a higher ``n_iter_max`` lands in a *new* log file that holds
+    only the resumed tail — ``get_resume_state`` restarts the loop at
+    ``start_iteration=latest_iter``, so that file's first line is (say) iteration
+    251, not 1. Loading it alone therefore plots a curve that begins mid-axis.
+
+    This scans the run's decomposition directory for sibling logs whose stem
+    differs only in the iteration count and returns every segment with
+    ``iters <= cfg.iters``, ascending — exactly the stitching the interactive
+    browser does. Returns ``(cfg,)`` unchanged when nothing else is on disk, so
+    it is always safe to call.
+    """
+    insp = cfg.insp if isinstance(cfg, RunRef) else cfg
+    try:
+        stem, log_path = cfg.stem, cfg.log_path
+    except Exception:                      # duck-typed object without both
+        return (cfg,)
+
+    def _seg_insp(n):
+        # Segments only need their log path (taken from disk below); the insp is
+        # carried for callers that want load_tucker on an earlier checkpoint.
+        try:
+            return replace(insp, iters=n)
+        except TypeError:                  # not a dataclass — keep the original
+            return insp
+
+    m = _ITERS_STEM_RE.search(stem)
+    if m is None:                          # legacy stem: no iteration token
+        return (cfg,)
+    prefix, iters = _chain_prefix(stem), int(m.group(1))
+
+    segments = []
+    for path in log_path.parent.glob(f"{prefix}_*i_log.txt"):
+        seg_stem = path.name[: -len("_log.txt")]
+        seg_m = _ITERS_STEM_RE.search(seg_stem)
+        # Guard the glob's "*": only stems differing *purely* in the iteration
+        # count belong to the chain (e.g. "..._100r_0p1ss_2000mn_500i" shares the
+        # prefix but is a different run).
+        if seg_m is None or _chain_prefix(seg_stem) != prefix:
+            continue
+        n = int(seg_m.group(1))
+        if n > iters:
+            continue
+        segments.append((n, RunRef(seg_stem, path, seg_stem, _seg_insp(n))))
+
+    if not segments:
+        return (cfg,)
+    segments.sort(key=lambda s: s[0])
+    # Keep the caller's own object as the final segment so titles/labels that
+    # read `run[-1]` keep reporting exactly what was passed in.
+    return tuple(ref for n, ref in segments if n < iters) + (cfg,)
+
+
+def describe_run(cfg):
+    """Print what a config actually loads — the check for a suspect curve.
+
+    Reports the resume segments found on disk and, per segment, the raw
+    iteration span plus the two defects :func:`load_metrics` now repairs:
+    a span that does not start near 0 (a resumed tail loaded on its own) and
+    repeated iteration numbers (an appended relaunch). Returns the chain.
+    """
+    chain = resume_chain(cfg)
+    print(f"{len(chain)} segment(s) for {cfg.stem}:")
+    for seg in chain:
+        try:
+            its, _rec, _sem = _read_log(seg)
+        except FileNotFoundError:
+            print(f"  {seg.stem}: MISSING LOG ({seg.log_path})")
+            continue
+        if not its:
+            print(f"  {seg.stem}: no parsable metric lines")
+            continue
+        dup = len(its) - len(set(its))
+        flags = []
+        if its[0] > min(50, max(its) * 0.1):
+            flags.append(f"starts at {its[0]} (resumed tail)")
+        if dup:
+            flags.append(f"{dup} duplicate iteration(s) (log appended)")
+        note = ("  <- " + "; ".join(flags)) if flags else ""
+        print(f"  {seg.stem}: {len(its)} points, iters {min(its)}..{max(its)}{note}")
+    return chain
+
+
 def _is_preloaded(run):
     """Return True if *run* is already a (iters, rec, sem) triple from average_runs."""
     return (isinstance(run, tuple) and len(run) == 3
@@ -219,7 +349,7 @@ def _is_preloaded(run):
 
 def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
                     plot_rec_error=True, title="Training Metrics Comparison",
-                    ax=None, clip_common=False, color_by=None):
+                    ax=None, clip_common=False, color_by=None, stitch=True):
     """Overlay any number of runs on a shared figure.
 
     ``configs`` is the list of runs to plot and ``labels`` a parallel list of
@@ -247,6 +377,13 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
     With ``clip_common`` set, the x-axis is capped at the last iteration shared by
     every run (the smallest of their final iterations), so short and long runs are
     compared over their common range instead of being squashed.
+
+    With ``stitch`` (the default), a run given as a *single* config is expanded
+    into its resume chain via :func:`resume_chain` — a resumed run's own log
+    holds only the tail, so without this its curve starts wherever the resume
+    began instead of at 0, and runs resumed different numbers of times don't
+    share an x-range. Runs passed as an explicit list of segments are left alone.
+    Pass ``stitch=False`` to plot exactly what was given.
     """
     if isinstance(configs, dict):
         if labels is None:
@@ -254,6 +391,9 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
         configs = list(configs.values())
 
     runs = [c if _is_preloaded(c) else _as_run(c) for c in configs]
+    if stitch:
+        runs = [resume_chain(r[0]) if (not _is_preloaded(r) and len(r) == 1) else r
+                for r in runs]
     if labels is None:
         labels = [None] * len(runs)
     labels = [str(lbl) if lbl is not None
@@ -362,6 +502,10 @@ _MN_STEM_RE = re.compile(r"_(\d+)mn(?=_|$)")
 # Tucker stems carry the bare "..._3D_..." tag instead.
 _DECOMP_STEM_RE = re.compile(r"_CP\d+D(?=_|$)")
 
+# "..._SGD3D_..." marks the experimental SGD solver (naming._order_tag with
+# solver="sgd"); MU stems carry no solver tag.
+_SOLVER_STEM_RE = re.compile(r"_SGD(?:CP)?\d+D(?=_|$)")
+
 
 def _ss_from_stem(stem):
     """Recover subsample_frac from a run's filename stem, or None if absent."""
@@ -383,6 +527,13 @@ def _decomp_from_stem(stem):
     naming._order_tag) — so the stem is the authoritative fallback.
     """
     return "cp" if _DECOMP_STEM_RE.search(stem) else "tucker"
+
+
+def _solver_from_stem(stem):
+    """Recover the solver ("sgd" or "mu") from a run's stem — the SGD{order}D
+    tag (naming._order_tag) is the authoritative fallback for snapshots that
+    predate the ``solver`` config field."""
+    return "sgd" if _SOLVER_STEM_RE.search(stem) else "mu"
 
 
 def _sf_from_stem(stem):
@@ -449,18 +600,22 @@ def _discover_one(dataset, data_dir):
         # Snapshots predating the CP feature lack "decomposition"; fall back to
         # the "CP{order}D" stem tag (naming._order_tag).
         decomposition = exp.get("decomposition") or _decomp_from_stem(stem)
+        solver = exp.get("solver") or _solver_from_stem(stem)
 
         insp = InspectionConfig(
             dim=dim, name=exp.get("name"), dataset=exp.get("dataset", dataset),
             method=exp.get("method", "siiSoftPlus"), divergence=exp.get("divergence", "kl"),
             order=exp.get("order", 3), iters=iters, rank=rank0,
             shared_factors=sf, subsample_frac=ss, max_nnz=(mn or None),
+            solver=solver,
         )
         # InspectionConfig has no declared "decomposition" field (it predates the
         # CP feature); duck-type it on like RunRef does for legacy-named runs, so
         # downstream label/facet code can read it uniformly off `insp`.
         insp.decomposition = decomposition
         decomp_tag = "" if decomposition == "tucker" else f"[{decomposition.upper()}] "
+        if solver == "sgd":
+            decomp_tag = f"[SGD] {decomp_tag}"
         log_path = decomp_dir / f"{stem}_log.txt"
         yield {
             "stem": stem,
@@ -769,14 +924,18 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
             fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
             try:
                 # a[-1] is the representative (latest) segment — used for titles/labels.
+                # stitch=False: the A/B options are already resolved to chains (or
+                # deliberately to a single segment when the checkbox is unticked),
+                # so the plot functions must not re-expand them.
                 if b is None:
                     plot_metrics(*a, sem_keys=keys, plot_rec_error=rec_chk.value,
-                                 title=a[-1].stem, ax=ax)
+                                 title=a[-1].stem, ax=ax, stitch=False)
                 else:
                     shared, (la, lb) = _diff_labels([a[-1].insp, b[-1].insp])
                     compare_metrics([list(a), list(b)], [la, lb],
                                     sem_keys=keys, plot_rec_error=rec_chk.value,
-                                    title=shared, ax=ax, clip_common=clip_chk.value)
+                                    title=shared, ax=ax, clip_common=clip_chk.value,
+                                    stitch=False)
             except FileNotFoundError as e:
                 plt.close(fig)
                 state["fig"] = None

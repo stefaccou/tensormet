@@ -75,11 +75,15 @@ def _r0(rank: _Rank) -> int:
     return rank[0] if rank else 0
 
 
-def _order_tag(order: int, decomposition: str = "tucker") -> str:
-    """Order fragment of the model stem: '{order}D' for Tucker (unchanged,
+def _order_tag(order: int, decomposition: str = "tucker", solver: str = "mu") -> str:
+    """Order fragment of the model stem: '{order}D' for MU Tucker (unchanged,
     keeps every existing filename byte-identical), 'CP{order}D' for the
-    experimental CP family so the two artifact families never collide."""
-    return f"CP{order}D" if decomposition == "cp" else f"{order}D"
+    experimental CP family, 'SGD{order}D' for the experimental SGD solver, so
+    the artifact families never collide (an SGD run can therefore never scan up
+    MU checkpoints on resume, and vice versa). 'SGDCP' is reserved but the
+    combination is rejected at fit time."""
+    base = f"CP{order}D" if decomposition == "cp" else f"{order}D"
+    return f"SGD{base}" if solver == "sgd" else base
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +103,11 @@ def model_stem(
     subsample_frac: float = 1.0,
     max_nnz: Optional[int] = None,
     decomposition: str = "tucker",
+    solver: str = "mu",
 ) -> str:
     """Return the model filename stem (without .pt extension)."""
     return (
-        f"{_prefix(name)}{divergence}_{method}_{_order_tag(order, decomposition)}_"
+        f"{_prefix(name)}{divergence}_{method}_{_order_tag(order, decomposition, solver)}_"
         f"{dim_spec_str(dim)}d{_sf(shared_factors, order)}_"
         f"{_r0(rank)}r{_ss(subsample_frac)}{_mn(max_nnz)}_{n_iter_max}i"
     )
@@ -121,12 +126,13 @@ def model_filename(
     subsample_frac: float = 1.0,
     max_nnz: Optional[int] = None,
     decomposition: str = "tucker",
+    solver: str = "mu",
 ) -> str:
     """Return the full model filename (e.g. 'fr_siiSoftPlus_3D_1000d_100r_300i.pt')."""
     return model_stem(
         divergence, method, order, dim, rank, n_iter_max,
         name=name, shared_factors=shared_factors, subsample_frac=subsample_frac,
-        max_nnz=max_nnz, decomposition=decomposition,
+        max_nnz=max_nnz, decomposition=decomposition, solver=solver,
     ) + ".pt"
 
 
@@ -142,6 +148,7 @@ def candidate_stems(
     subsample_frac: float = 1.0,
     max_nnz: Optional[int] = None,
     decomposition: str = "tucker",
+    solver: str = "mu",
 ) -> list[str]:
     """
     Return filename prefixes in descending priority order for directory scans.
@@ -155,7 +162,8 @@ def candidate_stems(
 
     For decomposition="cp" the order fragment becomes 'CP{order}D' and there
     is no legacy fallback (no CP artifacts predate this naming), so the list
-    is just [new] (+ [new_no_sf] when a shared-factor suffix applies).
+    is just [new] (+ [new_no_sf] when a shared-factor suffix applies). The same
+    applies to solver="sgd" ('SGD{order}D' fragment, no legacy fallback).
     """
     p   = _prefix(name)
     sf  = _sf(shared_factors, order)
@@ -163,7 +171,7 @@ def candidate_stems(
     mn  = _mn(max_nnz)
     d   = dim_spec_str(dim)
     r0  = _r0(rank)
-    ot  = _order_tag(order, decomposition)
+    ot  = _order_tag(order, decomposition, solver)
 
     new        = f"{p}{divergence}_{method}_{ot}_{d}d{sf}_{r0}r{ss}{mn}_"
     new_no_sf  = f"{p}{divergence}_{method}_{ot}_{d}d_{r0}r{ss}{mn}_"
@@ -173,7 +181,7 @@ def candidate_stems(
     stems = [new]
     if sf:
         stems.append(new_no_sf)
-    if decomposition != "cp":
+    if decomposition != "cp" and solver != "sgd":
         stems.append(legacy)
     return stems
 

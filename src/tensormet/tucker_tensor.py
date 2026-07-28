@@ -64,6 +64,17 @@ from tensormet.sharded_sparse import (
 import time
 
 cp, cpx_sparse = make_lazy_cupy_pair()
+
+
+def _as_host(x):
+    """Host-side value for save/eval sites shared by the MU (CuPy) and SGD
+    (torch/numpy) solver paths. Never touches the lazy `cp` for non-CuPy input,
+    so torch-only environments stay CuPy-free."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    if isinstance(x, (np.ndarray, np.generic, float, int)) or x is None:
+        return x
+    return cp.asnumpy(x)
 # Maps tensor role names to SimLex-999 POS tags (first match per POS wins)
 _SIMLEX_POS_MAP = {
     "root": "V", "verb": "V",
@@ -141,6 +152,7 @@ class TuckerDecomposition:
                        tier1: bool=False,
                        subsample_frac: float=1.0,
                        max_nnz: Optional[int]=None,
+                       solver: str="mu",
                           ) -> "TuckerDecomposition":
 
         """Loads a precomputed tucker decomposition from disk.
@@ -202,7 +214,7 @@ class TuckerDecomposition:
         stems = candidate_stems(
             divergence, method, order, dims, rank,
             name=name, shared_factors=parsed_shared, subsample_frac=subsample_frac,
-            max_nnz=max_nnz,
+            max_nnz=max_nnz, solver=solver,
         )
         new_file_prefix      = stems[0]
         new_file_prefix_no_sf = stems[1] if len(stems) > 2 else stems[0]
@@ -1291,6 +1303,20 @@ class SparseTupleTensor:
                 raise ValueError(
                     f"cfg.exp.decomposition must be 'tucker' or 'cp'; got {decomposition!r}"
                 )
+            # EXPERIMENTAL SGD solver (experimental/SGD/README.md). getattr for
+            # the same deserialized-config back-compat reason as above; the
+            # default reproduces the MU pipeline exactly.
+            solver = getattr(cfg.exp, "solver", "mu")
+            sgd_lr = getattr(cfg.exp, "sgd_lr", 1e-2)
+            sgd_batch_size = getattr(cfg.exp, "sgd_batch_size", 4096)
+            sgd_optimizer = getattr(cfg.exp, "sgd_optimizer", "adam")
+            sgd_parametrization = getattr(cfg.exp, "sgd_parametrization", "softplus")
+            sgd_steps_per_iteration = getattr(cfg.exp, "sgd_steps_per_iteration", 100)
+            sgd_warm_start = getattr(cfg.exp, "sgd_warm_start", None)
+            if solver not in ("mu", "sgd"):
+                raise ValueError(
+                    f"cfg.exp.solver must be 'mu' or 'sgd'; got {solver!r}"
+                )
 
             rec_check_every = cfg.eval.rec_check_every
             sem_check_every = cfg.eval.sem_check_every
@@ -1325,8 +1351,49 @@ class SparseTupleTensor:
 
         if not isinstance(self, SparseTupleTensor):
             raise TypeError("sparse_tensor must be a SparseTupleTensor instance.")
-        if not self.sparsity_type == "cupy":
+        _is_sgd = solver == "sgd"
+        if _is_sgd:
+            # The SGD trainer is torch-native; the tensor from load_from_disk is
+            # already a torch sparse COO, so no CuPy conversion ever happens.
+            if not self.sparsity_type == "torch":
+                raise ValueError("solver='sgd' needs sparsity_type 'torch' "
+                                 f"(got {self.sparsity_type!r}); skip tensor_to_sparse('cupy').")
+        elif not self.sparsity_type == "cupy":
             raise ValueError("sparse_tensor must have sparsity_type 'cupy'.")
+
+        # --- EXPERIMENTAL SGD guard rails: reject MU-only knobs whose semantics
+        # don't carry over to a minibatch solver (reinterpretation is deferred).
+        if _is_sgd:
+            if decomposition == "cp":
+                raise NotImplementedError(
+                    "solver='sgd' with decomposition='cp' is not implemented "
+                    "(experimental/SGD/README.md, deferred). Use decomposition='tucker'."
+                )
+            if getattr(cfg.exp, "subsample_frac", 1.0) < 1.0:
+                raise ValueError(
+                    "solver='sgd' is already minibatch; subsample_frac < 1.0 has no "
+                    "meaning there. Use --sgd-batch-size instead."
+                )
+            if getattr(cfg.exp, "max_nnz", None):
+                raise ValueError(
+                    "solver='sgd' does not support max_nnz (MU per-step NNZ ceiling). "
+                    "Use --sgd-batch-size instead."
+                )
+            if isinstance(init, str) and "svd" in init:
+                raise ValueError(
+                    "solver='sgd' does not support SVD init (CuPy routine). Use "
+                    "--init random or --sgd-warm-start <MU model .pt>."
+                )
+            if normalize_factors:
+                raise ValueError(
+                    "solver='sgd' does not support normalize_factors=True (scaling "
+                    "lives in the softplus/clamp parametrization)."
+                )
+            if largedim:
+                raise ValueError(
+                    "solver='sgd' does not use the largedim kernel family; "
+                    "drop --largedim."
+                )
 
         # --- EXPERIMENTAL CP swap points -----------------------------------
         # When decomposition == "cp", the `core` variable below holds the CP
@@ -1379,7 +1446,28 @@ class SparseTupleTensor:
         # NOTE (Task 6): the routing size decision is centralised in
         # needs_largedim(dim, ...) (see _largedim_selected below); no local
         # max(shape) threshold variable is needed here anymore.
-        if checkpoint_tensor is not None:
+        # SGD checkpoints are dict payloads carrying optimizer state alongside
+        # the (core, factors) views; they are consumed by the trainer below,
+        # never by the CuPy init path. Cross-solver loads are impossible by
+        # construction (distinct SGD{order}D stems + the solver resume key),
+        # but keep the payload check as a last line of defense.
+        _sgd_resume_payload = None
+        if _is_sgd and checkpoint_tensor is not None:
+            if not (isinstance(checkpoint_tensor, dict)
+                    and checkpoint_tensor.get("solver") == "sgd"):
+                raise ValueError(
+                    "solver='sgd' found a non-SGD checkpoint payload; refusing to "
+                    "resume from it (MU/CP checkpoints carry no optimizer state)."
+                )
+            _sgd_resume_payload = checkpoint_tensor
+            checkpoint_tensor = None
+
+        if _is_sgd:
+            # Init (random or warm start) lives inside SGDTrainer; `core` and
+            # `factors` stay undefined on this path — every downstream consumer
+            # goes through _sgd_trainer.materialize() instead.
+            core = factors = None
+        elif checkpoint_tensor is not None:
             if isinstance(checkpoint_tensor, tuple):
                 # if TensorLy TuckerTensor / plain (core|weights, factors) tuple
                 ckpt_core, ckpt_factors = checkpoint_tensor
@@ -1419,7 +1507,9 @@ class SparseTupleTensor:
         _max_nnz = int(getattr(cfg.exp, "max_nnz", None) or 0)
         if _max_nnz < 0:
             raise ValueError(f"cfg.exp.max_nnz must be >= 0, got {_max_nnz}")
-        _full_nnz = int(self.tensor.tocoo().row.size)
+        # .tocoo() is CuPy-only; the SGD path holds a torch sparse COO.
+        _full_nnz = (int(self.tensor._nnz()) if _is_sgd
+                     else int(self.tensor.tocoo().row.size))
         if _max_nnz and _full_nnz > _max_nnz:
             _subsample_frac = min(_subsample_frac, _max_nnz / _full_nnz)
             print(f"max_nnz={_max_nnz}: effective subsample_frac -> "
@@ -1464,7 +1554,42 @@ class SparseTupleTensor:
                 "(CP_IMPLEMENTATION_PLAN.md Phase 5). Use n_gpus=1."
             )
 
-        if _n_gpus > 1:
+        # --- EXPERIMENTAL SGD trainer construction ---
+        _sgd_trainer = None
+        if _is_sgd:
+            _sgd_init = init
+            if _sgd_resume_payload is None and sgd_warm_start:
+                # Warm start (init from an MU model artifact) is distinct from
+                # resume: parameters start at the MU solution but the optimizer
+                # state and step counter start fresh. The artifact is a plain
+                # CPU-numpy TuckerTensor (tuple-unpackable); accept a
+                # TuckerDecomposition payload's .core/.factors as a fallback.
+                _ws = torch.load(sgd_warm_start, map_location="cpu", weights_only=False)
+                try:
+                    _ws_core, _ws_factors = _ws
+                except (TypeError, ValueError):
+                    _ws_core, _ws_factors = _ws.core, _ws.factors
+                _sgd_init = (_ws_core, _ws_factors)
+                print(f"SGD warm start from {sgd_warm_start}")
+            _sgd_kwargs = dict(
+                rank=rank, divergence=divergence, objective=objective,
+                lr=sgd_lr, batch_size=sgd_batch_size, optimizer=sgd_optimizer,
+                parametrization=sgd_parametrization,
+                shared_factors=self.shared_factors, init=_sgd_init,
+                random_state=random_state,
+                steps_per_iteration=sgd_steps_per_iteration, epsilon=epsilon,
+                resume_payload=_sgd_resume_payload,
+            )
+            if _n_gpus > 1:
+                from tensormet.experimental.SGD.sharded_sgd import ShardedSGDTrainer
+                _sgd_trainer = ShardedSGDTrainer(
+                    self.tensor, device_ids=list(range(_n_gpus)), **_sgd_kwargs
+                )
+            else:
+                from tensormet.experimental.SGD.sgd_trainer import SGDTrainer
+                _sgd_trainer = SGDTrainer(self.tensor, **_sgd_kwargs)
+
+        if _n_gpus > 1 and not _is_sgd:
             _sst = ShardedSparseTensor.from_coo(
                 self.tensor, shape, device_ids=list(range(_n_gpus)),
                 subsample_frac=_subsample_frac, masked=masked,
@@ -1510,7 +1635,7 @@ class SparseTupleTensor:
         _grouping_cache = (
             NNZGroupingCache(self.tensor, shape)
             if (_sst is None and _subsample_frac >= 1.0 and _factor_is_largedim
-                and not _is_cp)
+                and not _is_cp and not _is_sgd)
             else None
         )
 
@@ -1529,7 +1654,7 @@ class SparseTupleTensor:
         _largedim_batches = (
             precompute_largedim_batches(core, factors, modes, masked=masked, nnz_live=_nnz_live)
             if (divergence == "kl" and _sst is None and _factor_is_largedim
-                and not _is_cp)
+                and not _is_cp and not _is_sgd)
             else None
         )
 
@@ -1551,8 +1676,13 @@ class SparseTupleTensor:
         # below if semantics improve past the resumed best_sem_score. If semantics never
         # improve during this run, the "best" tensor returned is just the latest checkpoint,
         # labeled with the resumed score.
-        best_core = core.copy()
-        best_factors = [f.copy() for f in factors]
+        if _is_sgd:
+            # Host-numpy snapshots (the SGD path never holds CuPy arrays); the
+            # save sites below handle numpy transparently via _as_host.
+            best_core, best_factors = _sgd_trainer.materialize()
+        else:
+            best_core = core.copy()
+            best_factors = [f.copy() for f in factors]
         best_sem_iteration = start_iteration if start_iteration > 0 else None
 
         # Decide once which semantic metric drives patience/diff.
@@ -1601,8 +1731,13 @@ class SparseTupleTensor:
                 f"accounts for its (model-dependent) GPU footprint from the first iteration."
             )
             # Return CuPy's cached-but-unused blocks to the driver so torch gets
-            # real headroom, then load the model before the loop begins.
-            if _sst is not None:
+            # real headroom, then load the model before the loop begins. The SGD
+            # path never allocates through CuPy; its equivalent is torch's own
+            # caching allocator, which the judge shares anyway.
+            if _is_sgd:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            elif _sst is not None:
                 _sst.trim_pools()
             else:
                 cp.get_default_memory_pool().free_all_blocks()
@@ -1613,7 +1748,10 @@ class SparseTupleTensor:
         # CHANGED (2026-06-12 review, Task 6): announce the routing family chosen by
         # the unified needs_largedim() predicate. Sharding engages iff largedim does
         # (and n_gpus > 1), so the three cases below are mutually exclusive.
-        if _sst is not None and _largedim_selected:
+        if _is_sgd:
+            _selected_path = (f"sgd (torch, sharded×{_n_gpus})" if _n_gpus > 1
+                              else "sgd (torch)")
+        elif _sst is not None and _largedim_selected:
             _selected_path = f"sharded×{_n_gpus}"
         elif _largedim_selected:
             _selected_path = "largedim"
@@ -1661,136 +1799,147 @@ class SparseTupleTensor:
             if time_iteration:
                 start_time = time.time()
             log_step = get_log_step(iteration, rec_log_every, rec_check_every)
-            routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step,
-                                              largedim=largedim, masked=masked,
-                                              decomposition=decomposition,
-                                              cp_inner_iters=cp_inner_iters,
-                                              cp_scooch_kappa=cp_scooch_kappa)
-            # --- multi-GPU routing override (largedim variants only) ---
-            # CHANGED (2026-06-12 review, Task 6): gate on the same needs_largedim()
-            # predicate as routing (via _largedim_selected) instead of re-deriving
-            # divergence-specific 4000 literals. Sharding now engages iff the
-            # largedim path is selected and a shard set exists (n_gpus > 1).
-            if _sst is not None and _largedim_selected:
-                if divergence == "kl":
-                    routing = UpdateRouting(
-                        factor_update=make_sharded_kl_factor_update(_sst),
-                        core_update=make_sharded_kl_core_update(_sst),
-                        error_fn=make_sharded_kl_compute_errors(_sst) if log_step else null_compute_errors,
-                        core_returns_error=routing.core_returns_error,
-                    )
-                elif divergence == "fr":
-                    routing = UpdateRouting(
-                        factor_update=make_sharded_fr_factor_update(_sst),
-                        core_update=make_sharded_fr_core_update(_sst),
-                        error_fn=make_sharded_fr_compute_errors(_sst) if log_step else null_compute_errors,
-                        core_returns_error=False,  # sharded core update never returns (core, error)
-                    )
-            # --- stochastic tensor selection ---
-            if _sst is not None:
-                _sst.set_iter_seed(iteration)
-            _use_subsample = (
-                _subsample_frac < 1.0
-                and iteration >= _subsample_warmup
-                and _sst is None   # multi-GPU handles sampling internally
-            )
-            _current_tensor = (
-                _iter_sampler.sample(iteration)
-                if _use_subsample else self.tensor
-            )
-            # --- factors ---
-            for mode in modes:
-                _factor_kwargs = dict(
-                    vec_tensor=_current_tensor,
-                    core=core,
-                    factors=factors,
-                    mode=mode,
-                    shape=shape,
-                    thread_budget=thread_budget,
-                    epsilon=epsilon,
-                    verbose=verbose,
-                )
-                # CHANGED (2026-06-12 review, Task 3): hand the largedim factor
-                # kernel its cached per-mode grouping (built lazily on first use)
-                # so it skips the decode/unique/scan. Only set when the cache is
-                # active (single-GPU largedim, no subsampling); the SST path caches
-                # internally and other kernels never receive this kwarg.
-                if _grouping_cache is not None:
-                    _factor_kwargs["grouping"] = _grouping_cache.get(mode)
-                # Precomputed col-batch size (largedim KL factor kernel only);
-                # skips the per-update _estimate_batch_cols_for_Z + pool flush.
-                if _largedim_batches is not None:
-                    _factor_kwargs["batch_cols"] = _largedim_batches["batch_cols"][mode]
-                factors[mode] = routing.factor_update(**_factor_kwargs)
-
-                # new: factor linking
-                if mode in linked_factors:
-                    for other in linked_factors[mode]:
-                        factors[other] = factors[mode]
-
-            # --- core + error ---
-            if routing.core_returns_error:
-                # FR: combined core update + error in one call.
-                # CHANGED (2026-06-12 review, Task 5 — I-1): feed the FULL tensor,
-                # not the subsampled/rescaled _current_tensor. This call only fires
-                # on log steps (routing sets core_returns_error = True*log_step), so
-                # the fused error portion (norm_X², ⟨X,X̂⟩) is unbiased; the core MU
-                # step it also performs is then the exact full-NNZ update that step.
-                core, rel_err = routing.core_update(
-                    vec_tensor=self.tensor,
-                    shape=shape,
-                    core=core,
-                    factors=factors,
-                    modes=modes,
-                    thread_budget=thread_budget,  # we always pass it, even if not needed, to ensure consistency
-                    epsilon=epsilon,
-                    verbose=verbose
-                )
+            if _is_sgd:
+                # --- EXPERIMENTAL SGD solver (experimental/SGD/README.md) ---
+                # One iteration = a block of sgd_steps_per_iteration optimizer
+                # steps run inside the trainer (torch-native; Adam moments, raw
+                # softplus params and the global step counter live there — state
+                # the UpdateRouting seam cannot express, hence this branch).
+                # On log steps it returns the exact full-NNZ relative error with
+                # the same normalization as the MU error kernels, so everything
+                # downstream (patience, logging, checkpointing) is shared.
+                rel_err = _sgd_trainer.run_block(iteration, log_step)
             else:
-                # KL: core update, then compute error separately
-                _core_kwargs = dict(
-                    vec_tensor=_current_tensor,
-                    shape=shape,
-                    core=core,
-                    factors=factors,
-                    modes=modes,
-                    thread_budget=thread_budget,
-                    epsilon=epsilon,
-                    verbose=verbose,
+                routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step,
+                                                  largedim=largedim, masked=masked,
+                                                  decomposition=decomposition,
+                                                  cp_inner_iters=cp_inner_iters,
+                                                  cp_scooch_kappa=cp_scooch_kappa)
+                # --- multi-GPU routing override (largedim variants only) ---
+                # CHANGED (2026-06-12 review, Task 6): gate on the same needs_largedim()
+                # predicate as routing (via _largedim_selected) instead of re-deriving
+                # divergence-specific 4000 literals. Sharding now engages iff the
+                # largedim path is selected and a shard set exists (n_gpus > 1).
+                if _sst is not None and _largedim_selected:
+                    if divergence == "kl":
+                        routing = UpdateRouting(
+                            factor_update=make_sharded_kl_factor_update(_sst),
+                            core_update=make_sharded_kl_core_update(_sst),
+                            error_fn=make_sharded_kl_compute_errors(_sst) if log_step else null_compute_errors,
+                            core_returns_error=routing.core_returns_error,
+                        )
+                    elif divergence == "fr":
+                        routing = UpdateRouting(
+                            factor_update=make_sharded_fr_factor_update(_sst),
+                            core_update=make_sharded_fr_core_update(_sst),
+                            error_fn=make_sharded_fr_compute_errors(_sst) if log_step else null_compute_errors,
+                            core_returns_error=False,  # sharded core update never returns (core, error)
+                        )
+                # --- stochastic tensor selection ---
+                if _sst is not None:
+                    _sst.set_iter_seed(iteration)
+                _use_subsample = (
+                    _subsample_frac < 1.0
+                    and iteration >= _subsample_warmup
+                    and _sst is None   # multi-GPU handles sampling internally
                 )
-                # Precomputed NNZ-batch sizes (largedim KL core kernel only);
-                # skips the per-update _estimate_batch_* + pool flush.
-                if _largedim_batches is not None:
-                    _core_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
-                    _core_kwargs["batch_num"] = _largedim_batches["batch_num"]
-                core = routing.core_update(**_core_kwargs)
+                _current_tensor = (
+                    _iter_sampler.sample(iteration)
+                    if _use_subsample else self.tensor
+                )
+                # --- factors ---
+                for mode in modes:
+                    _factor_kwargs = dict(
+                        vec_tensor=_current_tensor,
+                        core=core,
+                        factors=factors,
+                        mode=mode,
+                        shape=shape,
+                        thread_budget=thread_budget,
+                        epsilon=epsilon,
+                        verbose=verbose,
+                    )
+                    # CHANGED (2026-06-12 review, Task 3): hand the largedim factor
+                    # kernel its cached per-mode grouping (built lazily on first use)
+                    # so it skips the decode/unique/scan. Only set when the cache is
+                    # active (single-GPU largedim, no subsampling); the SST path caches
+                    # internally and other kernels never receive this kwarg.
+                    if _grouping_cache is not None:
+                        _factor_kwargs["grouping"] = _grouping_cache.get(mode)
+                    # Precomputed col-batch size (largedim KL factor kernel only);
+                    # skips the per-update _estimate_batch_cols_for_Z + pool flush.
+                    if _largedim_batches is not None:
+                        _factor_kwargs["batch_cols"] = _largedim_batches["batch_cols"][mode]
+                    factors[mode] = routing.factor_update(**_factor_kwargs)
 
-                # CHANGED (2026-06-12 review, Task 5 — I-1): the KL error runs on
-                # the FULL tensor, not the subsampled/rescaled _current_tensor.
-                # x·log(x/r), the sum_R_nz zero-correction, and ‖X‖ are nonlinear
-                # in the rescaled values, so a subsampled error is biased by frac.
-                # error_fn only does real work on log steps (else null_compute_errors),
-                # so full-NNZ evaluation is cheap. The core update above keeps using
-                # _current_tensor (its MU numerator is linear → 1/frac-unbiased).
-                _err_kwargs = dict(
-                    vec_tensor=self.tensor,
-                    shape=shape,
-                    core=core,
-                    factors=factors,
-                    thread_budget=thread_budget,
-                    epsilon=epsilon,
-                    verbose=verbose,
-                )
-                # Only the real largedim error fn accepts batch_rhat; on non-log
-                # steps error_fn is null_compute_errors (no such kwarg).
-                if _largedim_batches is not None and log_step:
-                    _err_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
-                rel_err = routing.error_fn(**_err_kwargs)
-            # Normalize if desired (Tucker only: the CP kernels already keep the
-            # factors column-normalized with the scale absorbed into λ —
-            # cp_normalize semantics are built into every factor update).
-            if normalize_factors and not _is_cp:
-                core, factors = tucker_normalize((core, factors))
+                    # new: factor linking
+                    if mode in linked_factors:
+                        for other in linked_factors[mode]:
+                            factors[other] = factors[mode]
+
+                # --- core + error ---
+                if routing.core_returns_error:
+                    # FR: combined core update + error in one call.
+                    # CHANGED (2026-06-12 review, Task 5 — I-1): feed the FULL tensor,
+                    # not the subsampled/rescaled _current_tensor. This call only fires
+                    # on log steps (routing sets core_returns_error = True*log_step), so
+                    # the fused error portion (norm_X², ⟨X,X̂⟩) is unbiased; the core MU
+                    # step it also performs is then the exact full-NNZ update that step.
+                    core, rel_err = routing.core_update(
+                        vec_tensor=self.tensor,
+                        shape=shape,
+                        core=core,
+                        factors=factors,
+                        modes=modes,
+                        thread_budget=thread_budget,  # we always pass it, even if not needed, to ensure consistency
+                        epsilon=epsilon,
+                        verbose=verbose
+                    )
+                else:
+                    # KL: core update, then compute error separately
+                    _core_kwargs = dict(
+                        vec_tensor=_current_tensor,
+                        shape=shape,
+                        core=core,
+                        factors=factors,
+                        modes=modes,
+                        thread_budget=thread_budget,
+                        epsilon=epsilon,
+                        verbose=verbose,
+                    )
+                    # Precomputed NNZ-batch sizes (largedim KL core kernel only);
+                    # skips the per-update _estimate_batch_* + pool flush.
+                    if _largedim_batches is not None:
+                        _core_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
+                        _core_kwargs["batch_num"] = _largedim_batches["batch_num"]
+                    core = routing.core_update(**_core_kwargs)
+
+                    # CHANGED (2026-06-12 review, Task 5 — I-1): the KL error runs on
+                    # the FULL tensor, not the subsampled/rescaled _current_tensor.
+                    # x·log(x/r), the sum_R_nz zero-correction, and ‖X‖ are nonlinear
+                    # in the rescaled values, so a subsampled error is biased by frac.
+                    # error_fn only does real work on log steps (else null_compute_errors),
+                    # so full-NNZ evaluation is cheap. The core update above keeps using
+                    # _current_tensor (its MU numerator is linear → 1/frac-unbiased).
+                    _err_kwargs = dict(
+                        vec_tensor=self.tensor,
+                        shape=shape,
+                        core=core,
+                        factors=factors,
+                        thread_budget=thread_budget,
+                        epsilon=epsilon,
+                        verbose=verbose,
+                    )
+                    # Only the real largedim error fn accepts batch_rhat; on non-log
+                    # steps error_fn is null_compute_errors (no such kwarg).
+                    if _largedim_batches is not None and log_step:
+                        _err_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
+                    rel_err = routing.error_fn(**_err_kwargs)
+                # Normalize if desired (Tucker only: the CP kernels already keep the
+                # factors column-normalized with the scale absorbed into λ —
+                # cp_normalize semantics are built into every factor update).
+                if normalize_factors and not _is_cp:
+                    core, factors = tucker_normalize((core, factors))
 
             if log_step:
                 rec_errors.append(rel_err)
@@ -1847,9 +1996,16 @@ class SparseTupleTensor:
             )
 
             if do_sem_check:
+                # The SGD path already runs on the pytorch backend; for MU this
+                # flips cupy -> pytorch for the eval stack (restored below).
                 tl.set_backend("pytorch")
-                core_cpu = tl.tensor(cp.asnumpy(core))
-                factors_cpu = [tl.tensor(cp.asnumpy(f)) for f in factors]
+                if _is_sgd:
+                    _sem_core_np, _sem_factors_np = _sgd_trainer.materialize()
+                    core_cpu = tl.tensor(_sem_core_np)
+                    factors_cpu = [tl.tensor(f) for f in _sem_factors_np]
+                else:
+                    core_cpu = tl.tensor(cp.asnumpy(core))
+                    factors_cpu = [tl.tensor(cp.asnumpy(f)) for f in factors]
                 roles = extract_roles_from_vocab(vocab)
                 if _is_cp:
                     # CPDecomposition implements the same eval contract
@@ -1923,7 +2079,10 @@ class SparseTupleTensor:
                         # room for the judge's activations even though CuPy itself
                         # has nothing live. Trim the pools right before scoring so the
                         # freed decomposition memory is actually available to torch.
-                        if _sst is not None:
+                        if _is_sgd:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        elif _sst is not None:
                             _sst.trim_pools()
                         else:
                             cp.get_default_memory_pool().free_all_blocks()
@@ -1999,15 +2158,21 @@ class SparseTupleTensor:
                         f"Sem_all: {sem_all_dump}"
                     )
 
-                tl.set_backend("cupy")
+                if not _is_sgd:
+                    tl.set_backend("cupy")
 
                 if _sem_value_available:
                     # track best semantic model (based on primary key)
                     diff = sem_value - float(best_sem_score)
                     if diff > 0:
                         best_sem_score = sem_value
-                        best_core = core.copy()
-                        best_factors = [factor.copy() for factor in factors]
+                        if _is_sgd:
+                            # already-materialized host snapshots from this check
+                            best_core = _sem_core_np
+                            best_factors = list(_sem_factors_np)
+                        else:
+                            best_core = core.copy()
+                            best_factors = [factor.copy() for factor in factors]
                         best_sem_iteration = iteration
                         if verbose:
                             print("New best semantic score; saving current best core and factors.")
@@ -2016,14 +2181,25 @@ class SparseTupleTensor:
                             # pickled CuPy arrays can only be loaded where CuPy +
                             # a GPU are available, and this file is what
                             # judge_eval/inspect_tucker later load on CPU.
-                            temp_tensor = _Container(
-                                (cp.asnumpy(best_core),
-                                 [cp.asnumpy(factor) for factor in best_factors])
-                            )
+                            if _is_sgd:
+                                # tensorly validates the container against the
+                                # ACTIVE backend; on the SGD path that is
+                                # "pytorch", whose ndim() rejects numpy — wrap
+                                # the host snapshots in CPU torch tensors
+                                # (zero-copy, still loads fine on CPU boxes).
+                                temp_tensor = _Container(
+                                    (torch.as_tensor(best_core),
+                                     [torch.as_tensor(f) for f in best_factors])
+                                )
+                            else:
+                                temp_tensor = _Container(
+                                    (_as_host(best_core),
+                                     [_as_host(factor) for factor in best_factors])
+                                )
                             torch.save(temp_tensor, paths["model"])
                             print("saving temp model to", paths["model"])
 
-                            np.save(paths["errors"], np.array([cp.asnumpy(e) for e in rec_errors]))
+                            np.save(paths["errors"], np.array([_as_host(e) for e in rec_errors]))
 
                             # Save semantic scores more robustly
                             if isinstance(sem_out, dict):
@@ -2054,7 +2230,14 @@ class SparseTupleTensor:
             if checkpoint_saving: # only trigger if this is not 0 -> True
                 if (iteration + 1) % cfg.train.checkpoint_saving_steps == 0:
                     print(f"saving model at iteration {iteration}")
-                    checkpoint_tensor = _Container((cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors]))
+                    if _is_sgd:
+                        # Dict payload: (core, factors) views for tooling that
+                        # peeks, plus raw params + optimizer state so resume
+                        # continues the exact trajectory (batches replay from
+                        # the step counter; see SGDTrainer).
+                        checkpoint_tensor = _sgd_trainer.checkpoint_payload(iteration + 1)
+                    else:
+                        checkpoint_tensor = _Container((cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors]))
                     paths = cfg.artifact_paths()
                     torch.save(checkpoint_tensor, paths["checkpoint_dir"] / f"{iteration + 1}.pt")
                     # Durably mirror this checkpoint to GPFS so a walltime kill stays resumable.
@@ -2087,7 +2270,10 @@ class SparseTupleTensor:
             # Reclaims transient eval/copy blocks so out-of-pool cuBLAS/cuSPARSE
             # workspaces keep their headroom. Deliberately NOT per iteration.
             if pool_trim_every and (iteration + 1) % pool_trim_every == 0:
-                if _sst is not None:
+                if _is_sgd:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                elif _sst is not None:
                     _sst.trim_pools()
                 else:
                     cp.get_default_memory_pool().free_all_blocks()
@@ -2103,12 +2289,15 @@ class SparseTupleTensor:
                 print(f"Saving resumable checkpoint at iteration {iteration} before stopping...")
                 try:
                     os.makedirs(paths["checkpoint_dir"], exist_ok=True)
-                    checkpoint_tensor = _Container(
-                        (cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors])
-                    )
+                    if _is_sgd:
+                        checkpoint_tensor = _sgd_trainer.checkpoint_payload(iteration + 1)
+                    else:
+                        checkpoint_tensor = _Container(
+                            (cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors])
+                        )
                     ckpt_path = paths["checkpoint_dir"] / f"{iteration + 1}.pt"
                     torch.save(checkpoint_tensor, ckpt_path)
-                    np.save(paths["errors"], np.array([cp.asnumpy(e) for e in rec_errors]))
+                    np.save(paths["errors"], np.array([_as_host(e) for e in rec_errors]))
                     if fitness_scores:
                         if isinstance(fitness_scores[-1], dict):
                             with open(paths["fitness_json"], "w") as f:
@@ -2132,8 +2321,22 @@ class SparseTupleTensor:
             signal.signal(signal.SIGINT, _original_sigint)
 
         if best_sem_iteration is not None:
-            tensor = _Container((best_core, best_factors))
+            if _is_sgd:
+                # numpy snapshots + pytorch backend: see the temp-save note.
+                tensor = _Container(
+                    (torch.as_tensor(best_core),
+                     [torch.as_tensor(f) for f in best_factors])
+                )
+            else:
+                tensor = _Container((best_core, best_factors))
             iteration = best_sem_iteration
+        elif _is_sgd:
+            # `core`/`factors` are never bound on the SGD path.
+            _fin_core, _fin_factors = _sgd_trainer.materialize()
+            tensor = _Container(
+                (torch.as_tensor(_fin_core),
+                 [torch.as_tensor(f) for f in _fin_factors])
+            )
         else:
             tensor = _Container((core, factors))
         if return_errors == "simple":

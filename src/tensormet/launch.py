@@ -212,15 +212,23 @@ def launch_nnt_decomposition(cfg):
 
     # load in GPU sensitive modules only AFTER device has been set!
     import torch
-    print(f"[{time.strftime('%H:%M:%S')}] importing cupy...", flush=True)
-    import cupy as cp
+    _is_sgd = getattr(cfg.exp, "solver", "mu") == "sgd"
+    if _is_sgd:
+        # The SGD solver is torch-native end to end: no CuPy import, and the
+        # tensorly backend stays "pytorch" for the whole run (the MU loop's
+        # cupy<->pytorch flips are solver-gated inside the loop).
+        cp = None
+        print(f"[{time.strftime('%H:%M:%S')}] solver=sgd: skipping cupy import", flush=True)
+    else:
+        print(f"[{time.strftime('%H:%M:%S')}] importing cupy...", flush=True)
+        import cupy as cp
     print(f"[{time.strftime('%H:%M:%S')}] importing tucker_tensor...", flush=True)
-    from tensormet.tucker_tensor import SparseTupleTensor
+    from tensormet.tucker_tensor import SparseTupleTensor, _as_host
     print(f"[{time.strftime('%H:%M:%S')}] importing similarity...", flush=True)
     from tensormet.similarity import load_eval_sentences_cached_parquet, ensure_vocab
     print(f"[{time.strftime('%H:%M:%S')}] all deferred imports done", flush=True)
 
-    tl.set_backend("cupy")
+    tl.set_backend("pytorch" if _is_sgd else "cupy")
 
     # we load the sample sentences only once
 
@@ -320,7 +328,9 @@ def launch_nnt_decomposition(cfg):
 
     try:
         with tee_output(paths["log"]):
-            sparse_tensor.tensor_to_sparse("cupy")
+            if not _is_sgd:
+                # SGD trains straight on the torch COO from load_from_disk.
+                sparse_tensor.tensor_to_sparse("cupy")
             tucker_decomp_info = sparse_tensor.non_negative_tucker_with_similarity(
                 cfg=cfg,
                 thread_budget=thread_budget,
@@ -340,8 +350,8 @@ def launch_nnt_decomposition(cfg):
         errors = tucker_decomp_info["errors"]
         fitness_scores = tucker_decomp_info["fitness_scores"]
 
-        core_t = tl.tensor(cp.asnumpy(core))
-        factors_t = [tl.tensor(cp.asnumpy(f)) for f in factors]
+        core_t = tl.tensor(_as_host(core))
+        factors_t = [tl.tensor(_as_host(f)) for f in factors]
         _decomposition = getattr(cfg.exp, "decomposition", "tucker")
         if _decomposition == "cp":
             from tensorly.cp_tensor import CPTensor
@@ -358,7 +368,7 @@ def launch_nnt_decomposition(cfg):
                 with open(paths["fitness_json"], "w") as f:
                     json.dump(fitness_scores, f, indent=2)
             else:
-                np.save(paths["fitness"], np.array([cp.asnumpy(f) for f in fitness_scores]))
+                np.save(paths["fitness"], np.array([_as_host(f) for f in fitness_scores]))
 
         # Persist timings next to the other per-run artifacts so downstream
         # tooling (e.g. scripts/benchmarking.sh) can report a decomposition time
