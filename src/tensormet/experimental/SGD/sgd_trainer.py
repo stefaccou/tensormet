@@ -20,6 +20,14 @@ would have seen.
 Unlike the MU kernels this trainer carries state the UpdateRouting seam cannot
 express (Adam moments, raw pre-softplus parameters, the step counter), which
 is why the loop branches on the solver instead of routing kernels.
+
+The step body itself lives in ``sgd_tucker.GradStepper``, shared verbatim with
+``sharded_sgd.ShardedSGDTrainer`` (which runs one per device behind a
+collective). Single-GPU runs therefore get micro-batching — required for
+order 4 / rank 100 to fit at all — and the opt-in CUDA-graph capture that
+addresses the dispatch-bound order-3 regime, without a second implementation.
+Note the one constraint that follows: parameter ``.grad``s are views into the
+stepper's flat buffer, so nothing here may call ``zero_grad(set_to_none=True)``.
 """
 from __future__ import annotations
 
@@ -31,8 +39,8 @@ import torch
 from tensormet.experimental.SGD.sgd_tucker import (
     _EPS,
     EntryBatcher,
+    GradStepper,
     SGDTuckerModel,
-    _batch_loss,
     full_relative_error,
 )
 
@@ -59,6 +67,8 @@ class SGDTrainer:
         device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float32,
         eval_chunk: Optional[int] = None,
+        micro_batch: Optional[int] = None,
+        cuda_graph: bool = False,
         resume_payload: Optional[dict] = None,
     ):
         if objective not in ("full", "masked"):
@@ -109,6 +119,17 @@ class SGDTrainer:
         else:
             raise ValueError(f"optimizer must be 'adam' or 'sgd', got {optimizer!r}")
 
+        # The step body (micro-batching, the flat gradient buffer, the optional
+        # captured graph) is the same object the sharded trainer runs per
+        # device; only the collective around it differs.
+        self.stepper = GradStepper(
+            self.model, self.indices, self.values, self.batcher,
+            scale=self.scale, divergence=self.divergence, masked=self.masked,
+            norm_const=self.norm_const, include_zero_term=True,
+            micro_batch=micro_batch, cuda_graph=cuda_graph, eps=epsilon,
+        )
+        self.micro_batch = self.stepper.micro_batch
+
         if resume_payload is not None:
             self.load_payload(resume_payload)
 
@@ -119,20 +140,26 @@ class SGDTrainer:
         the exact relative error over all nnz on log steps, else None."""
         k = self.steps_per_iteration
         for step in range(iteration * k, (iteration + 1) * k):
-            sel = self.batcher.batch(step)
-            idx = self.indices[:, sel]
-            x = self.values[sel]
-
-            self.opt.zero_grad(set_to_none=True)
-            x_hat = self.model.predict_entries(idx)
-            loss = _batch_loss(self.model, x, x_hat, self.scale,
-                               self.divergence, self.masked) / self.norm_const
-            loss.backward()
+            self.stepper.compute_grads(step)
             self.opt.step()
             self.model.project_()
 
         if not log_step:
             return None
+        return self._full_relative_error()
+
+    def sync(self) -> None:
+        """Block until the device is idle.
+
+        ``run_block`` returns with work still queued on non-log steps, so a
+        benchmark timing it must call this around the timed region — otherwise
+        it attributes one block's kernels to the next block's wall clock.
+        Mirrors ``ShardedSGDTrainer.sync``.
+        """
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _full_relative_error(self) -> float:
         return full_relative_error(
             self.model, self.indices, self.values, self.divergence,
             masked=self.masked, chunk=self.eval_chunk,

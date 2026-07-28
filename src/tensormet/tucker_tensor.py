@@ -1293,16 +1293,7 @@ class SparseTupleTensor:
             epsilon = cfg.exp.epsilon
             normalize_factors = cfg.exp.normalize_factors
             objective = getattr(cfg.exp, "objective", "full")
-            # EXPERIMENTAL CP support (reviews/CP_IMPLEMENTATION_PLAN.md).
-            # getattr so configs deserialized from before these fields existed
-            # keep working; the default reproduces the Tucker pipeline exactly.
-            decomposition = getattr(cfg.exp, "decomposition", "tucker")
-            cp_inner_iters = getattr(cfg.exp, "cp_inner_iters", 1)
-            cp_scooch_kappa = getattr(cfg.exp, "cp_scooch_kappa", 0.0)
-            if decomposition not in ("tucker", "cp"):
-                raise ValueError(
-                    f"cfg.exp.decomposition must be 'tucker' or 'cp'; got {decomposition!r}"
-                )
+
             # EXPERIMENTAL SGD solver (experimental/SGD/README.md). getattr for
             # the same deserialized-config back-compat reason as above; the
             # default reproduces the MU pipeline exactly.
@@ -1313,6 +1304,11 @@ class SparseTupleTensor:
             sgd_parametrization = getattr(cfg.exp, "sgd_parametrization", "softplus")
             sgd_steps_per_iteration = getattr(cfg.exp, "sgd_steps_per_iteration", 100)
             sgd_warm_start = getattr(cfg.exp, "sgd_warm_start", None)
+            sgd_batch_scope = getattr(cfg.exp, "sgd_batch_scope", "per_device")
+            sgd_sync_every = getattr(cfg.exp, "sgd_sync_every", 1)
+            sgd_micro_batch = getattr(cfg.exp, "sgd_micro_batch", None)
+            sgd_cuda_graph = getattr(cfg.exp, "sgd_cuda_graph", False)
+            sgd_comm_backend = getattr(cfg.exp, "sgd_comm_backend", "auto")
             if solver not in ("mu", "sgd"):
                 raise ValueError(
                     f"cfg.exp.solver must be 'mu' or 'sgd'; got {solver!r}"
@@ -1364,11 +1360,6 @@ class SparseTupleTensor:
         # --- EXPERIMENTAL SGD guard rails: reject MU-only knobs whose semantics
         # don't carry over to a minibatch solver (reinterpretation is deferred).
         if _is_sgd:
-            if decomposition == "cp":
-                raise NotImplementedError(
-                    "solver='sgd' with decomposition='cp' is not implemented "
-                    "(experimental/SGD/README.md, deferred). Use decomposition='tucker'."
-                )
             if getattr(cfg.exp, "subsample_frac", 1.0) < 1.0:
                 raise ValueError(
                     "solver='sgd' is already minibatch; subsample_frac < 1.0 has no "
@@ -1395,17 +1386,6 @@ class SparseTupleTensor:
                     "drop --largedim."
                 )
 
-        # --- EXPERIMENTAL CP swap points -----------------------------------
-        # When decomposition == "cp", the `core` variable below holds the CP
-        # weight vector λ (R,) — the CP kernels accept it through the same
-        # UpdateRouting seam, so this 750-line loop is reused, not forked.
-        # Checkpoints/best/final containers become tensorly CPTensor payloads.
-        _is_cp = decomposition == "cp"
-        if _is_cp:
-            from tensorly.cp_tensor import CPTensor as _Container
-        else:
-            _Container = TuckerTensor
-
         paths = cfg.artifact_paths()
 
         # Under HPC mode `paths` resolve to node-local $TMPDIR. mirror_paths is the
@@ -1427,22 +1407,8 @@ class SparseTupleTensor:
         checkpoint_tensor = resume_state.get("checkpoint_tensor", None)
 
         shape = tuple(self.shape)
-        if _is_cp:
-            # CP uses a single rank R (no per-mode core dimensions). Accept the
-            # config's per-mode tuple only when uniform.
-            from tensorly.cp_tensor import validate_cp_rank
-            if isinstance(rank, (list, tuple)):
-                if len(set(rank)) > 1:
-                    raise ValueError(
-                        f"CP decomposition uses a single rank; got per-mode ranks {tuple(rank)}. "
-                        f"Pass a uniform --rank."
-                    )
-                rank = rank[0]
-            rank = validate_cp_rank(shape, rank=int(rank))
-            modes = list(range(len(shape)))
-        else:
-            rank = validate_tucker_rank(shape, rank=rank)
-            modes = list(range(len(rank)))
+        rank = validate_tucker_rank(shape, rank=rank)
+        modes = list(range(len(rank)))
         # NOTE (Task 6): the routing size decision is centralised in
         # needs_largedim(dim, ...) (see _largedim_selected below); no local
         # max(shape) threshold variable is needed here anymore.
@@ -1457,7 +1423,7 @@ class SparseTupleTensor:
                     and checkpoint_tensor.get("solver") == "sgd"):
                 raise ValueError(
                     "solver='sgd' found a non-SGD checkpoint payload; refusing to "
-                    "resume from it (MU/CP checkpoints carry no optimizer state)."
+                    "resume from it (MU checkpoints carry no optimizer state)."
                 )
             _sgd_resume_payload = checkpoint_tensor
             checkpoint_tensor = None
@@ -1469,10 +1435,7 @@ class SparseTupleTensor:
             core = factors = None
         elif checkpoint_tensor is not None:
             if isinstance(checkpoint_tensor, tuple):
-                # if TensorLy TuckerTensor / plain (core|weights, factors) tuple
-                ckpt_core, ckpt_factors = checkpoint_tensor
-            elif _is_cp:
-                # tensorly CPTensor payload: iterable as (weights, factors)
+                # if TensorLy TuckerTensor / plain (core, factors) tuple
                 ckpt_core, ckpt_factors = checkpoint_tensor
             else:
                 # if our TuckerDecomposition class
@@ -1480,13 +1443,6 @@ class SparseTupleTensor:
 
             core = cp.asarray(ckpt_core)
             factors = [cp.asarray(factor) for factor in ckpt_factors]
-        elif _is_cp:
-            from tensormet.experimental.CP.cp_ops import initialize_nonnegative_cp
-            # `core` = λ weight vector; see the CP swap-points note above.
-            core, factors = initialize_nonnegative_cp(
-                self.tensor, shape, rank, modes, init, random_state,
-                thread_budget=thread_budget, divergence=divergence, epsilon=epsilon,
-            )
         else:
             core, factors = initialize_nonnegative_tucker(self.tensor, shape, rank, modes, init,
                                                            random_state, thread_budget=thread_budget)
@@ -1541,19 +1497,6 @@ class SparseTupleTensor:
                 "Use subsample_frac=1.0 and max_nnz=0 on a single GPU."
             )
 
-        # --- CP guard rails (plan Phase 2): explicit rejections for paths the
-        # experimental CP family does not implement yet (both are Phase-5 work).
-        if _is_cp and masked:
-            raise NotImplementedError(
-                "decomposition='cp' does not support objective='masked' yet "
-                "(CP_IMPLEMENTATION_PLAN.md §1.8 / Phase 5). Use objective='full'."
-            )
-        if _is_cp and _n_gpus > 1:
-            raise NotImplementedError(
-                "decomposition='cp' does not support the multi-GPU sharded path yet "
-                "(CP_IMPLEMENTATION_PLAN.md Phase 5). Use n_gpus=1."
-            )
-
         # --- EXPERIMENTAL SGD trainer construction ---
         _sgd_trainer = None
         if _is_sgd:
@@ -1578,12 +1521,17 @@ class SparseTupleTensor:
                 shared_factors=self.shared_factors, init=_sgd_init,
                 random_state=random_state,
                 steps_per_iteration=sgd_steps_per_iteration, epsilon=epsilon,
+                micro_batch=sgd_micro_batch, cuda_graph=sgd_cuda_graph,
                 resume_payload=_sgd_resume_payload,
             )
             if _n_gpus > 1:
                 from tensormet.experimental.SGD.sharded_sgd import ShardedSGDTrainer
                 _sgd_trainer = ShardedSGDTrainer(
-                    self.tensor, device_ids=list(range(_n_gpus)), **_sgd_kwargs
+                    self.tensor, device_ids=list(range(_n_gpus)),
+                    # Multi-GPU-only knobs; the single-GPU trainer has no
+                    # collective, no batch scope and no sync cadence.
+                    batch_scope=sgd_batch_scope, sync_every=sgd_sync_every,
+                    comm_backend=sgd_comm_backend, **_sgd_kwargs
                 )
             else:
                 from tensormet.experimental.SGD.sgd_trainer import SGDTrainer
@@ -1628,14 +1576,10 @@ class SparseTupleTensor:
         # literals that could disagree with routing for FR dims in (3000, 4000]).
         _largedim_selected = needs_largedim(dim, largedim=largedim, masked=masked)
         _factor_is_largedim = _largedim_selected
-        # CP note: the grouping cache and the precomputed largedim batch sizes
-        # below are Tucker-largedim-kernel optimizations; the CP kernels stream
-        # NNZ directly (no column grouping, own batch estimator), so both stay
-        # None for CP and their kwargs are never injected into _factor_kwargs.
         _grouping_cache = (
             NNZGroupingCache(self.tensor, shape)
             if (_sst is None and _subsample_frac >= 1.0 and _factor_is_largedim
-                and not _is_cp and not _is_sgd)
+                and not _is_sgd)
             else None
         )
 
@@ -1654,7 +1598,7 @@ class SparseTupleTensor:
         _largedim_batches = (
             precompute_largedim_batches(core, factors, modes, masked=masked, nnz_live=_nnz_live)
             if (divergence == "kl" and _sst is None and _factor_is_largedim
-                and not _is_cp and not _is_sgd)
+                and not _is_sgd)
             else None
         )
 
@@ -1811,10 +1755,7 @@ class SparseTupleTensor:
                 rel_err = _sgd_trainer.run_block(iteration, log_step)
             else:
                 routing = get_update_routing_step(divergence=divergence, dim=dim, log_step=log_step,
-                                                  largedim=largedim, masked=masked,
-                                                  decomposition=decomposition,
-                                                  cp_inner_iters=cp_inner_iters,
-                                                  cp_scooch_kappa=cp_scooch_kappa)
+                                                  largedim=largedim, masked=masked)
                 # --- multi-GPU routing override (largedim variants only) ---
                 # CHANGED (2026-06-12 review, Task 6): gate on the same needs_largedim()
                 # predicate as routing (via _largedim_selected) instead of re-deriving
@@ -1935,10 +1876,7 @@ class SparseTupleTensor:
                     if _largedim_batches is not None and log_step:
                         _err_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
                     rel_err = routing.error_fn(**_err_kwargs)
-                # Normalize if desired (Tucker only: the CP kernels already keep the
-                # factors column-normalized with the scale absorbed into λ —
-                # cp_normalize semantics are built into every factor update).
-                if normalize_factors and not _is_cp:
+                if normalize_factors:
                     core, factors = tucker_normalize((core, factors))
 
             if log_step:
@@ -2007,15 +1945,7 @@ class SparseTupleTensor:
                     core_cpu = tl.tensor(cp.asnumpy(core))
                     factors_cpu = [tl.tensor(cp.asnumpy(f)) for f in factors]
                 roles = extract_roles_from_vocab(vocab)
-                if _is_cp:
-                    # CPDecomposition implements the same eval contract
-                    # (batch_excluded_role_vector, judge/SimLex accessors), so
-                    # everything downstream of this variable stays unchanged.
-                    from tensormet.experimental.CP.cp_decomposition import CPDecomposition
-                    tucker_decomp = CPDecomposition(weights=core_cpu, factors=factors_cpu,
-                                                    vocab=vocab, roles=roles)
-                else:
-                    tucker_decomp = TuckerDecomposition(core=core_cpu, factors=factors_cpu, vocab=vocab, roles=roles)
+                tucker_decomp = TuckerDecomposition(core=core_cpu, factors=factors_cpu, vocab=vocab, roles=roles)
 
                 sem_out = evaluate_sample(
                     tucker_decomp,
@@ -2187,12 +2117,12 @@ class SparseTupleTensor:
                                 # "pytorch", whose ndim() rejects numpy — wrap
                                 # the host snapshots in CPU torch tensors
                                 # (zero-copy, still loads fine on CPU boxes).
-                                temp_tensor = _Container(
+                                temp_tensor = TuckerTensor(
                                     (torch.as_tensor(best_core),
                                      [torch.as_tensor(f) for f in best_factors])
                                 )
                             else:
-                                temp_tensor = _Container(
+                                temp_tensor = TuckerTensor(
                                     (_as_host(best_core),
                                      [_as_host(factor) for factor in best_factors])
                                 )
@@ -2237,7 +2167,7 @@ class SparseTupleTensor:
                         # the step counter; see SGDTrainer).
                         checkpoint_tensor = _sgd_trainer.checkpoint_payload(iteration + 1)
                     else:
-                        checkpoint_tensor = _Container((cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors]))
+                        checkpoint_tensor = TuckerTensor((cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors]))
                     paths = cfg.artifact_paths()
                     torch.save(checkpoint_tensor, paths["checkpoint_dir"] / f"{iteration + 1}.pt")
                     # Durably mirror this checkpoint to GPFS so a walltime kill stays resumable.
@@ -2292,7 +2222,7 @@ class SparseTupleTensor:
                     if _is_sgd:
                         checkpoint_tensor = _sgd_trainer.checkpoint_payload(iteration + 1)
                     else:
-                        checkpoint_tensor = _Container(
+                        checkpoint_tensor = TuckerTensor(
                             (cp.asnumpy(core), [cp.asnumpy(factor) for factor in factors])
                         )
                     ckpt_path = paths["checkpoint_dir"] / f"{iteration + 1}.pt"
@@ -2323,22 +2253,22 @@ class SparseTupleTensor:
         if best_sem_iteration is not None:
             if _is_sgd:
                 # numpy snapshots + pytorch backend: see the temp-save note.
-                tensor = _Container(
+                tensor = TuckerTensor(
                     (torch.as_tensor(best_core),
                      [torch.as_tensor(f) for f in best_factors])
                 )
             else:
-                tensor = _Container((best_core, best_factors))
+                tensor = TuckerTensor((best_core, best_factors))
             iteration = best_sem_iteration
         elif _is_sgd:
             # `core`/`factors` are never bound on the SGD path.
             _fin_core, _fin_factors = _sgd_trainer.materialize()
-            tensor = _Container(
+            tensor = TuckerTensor(
                 (torch.as_tensor(_fin_core),
                  [torch.as_tensor(f) for f in _fin_factors])
             )
         else:
-            tensor = _Container((core, factors))
+            tensor = TuckerTensor((core, factors))
         if return_errors == "simple":
             return tensor, rec_errors
         elif return_errors == "full":

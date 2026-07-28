@@ -11,6 +11,14 @@ O(Σ_m I_m·R_m) for KL (column sums) and O(Σ_m I_m·R_m²) for FR (Grams) — 
 dominates a small batch at production mode dimensions. Both are independent of
 nnz; the one O(nnz) piece is the exact-error pass on log steps.
 
+Per-step *memory* is set by ``predict_entries``: no contraction order avoids a
+``batch × prod(rank[:-1])`` intermediate (every gathered factor row carries the
+batch axis), which is 16 GB at order 4 / rank 100 / B=4096. ``GradStepper``
+therefore splits each step into micro-batches sized from the rank and lets
+gradients accumulate — exact, since the sampled loss is a sum over entries —
+and ``resolve_micro_batch`` refuses an over-large explicit setting with a
+message naming the knob rather than letting CUDA OOM.
+
 Model
 -----
 X̂ = G ×_1 A^(1) ×_2 … ×_N A^(N), with non-negativity enforced through a
@@ -129,19 +137,86 @@ def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
     return torch.log(torch.expm1(y.clamp_min(1e-6)))
 
 
-def _default_eval_chunk(rank: Sequence[int], budget: int = 1 << 26) -> int:
-    """Entries per chunk in ``full_relative_error``.
+def _intermediate_width(rank: Sequence[int]) -> int:
+    """Elements of the largest ``predict_entries`` intermediate *per entry*.
 
-    ``predict_entries`` contracts the core against B gathered factor rows, whose
-    largest intermediate is B × prod(rank[:-1]) elements. A fixed chunk is fine
-    for the toy ranks but explodes at production scale (B=2^20, rank=100 → 10^10
-    elements ≈ 40 GB), so size the chunk from the rank instead: ``budget`` caps
-    the intermediate at 2^26 elements (~256 MB fp32).
+    ``einsum("abcd,za,zb,zc,zd->z")`` cannot avoid a ``B × prod(rank[:-1])``
+    intermediate under any contraction order, because every gathered factor row
+    carries the batch axis: contracting the core against the first N-1 row sets
+    leaves one rank axis un-contracted alongside ``z``. So the memory of a
+    forward pass is linear in the batch with this constant.
     """
     inter = 1
     for r in tuple(rank)[:-1]:
         inter *= int(r)
-    return int(max(1024, min(1 << 20, budget // max(inter, 1))))
+    return max(inter, 1)
+
+
+def _rank_derived_chunk(rank: Sequence[int], budget: int = 1 << 26) -> int:
+    """Largest entry count whose forward intermediate fits ``budget`` elements.
+
+    ``budget`` defaults to 2^26 elements (~256 MB fp32). The floor is 64, not
+    1024: at order 4 / rank 100 the constant is 10^6, so the budget asks for 67
+    entries and a 1024 floor would silently produce a 4 GB intermediate —
+    i.e. the floor used to defeat the budget it was supposed to enforce. 64 is
+    still a floor, so past roughly order 4 / rank 200 it binds and the budget is
+    exceeded again; that is deliberate (a chunk of 1 would be unusable), but it
+    means very large ranks need an explicit ``--sgd-micro-batch``.
+    """
+    return int(max(64, min(1 << 20, budget // _intermediate_width(rank))))
+
+
+def _default_eval_chunk(rank: Sequence[int], budget: int = 1 << 26) -> int:
+    """Entries per chunk in ``full_relative_error`` (see ``_rank_derived_chunk``)."""
+    return _rank_derived_chunk(rank, budget)
+
+
+def resolve_micro_batch(
+    rank: Sequence[int],
+    batch_size: int,
+    micro_batch: Optional[int] = None,
+    dtype: torch.dtype = torch.float32,
+    budget: int = 1 << 26,
+    ceiling_bytes: int = 2 << 30,
+) -> int:
+    """Entries per forward/backward inside one optimizer step.
+
+    A step's sampled loss is a *sum* over its entries, so splitting the batch
+    into micro-batches and letting gradients accumulate is mathematically
+    identical to one big backward — purely a memory transformation. It is what
+    makes ``--order 4 --rank 100`` runnable at all (see ``_intermediate_width``:
+    B=4096 there is a 16 GB intermediate before autograd's saved tensors).
+
+    ``micro_batch=None`` derives the value from the rank on the same budget
+    ``_default_eval_chunk`` uses. An explicit value is honoured but still
+    checked against ``ceiling_bytes``, so an over-large request fails with a
+    message naming the knob instead of a bare CUDA OOM.
+    """
+    batch_size = int(batch_size)
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    inter = _intermediate_width(rank)
+    itemsize = torch.empty((), dtype=dtype).element_size()
+
+    if micro_batch is None:
+        return min(batch_size, _rank_derived_chunk(rank, budget))
+
+    mb = int(micro_batch)
+    if mb < 1:
+        raise ValueError(f"sgd_micro_batch must be >= 1, got {micro_batch}")
+    mb = min(mb, batch_size)
+    projected = inter * mb * itemsize
+    if projected > ceiling_bytes:
+        raise ValueError(
+            f"An SGD forward pass at micro_batch={mb} and rank={tuple(rank)} would "
+            f"allocate a {projected / 2**30:.1f} GiB intermediate "
+            f"({mb} entries x prod(rank[:-1])={inter} x {itemsize} B), above the "
+            f"{ceiling_bytes / 2**30:.1f} GiB ceiling — and autograd saves it for "
+            f"the backward pass on top. Lower --sgd-micro-batch (the rank-derived "
+            f"default here is {min(batch_size, _rank_derived_chunk(rank, budget))}) "
+            f"or lower --rank."
+        )
+    return mb
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +233,8 @@ class EntryBatcher:
         self.batch_size = min(int(batch_size), self.nnz)
         perm_np = np.random.default_rng(int(seed)).permutation(self.nnz)
         self._perm = torch.from_numpy(perm_np).to(device)
+        self.device = self._perm.device
+        self.dtype = self._perm.dtype
 
     def batch(self, step: int) -> torch.Tensor:
         start = (step * self.batch_size) % self.nnz
@@ -165,6 +242,29 @@ class EntryBatcher:
         if end <= self.nnz:
             return self._perm[start:end]
         return torch.cat([self._perm[start:], self._perm[: end - self.nnz]])
+
+    def new_buffer(self) -> torch.Tensor:
+        """A ``(batch_size,)`` buffer ``batch_into`` can write into."""
+        return torch.empty(self.batch_size, dtype=self.dtype, device=self.device)
+
+    def batch_into(self, step: int, out: torch.Tensor) -> torch.Tensor:
+        """``batch(step)`` written into a caller-owned buffer.
+
+        Same window, no allocation and no ``torch.cat`` on wrap-around. The
+        CUDA-graph path needs the batch indices to live at a *fixed* address
+        across steps, and this is how they get there: the window offset is a
+        host-side value, so the copy must happen outside any captured region
+        while everything downstream of ``out`` stays capturable.
+        """
+        start = (step * self.batch_size) % self.nnz
+        end = start + self.batch_size
+        if end <= self.nnz:
+            out.copy_(self._perm[start:end])
+        else:
+            head = self.nnz - start
+            out[:head].copy_(self._perm[start:])
+            out[head:].copy_(self._perm[: end - self.nnz])
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -304,20 +404,226 @@ class SGDTuckerModel(torch.nn.Module):
 # objectives
 # ---------------------------------------------------------------------------
 
-def _batch_loss(model, x, x_hat, scale, divergence, masked, eps=_EPS):
-    """Unbiased estimate of the total objective. ``scale`` = nnz / batch."""
+def sampled_loss(x, x_hat, scale, divergence, masked, eps=_EPS):
+    """The *sampled* (nnz) half of the objective, rescaled to full-tensor scale.
+
+    A pure sum over the given entries, which is what makes micro-batching and
+    NNZ sharding exact rather than approximate: splitting the entries and adding
+    the partial losses reproduces the whole term. ``scale`` = nnz / batch.
+    """
     if divergence == "kl":
         x_safe = x.clamp_min(eps)
         nz = x_safe * torch.log(x_safe / (x_hat + eps)) - x
         if masked:
             return scale * (nz + x_hat).sum()
-        return scale * nz.sum() + model.total_sum()
+        return scale * nz.sum()
     if divergence == "fr":
         sq = (x - x_hat) ** 2
         if masked:
             return scale * sq.sum()
-        return scale * (sq - x_hat ** 2).sum() + model.total_sq_norm()
+        return scale * (sq - x_hat ** 2).sum()
     raise ValueError(f"divergence must be 'kl' or 'fr', got {divergence!r}")
+
+
+def zero_entry_term(model, divergence):
+    """The EXACT closed-form zero-entry half — a function of the parameters
+    only, so it is added once per step no matter how the entries are split."""
+    if divergence == "kl":
+        return model.total_sum()
+    if divergence == "fr":
+        return model.total_sq_norm()
+    raise ValueError(f"divergence must be 'kl' or 'fr', got {divergence!r}")
+
+
+def _batch_loss(model, x, x_hat, scale, divergence, masked, eps=_EPS):
+    """Unbiased estimate of the total objective. ``scale`` = nnz / batch."""
+    loss = sampled_loss(x, x_hat, scale, divergence, masked, eps=eps)
+    if masked:
+        return loss
+    return loss + zero_entry_term(model, divergence)
+
+
+# ---------------------------------------------------------------------------
+# one step's gradient, shared by the single-GPU and sharded trainers
+# ---------------------------------------------------------------------------
+
+class GradStepper:
+    """Everything needed to fill one model's gradients for one step, on one
+    device — the unit both ``SGDTrainer`` and ``ShardedSGDTrainer`` build on.
+
+    Three things live here rather than in the trainers:
+
+    **A flat gradient buffer.** Every parameter's ``.grad`` is a *view* into one
+    contiguous tensor, so the sharded trainer's cross-device reduction is a
+    single collective over a single buffer (instead of one allocation per
+    parameter per replica per step) and zeroing is one kernel. Nothing copies.
+    The wiring means ``zero_grad(set_to_none=True)`` must never be called on
+    these models — use :meth:`zero_grad_`.
+
+    **Micro-batching.** The batch is split into chunks whose forward
+    intermediate fits a memory budget, with gradients accumulating across them.
+    Exact, not approximate (see ``sampled_loss``); the zero-entry term is added
+    once, after the loop, because it depends only on the parameters.
+
+    **Optional CUDA-graph capture.** At production mode dimensions the order-3
+    step is ~50x off its arithmetic roofline — it is Python dispatch, kernel
+    launch and autograd-node overhead, not math. The step body is fixed-shape,
+    so it captures cleanly. The one dynamic input, the batch window offset, is
+    handled by writing indices into a static buffer *outside* the capture.
+    """
+
+    def __init__(
+        self,
+        model: SGDTuckerModel,
+        indices: torch.Tensor,
+        values: torch.Tensor,
+        batcher: EntryBatcher,
+        *,
+        scale: float,
+        divergence: str,
+        masked: bool,
+        norm_const: float,
+        include_zero_term: bool = True,
+        micro_batch: Optional[int] = None,
+        cuda_graph: bool = False,
+        eps: float = _EPS,
+    ):
+        self.model = model
+        self.indices = indices
+        self.values = values
+        self.batcher = batcher
+        self.scale = float(scale)
+        self.divergence = divergence
+        self.masked = bool(masked)
+        self.norm_const = float(norm_const)
+        # A masked objective has no zero-entry term at all; a sharded trainer
+        # additionally suppresses it on all but one device when gradients are
+        # summed every step (adding it G times would count it G times).
+        self.include_zero_term = bool(include_zero_term) and not self.masked
+        self.eps = float(eps)
+        self.device = values.device
+
+        self.params = list(model.parameters())
+        if not self.params:
+            raise ValueError("model has no trainable parameters.")
+        dtype = self.params[0].dtype
+        numel = sum(p.numel() for p in self.params)
+        self.flat_grad = torch.zeros(numel, device=self.device, dtype=dtype)
+        offset = 0
+        for p in self.params:
+            p.grad = self.flat_grad[offset:offset + p.numel()].view_as(p)
+            offset += p.numel()
+
+        self.batch_size = int(batcher.batch_size)
+        self.micro_batch = resolve_micro_batch(
+            model.rank, self.batch_size, micro_batch, dtype=dtype
+        )
+        self._slices = [
+            (lo, min(lo + self.micro_batch, self.batch_size))
+            for lo in range(0, self.batch_size, self.micro_batch)
+        ]
+        self._sel = batcher.new_buffer()
+        self._graph: Optional["torch.cuda.CUDAGraph"] = None
+        if cuda_graph:
+            self._capture()
+
+    # --- gradient plumbing ---------------------------------------------------
+
+    def zero_grad_(self) -> None:
+        """Zero in place. NOT ``set_to_none``: the grads are views into
+        ``flat_grad`` and detaching them would break the collective's buffer."""
+        self.flat_grad.zero_()
+
+    @property
+    def param_numel(self) -> int:
+        return int(self.flat_grad.numel())
+
+    def new_param_buffer(self) -> torch.Tensor:
+        """A buffer ``pack_params_`` fits, laid out like ``flat_grad``."""
+        return torch.empty_like(self.flat_grad)
+
+    @torch.no_grad()
+    def pack_params_(self, out: torch.Tensor) -> torch.Tensor:
+        """Parameters -> one contiguous vector (off the hot path: parameter
+        averaging under ``sgd_sync_every`` and the replica-drift check)."""
+        offset = 0
+        for p in self.params:
+            n = p.numel()
+            out[offset:offset + n].copy_(p.detach().reshape(-1))
+            offset += n
+        return out
+
+    @torch.no_grad()
+    def unpack_params_(self, flat: torch.Tensor) -> None:
+        offset = 0
+        for p in self.params:
+            n = p.numel()
+            p.copy_(flat[offset:offset + n].view_as(p))
+            offset += n
+
+    # --- the step body -------------------------------------------------------
+
+    def _body(self) -> None:
+        """Fill ``flat_grad`` from the indices currently in ``self._sel``.
+
+        Capturable: fixed shapes, no host syncs, no allocations that depend on
+        a host-side value.
+        """
+        self.flat_grad.zero_()
+        for lo, hi in self._slices:
+            sel = self._sel[lo:hi]
+            idx = self.indices[:, sel]
+            x = self.values[sel]
+            x_hat = self.model.predict_entries(idx)
+            loss = sampled_loss(x, x_hat, self.scale, self.divergence,
+                                self.masked, eps=self.eps) / self.norm_const
+            loss.backward()
+        if self.include_zero_term:
+            z = zero_entry_term(self.model, self.divergence) / self.norm_const
+            z.backward()
+
+    def compute_grads(self, step: int) -> None:
+        """Gradients of step ``step``'s objective, into ``flat_grad``."""
+        self.batcher.batch_into(step, self._sel)
+        if self._graph is not None:
+            self._graph.replay()
+        else:
+            self._body()
+
+    # --- CUDA graph capture --------------------------------------------------
+
+    def _capture(self, warmup: int = 3) -> None:
+        if self.device.type != "cuda":
+            raise ValueError("sgd_cuda_graph requires a CUDA device.")
+        self.batcher.batch_into(0, self._sel)
+        with torch.cuda.device(self.device):
+            # Warm up on a side stream: lazy cubin loads, autograd node
+            # allocation and cuBLAS workspace grabs must all have happened
+            # before the capture, or they get recorded (or refuse to record).
+            side = torch.cuda.Stream(device=self.device)
+            side.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(side):
+                for _ in range(max(1, int(warmup))):
+                    self._body()
+            torch.cuda.current_stream(self.device).wait_stream(side)
+            torch.cuda.synchronize(self.device)
+
+            graph = torch.cuda.CUDAGraph()
+            try:
+                # thread_local, not the default global mode: the sharded
+                # trainer captures one graph per device and other devices'
+                # worker threads must not be able to invalidate the capture.
+                with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                    self._body()
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "CUDA graph capture of the SGD step failed "
+                    f"({exc}). Re-run with --sgd-cuda-graph false; the capture "
+                    "is an optimization, not a requirement."
+                ) from exc
+            torch.cuda.synchronize(self.device)
+        self.flat_grad.zero_()
+        self._graph = graph
 
 
 @torch.no_grad()

@@ -8,10 +8,15 @@ login nodes without GPU stacks).
 _SUBMODULE_BY_NAME = {
     "SGDTuckerModel": "sgd_tucker",
     "EntryBatcher": "sgd_tucker",
+    "GradStepper": "sgd_tucker",
     "full_relative_error": "sgd_tucker",
+    "resolve_micro_batch": "sgd_tucker",
+    "sampled_loss": "sgd_tucker",
+    "zero_entry_term": "sgd_tucker",
     "sgd_non_negative_tucker": "sgd_tucker",
     "SGDTrainer": "sgd_trainer",
     "ShardedSGDTrainer": "sharded_sgd",
+    "make_collective": "collectives",
 }
 
 __all__ = list(_SUBMODULE_BY_NAME)

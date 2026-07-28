@@ -312,6 +312,33 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--sgd-warm-start", type=str, dest="sgd_warm_start", default=None,
                         help="SGD only: path to an MU model .pt used as init (warm start; "
                              "optimizer state starts fresh, unlike --resume).")
+    parser.add_argument("--sgd-batch-scope", type=str, dest="sgd_batch_scope", default=None,
+                        choices=["per_device", "global"],
+                        help="SGD multi-GPU: 'per_device' (default) gives EVERY gpu "
+                             "--sgd-batch-size entries, so the effective batch is "
+                             "n_gpus x batch_size; 'global' splits --sgd-batch-size across "
+                             "them (the pre-2026-07 behaviour). Affects the trajectory, so "
+                             "it is part of the resume-compatibility key.")
+    parser.add_argument("--sgd-sync-every", type=int, dest="sgd_sync_every", default=None,
+                        help="SGD multi-GPU: local-SGD cadence — K local Adam steps per gpu, "
+                             "then parameter averaging (default 1 = average every step). "
+                             "Divides the barrier count by K but makes every gpu pay the "
+                             "exact zero-entry term every step; try 8-16 for KL/order 3, "
+                             "leave at 1 when that term dominates. Affects the trajectory.")
+    parser.add_argument("--sgd-micro-batch", type=int, dest="sgd_micro_batch", default=None,
+                        help="SGD only: entries per forward/backward inside one optimizer "
+                             "step (gradients accumulate, so this is exact — memory only). "
+                             "Default derives it from the rank; this is what makes "
+                             "--order 4 --rank 100 fit.")
+    parser.add_argument("--sgd-cuda-graph", type=_parse_bool, dest="sgd_cuda_graph", default=None,
+                        help="SGD only: capture the fixed-shape step body as a CUDA graph "
+                             "(default false). Worth trying whenever step time is nearly "
+                             "independent of --sgd-batch-size, i.e. dispatch-bound.")
+    parser.add_argument("--sgd-comm-backend", type=str, dest="sgd_comm_backend", default=None,
+                        choices=["auto", "nccl", "host"],
+                        help="SGD multi-GPU: cross-device reduction backend. 'auto' (default) "
+                             "picks single-process NCCL when it is available and the devices "
+                             "have a full peer-access mesh, else pinned-host staging.")
 
     # Eval-level args
     parser.add_argument("--rec-check-every", type=int, dest="rec_check_every", default=None)
@@ -363,7 +390,9 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                   "shared_factors", "subsample_frac", "max_nnz", "objective",
                   "decomposition", "cp_inner_iters", "cp_scooch_kappa",
                   "solver", "sgd_lr", "sgd_batch_size", "sgd_optimizer",
-                  "sgd_parametrization", "sgd_steps_per_iteration", "sgd_warm_start"):
+                  "sgd_parametrization", "sgd_steps_per_iteration", "sgd_warm_start",
+                  "sgd_batch_scope", "sgd_sync_every", "sgd_micro_batch",
+                  "sgd_cuda_graph", "sgd_comm_backend"):
         v = parsed_dict.get(field, None)
         if v is not None:
             exp_kwargs[field] = v

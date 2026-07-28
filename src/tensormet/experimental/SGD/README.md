@@ -10,6 +10,15 @@ python3 -m tensormet.scripts.nnt \
     --rank 100 --dim 1000 --n-iter-max 1000
 ```
 
+Multi-GPU (single process, up to a whole 4-GPU node):
+
+```bash
+python3 -m tensormet.scripts.nnt \
+    --solver sgd --divergence kl --objective full --n-gpus 4 \
+    --sgd-batch-size 4096 --sgd-sync-every 8 \
+    --rank 100 --dim 6000 --order 4 --n-iter-max 1000
+```
+
 With `--solver mu` (the default) every existing code path and filename is
 byte-identical. Template for this layout: `experimental/CP/` +
 `reviews/CP_IMPLEMENTATION_PLAN.md`.
@@ -34,25 +43,89 @@ steps (default 100). All iteration-based knobs (`n_iter_max`,
 
 - `sgd_tucker.py` — model (`SGDTuckerModel`), deterministic `EntryBatcher`
   (pure function of (seed, step) → resume replays exact batches), objectives,
-  exact error, and the standalone `sgd_non_negative_tucker` for notebooks.
+  exact error, the standalone `sgd_non_negative_tucker` for notebooks, and
+  `GradStepper` — the per-device step body (flat gradient buffer,
+  micro-batching, optional CUDA-graph capture) both trainers run.
   (The old `experimental/sgd_tucker.py` is a re-export shim.)
 - `sgd_trainer.py` — `SGDTrainer`, the loop-facing surface:
   `run_block(iteration, log_step)`, `materialize()`, `checkpoint_payload()`,
-  `load_payload()`. Owns Adam moments, raw params, and the step counter —
-  state the `UpdateRouting` seam cannot express, which is why the loop
-  branches on the solver instead of routing kernels.
+  `load_payload()`, `sync()`. Owns Adam moments, raw params, and the step
+  counter — state the `UpdateRouting` seam cannot express, which is why the
+  loop branches on the solver instead of routing kernels.
+- `collectives.py` — the `Collective` seam: `NcclSingleProcess`
+  (`torch.cuda.nccl.all_reduce`, single-process multi-device — no process
+  group, no spawn), `HostReduce` (preallocated pinned staging, the fallback
+  when NCCL or peer access is missing), `SingleDevice` (no-op).
 - `sharded_sgd.py` — `ShardedSGDTrainer` for `--n_gpus > 1`: single-process
   data parallelism (contiguous NNZ shards + per-shard batchers seeded
-  `random_state*1000+g`, model replicas, grad all-reduce onto device 0,
-  param broadcast back). Master-only checkpoints → resume works across
-  different `n_gpus`. Honest caveat: the model is tiny, so the win is data
-  sharding + effective batch, not linear step-time scaling.
+  `random_state*1000+g`, a full model + optimizer + `GradStepper` per device,
+  a persistent thread-per-GPU pool, **one** flattened gradient all-reduce per
+  step and a redundant optimizer step — so there is no parameter broadcast at
+  all). Device-0 checkpoints, byte-compatible with the single-GPU trainer's.
+
+## Multi-GPU knobs and how to set them
+
+| Knob | Default | Trajectory? | What it does |
+|---|---|---|---|
+| `--sgd-batch-scope` | `per_device` | **yes** | `per_device`: every GPU samples `--sgd-batch-size` entries, so the effective batch is `n_gpus × batch_size` and per-device work is constant in `n_gpus`. `global`: split the batch across GPUs (the pre-2026-07 behaviour). |
+| `--sgd-sync-every` | `1` | **yes** | K local Adam steps per device, then parameter averaging. Divides the barrier count by K. |
+| `--sgd-micro-batch` | rank-derived | no | Entries per forward/backward inside one step; gradients accumulate. Exact, memory-only. |
+| `--sgd-cuda-graph` | `false` | no | Capture the fixed-shape step body. |
+| `--sgd-comm-backend` | `auto` | no | `auto` / `nccl` / `host`. |
+
+**`sync_every` vs the zero-entry term.** Under K local steps each device has to
+optimize an unbiased estimate of the *full* objective on its own, so it scales
+to the global nnz **and adds the exact zero-entry term itself, every step**.
+That makes K a win exactly when that term is cheap relative to per-step
+overhead — KL at order 3, where it is O(Σ I_m·R_m) column sums — and a **loss**
+when it dominates, which is FR with a large core (O(Σ I_m·R_m²) Grams plus a
+core-sized contraction). Start at 1; try 8–16 for KL/order 3 and measure.
+
+Two further caveats for K > 1: the sync cadence is clipped at each block
+boundary (so parameters are always averaged before an eval or a checkpoint —
+prefer `steps_per_iteration` a multiple of K), and the NNZ shards are
+*contiguous* slices of the coalesced tensor, hence sorted by index and not
+IID. Local SGD on non-IID shards drifts faster than the textbook analysis
+suggests, which is the other reason to keep K modest and watch the error curve.
+
+**Micro-batching is what makes order 4 runnable.** `predict_entries` cannot
+avoid a `batch × prod(rank[:-1])` intermediate under any contraction order —
+16 GB at `--order 4 --rank 100` with `batch_size=4096`. The rank-derived
+default splits the step so the intermediate stays around 256 MB; an explicit
+`--sgd-micro-batch` that would exceed 2 GiB is refused by name instead of
+becoming a CUDA OOM. Beyond about order 4 / rank 200 the chunk floor of 64
+binds and you should set the knob yourself.
+
+**Not implemented: core sharding** (`sgd_core_shard`). Once micro-batching
+lands, order 4 / rank 100 is compute-bound with roughly a 50:1
+compute-to-zero-entry ratio and a replicated core fits in 80 GB, so plain data
+parallelism is sufficient. Splitting the core along the mode-1 rank axis makes
+the model an additive sum of G lower-rank Tucker models sharing modes 2…N; the
+KL zero-entry term stays perfectly separable (all-reduce one scalar) but
+`‖X̂‖²` does not — the mode-1 Gram mixes all mode-1 rank indices, forcing an
+O(|core|) all-gather per step, so for FR it trades a core-sized gradient
+all-reduce for a core-sized core all-gather: a wash on traffic, a win on
+memory. Revisit when rank or order grows past what replication fits.
+
+The cheap half of that idea is still on the table and needs no new
+communication: keep the core replicated but shard the *zero-entry* computation
+along mode 1, so each device forms its own row block locally and the step
+reduces a single scalar. That would remove the one remaining serialization at
+`sync_every=1` — device 0 currently carries the whole zero-entry term while the
+others idle. Worth doing if the sweep shows that imbalance dominating.
+
+If `torch.cuda.nccl.all_reduce` misbehaves (single-process multi-device NCCL is
+the less-travelled API), `--sgd-comm-backend host` is a working fallback and
+the sweep numbers stay meaningful — it is the same collective, staged through
+pinned host memory.
 
 ## Integration seams (guarded; revert = delete this dir + these hunks)
 
 1. `config.py` — `ExperimentConfig.solver` + `sgd_lr`, `sgd_batch_size`,
    `sgd_optimizer`, `sgd_parametrization`, `sgd_steps_per_iteration`,
-   `sgd_warm_start`; all of them (plus `solver`) joined the
+   `sgd_warm_start`, `sgd_batch_scope`, `sgd_sync_every`, `sgd_micro_batch`,
+   `sgd_cuda_graph`, `sgd_comm_backend`. The trajectory-affecting ones (plus
+   `solver`, plus `n_gpus` via `_sgd_trajectory_depends_on_n_gpus`) joined the
    resume-compatibility key in `get_resume_state` (an SGD run must never
    splice an MU checkpoint or an SGD run with different optimizer knobs);
    `model_filename()`/`get_resume_state()` pass `solver=` to naming.
@@ -60,7 +133,7 @@ steps (default 100). All iteration-based knobs (`n_iter_max`,
    MU artifacts can never collide, and resume scans can't cross solvers);
    threaded through `model_stem`/`model_filename`/`candidate_stems`; no
    legacy fallback for SGD stems.
-3. `parsing.py` — `--solver` + the six `--sgd-*` flags; exp field tuple.
+3. `parsing.py` — `--solver` + the eleven `--sgd-*` flags; exp field tuple.
 4. `tucker_tensor.py` — `_is_sgd` branch in
    `non_negative_tucker_with_similarity`: torch-COO input check, guard rails
    (rejects `decomposition=cp`, `subsample_frac<1`, `max_nnz`, SVD init,
@@ -76,7 +149,8 @@ steps (default 100). All iteration-based knobs (`n_iter_max`,
    `_as_host`.
 
 Also: `experimental/__init__.py` re-exports; `experimental/submit.py` gained
-`TIER2_H100_DUAL` for 2-GPU runs.
+`TIER2_H100_DUAL` (2 GPUs) and `TIER2_H100_QUAD` (whole node, 4 GPUs) — both
+still `tasks_per_node=1`, since the sharding happens inside one process.
 
 ## Checkpoint / resume semantics
 
@@ -92,14 +166,50 @@ solver="sgd")`, `inspect_tucker`, and `judge_eval` work unchanged.
 the MU solution (pushed through softplus⁻¹), optimizer state and step counter
 start fresh.
 
+**Resume and `n_gpus`.** The multi-GPU defaults make the trajectory a function
+of the device count — `batch_scope="per_device"` scales the effective batch
+with `n_gpus`, and `sync_every > 1` averages across whatever devices exist. So
+`n_gpus` is now part of the resume-compatibility key *whenever either of those
+is in play*: resume at the same `n_gpus`, or accept a trajectory change. Under
+`--sgd-batch-scope global --sgd-sync-every 1` the original "checkpoints resume
+across different `n_gpus`" promise still holds, and MU is untouched. On resume
+every device's optimizer is restored from the checkpoint, not just device 0's,
+because every device steps.
+
 ## Not implemented (rejected with clear errors)
 
 `decomposition=cp` × sgd; `subsample_frac<1`/`max_nnz` (SGD is already
 minibatch — use `--sgd-batch-size`); `init=svd` (CuPy routine — use
 warm start); `normalize_factors`; `largedim`.
 
+## DDP escape hatch (documented, not built)
+
+`collectives.Collective` is the seam. A `TorchDistributed` implementation
+backed by `init_process_group("nccl")` slots in unchanged — the trainer only
+ever asks it to sum G buffers in place. What a real DDP move would
+*additionally* require, and why it is deferred:
+
+- a rank-aware tee logger (only rank 0 writes), SIGINT checkpoint handler, LLM
+  judge invocation, and checkpoint writer — the four things the single-process
+  design exists to keep unambiguous;
+- Slurm profiles with `tasks_per_node=G` and a `torchrun`/`srun` launcher,
+  replacing the in-process `launch_nnt_decomposition` call in `submit.py`;
+- `select_gpu`'s pre-torch `CUDA_VISIBLE_DEVICES` remapping (`utils.py`) would
+  have to become `LOCAL_RANK`-aware.
+
+Up to 4 GPUs on one node, none of that is worth paying for.
+
 ## Validation
 
 `0_tests/test_sgd_solver.ipynb` (units, parity, resume-exactness, e2e smoke)
-and `0_tests/test_sgd_multigpu.ipynb` (gradient parity, trajectory parity,
-step-time benchmark) — run on the GPU box.
+and `0_tests/test_sgd_multigpu.ipynb` (gradient parity, micro-batch parity,
+replica-drift, resume exactness, scaling sweep, order-4 smoke) — run on the
+GPU box.
+
+**Timing hygiene comes first.** `run_block` deliberately returns with work
+still queued on non-log steps, so any benchmark must bracket the timed region
+with `trainer.sync()` (both trainers expose it) and record
+`torch.cuda.max_memory_allocated(dev)` per device. Timings taken without it
+are not orderable — the pre-Phase-1 sweep reported B=128 as *slower* than
+B=1024, which is not a physical ordering, and no scaling claim should be made
+against numbers gathered that way.
