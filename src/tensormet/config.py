@@ -223,18 +223,32 @@ class ExperimentConfig:
     #                       a loss when that term dominates. TRAJECTORY.
     #   sgd_micro_batch   — entries per forward/backward inside one step;
     #                       gradients accumulate, so this is exact, not an
-    #                       approximation. None derives it from the rank. This
-    #                       is what makes order 4 / rank 100 fit at all.
+    #                       approximation. None derives it from the rank, which
+    #                       under the two-group contraction is the whole batch
+    #                       up to ~order 4 / rank 200; it binds at order 5+.
     #   sgd_cuda_graph    — capture the fixed-shape step body as a CUDA graph.
     #                       Opt-in; addresses the dispatch-bound regime.
     #   sgd_comm_backend  — "auto" | "nccl" | "host" (experimental/SGD/
     #                       collectives.py).
-    # Only the first two affect the trajectory and hence resume compatibility.
+    #   sgd_eval_sample   — nnz evaluated per logged error. None (default) is
+    #                       the exact pass over every nnz, which costs the same
+    #                       per entry as a training step: roughly
+    #                       nnz / (3 · sgd_batch_size · sgd_steps_per_iteration ·
+    #                       rec_check_every) times a block's compute, so on a
+    #                       large tensor it dominates the run. Setting it
+    #                       evaluates a FIXED random subset instead (unbiased for
+    #                       the KL numerator / squared FR numerator); the final
+    #                       reported error is still computed exactly. Affects the
+    #                       logged curve and hence when patience fires, not the
+    #                       update sequence.
+    # Only sgd_batch_scope and sgd_sync_every affect the trajectory and hence
+    # resume compatibility.
     sgd_batch_scope: str = "per_device"
     sgd_sync_every: int = 1
     sgd_micro_batch: Optional[int] = None
     sgd_cuda_graph: bool = False
     sgd_comm_backend: str = "auto"
+    sgd_eval_sample: Optional[int] = None
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -446,12 +460,14 @@ class RunConfig:
                     int(getattr(self.exp, "sgd_steps_per_iteration", 100)) and
                     (old_exp.get("sgd_warm_start") or None) ==
                     (getattr(self.exp, "sgd_warm_start", None) or None) and
-                    # Multi-GPU SGD trajectory knobs. Only these two of the five
-                    # change the sequence of parameter updates; sgd_micro_batch,
+                    # Multi-GPU SGD trajectory knobs. Only these two change the
+                    # sequence of parameter updates; sgd_micro_batch,
                     # sgd_cuda_graph and sgd_comm_backend are memory/dispatch
-                    # transformations that leave the mathematics alone, so they
-                    # are deliberately NOT part of the identity (you may change
-                    # them on resume).
+                    # transformations that leave the mathematics alone, and
+                    # sgd_eval_sample only changes what gets *measured* (like
+                    # rec_check_every, which is also not in the identity), so
+                    # they are deliberately NOT part of the identity — you may
+                    # change any of them on resume.
                     old_exp.get("sgd_batch_scope", "per_device") ==
                     getattr(self.exp, "sgd_batch_scope", "per_device") and
                     int(old_exp.get("sgd_sync_every", 1)) ==

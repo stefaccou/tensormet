@@ -69,9 +69,36 @@ steps (default 100). All iteration-based knobs (`n_iter_max`,
 |---|---|---|---|
 | `--sgd-batch-scope` | `per_device` | **yes** | `per_device`: every GPU samples `--sgd-batch-size` entries, so the effective batch is `n_gpus × batch_size` and per-device work is constant in `n_gpus`. `global`: split the batch across GPUs (the pre-2026-07 behaviour). |
 | `--sgd-sync-every` | `1` | **yes** | K local Adam steps per device, then parameter averaging. Divides the barrier count by K. |
-| `--sgd-micro-batch` | rank-derived | no | Entries per forward/backward inside one step; gradients accumulate. Exact, memory-only. |
+| `--sgd-micro-batch` | rank-derived | no | Entries per forward/backward inside one step; gradients accumulate. Exact, memory-only. Rarely binding since the two-group contraction — see below. |
 | `--sgd-cuda-graph` | `false` | no | Capture the fixed-shape step body. |
 | `--sgd-comm-backend` | `auto` | no | `auto` / `nccl` / `host`. |
+| `--sgd-eval-sample` | unset (exact) | no* | nnz per logged error. See "Eval cost" below. |
+
+\* Not in the resume key, but it changes the logged curve and therefore when
+`tol`/`patience` fire — same status as `--rec-check-every`.
+
+## Eval cost
+
+The error pass evaluates `x̂` at every nnz, at the same `prod(rank)` flops per
+entry a training step pays. So an eval is worth roughly `nnz / (3 · batch_size)`
+steps of compute, and relative to a whole block of training:
+
+```
+eval / training  ≈  nnz / (3 · sgd_batch_size · sgd_steps_per_iteration · rec_check_every)
+```
+
+At the defaults (4096 × 100 × 20) that is ~4× at nnz = 10⁸ and ~40× at
+nnz = 10⁹ — i.e. the run is mostly measuring itself. MU does not have this
+problem because one MU iteration already touches every nnz; a block of SGD steps
+touches `batch_size × steps_per_iteration`.
+
+`--sgd-eval-sample N` evaluates a **fixed** random subset of N entries instead,
+rescaling the nnz half to full-tensor scale while the zero-entry half stays
+exact — unbiased for the KL numerator and for the squared FR numerator. Fixed
+rather than redrawn per eval on purpose: `tol`/`patience` compare *successive*
+errors, and a moving subset would inject sampling noise into exactly that
+difference. The final reported `final_error` is always computed exactly, over
+all nnz, once at the end of the run.
 
 **`sync_every` vs the zero-entry term.** Under K local steps each device has to
 optimize an unbiased estimate of the *full* objective on its own, so it scales
@@ -88,13 +115,35 @@ prefer `steps_per_iteration` a multiple of K), and the NNZ shards are
 IID. Local SGD on non-IID shards drifts faster than the textbook analysis
 suggests, which is the other reason to keep K modest and watch the error curve.
 
-**Micro-batching is what makes order 4 runnable.** `predict_entries` cannot
-avoid a `batch × prod(rank[:-1])` intermediate under any contraction order —
-16 GB at `--order 4 --rank 100` with `batch_size=4096`. The rank-derived
-default splits the step so the intermediate stays around 256 MB; an explicit
-`--sgd-micro-batch` that would exceed 2 GiB is refused by name instead of
-becoming a CUDA OOM. Beyond about order 4 / rank 200 the chunk floor of 64
-binds and you should set the knob yourself.
+**The two-group contraction is what makes order 4 runnable.**
+`predict_entries` splits the modes into two groups, forms the row-wise
+Khatri-Rao product of each group's gathered rows, and contracts the two against
+the core reshaped to a matrix with a single GEMM. Flops are unchanged
+(`batch × prod(rank)` is irreducible for a dense core) but the largest
+intermediate drops from `batch × prod(rank)/max(rank)` to
+`batch × ~sqrt(prod(rank))` — 16 GB → 160 MB at `--order 4 --rank 100`,
+`batch_size=4096` — and the forward becomes three kernels instead of an
+N-operand einsum decomposition. The split is chosen at model construction by
+`_contraction_plan`, which minimises the intermediate over contiguous split
+points and therefore degenerates to the one-mode-at-a-time plan when the ranks
+are skewed enough for that to win.
+
+Consequently **micro-batching is now a no-op up to about order 4 / rank 200**:
+the rank-derived `--sgd-micro-batch` returns the whole batch there. It still
+binds at order 5+, where the intermediate genuinely cannot be brought down, and
+the chunk floor of 64 means you should set the knob yourself in that regime. An
+explicit setting that would exceed 2 GiB is still refused by name rather than
+becoming a CUDA OOM.
+
+**The parametrization is evaluated once per step.** `model.core` is a softplus
+over the whole core — 400 MB of traffic at order 4 / rank 100 — so reading it
+per micro-batch chunk cost more than the arithmetic the step exists to do.
+`SGDTuckerModel.nonneg_views()` materialises the views once (aliased
+`shared_factors` modes share one tensor object) and everything downstream takes
+them as arguments. When a step *is* split, the chunks differentiate against
+detached views with persistent gradient buffers and one chain-rule pass at the
+end pushes the total back through softplus — exact, and verified by gradient
+parity across chunk counts in `0_tests/test_sgd_solver.ipynb` §6.
 
 **Not implemented: core sharding** (`sgd_core_shard`). Once micro-batching
 lands, order 4 / rank 100 is compute-bound with roughly a 50:1
@@ -124,7 +173,8 @@ pinned host memory.
 1. `config.py` — `ExperimentConfig.solver` + `sgd_lr`, `sgd_batch_size`,
    `sgd_optimizer`, `sgd_parametrization`, `sgd_steps_per_iteration`,
    `sgd_warm_start`, `sgd_batch_scope`, `sgd_sync_every`, `sgd_micro_batch`,
-   `sgd_cuda_graph`, `sgd_comm_backend`. The trajectory-affecting ones (plus
+   `sgd_cuda_graph`, `sgd_comm_backend`, `sgd_eval_sample`. The
+   trajectory-affecting ones (plus
    `solver`, plus `n_gpus` via `_sgd_trajectory_depends_on_n_gpus`) joined the
    resume-compatibility key in `get_resume_state` (an SGD run must never
    splice an MU checkpoint or an SGD run with different optimizer knobs);
@@ -133,7 +183,7 @@ pinned host memory.
    MU artifacts can never collide, and resume scans can't cross solvers);
    threaded through `model_stem`/`model_filename`/`candidate_stems`; no
    legacy fallback for SGD stems.
-3. `parsing.py` — `--solver` + the eleven `--sgd-*` flags; exp field tuple.
+3. `parsing.py` — `--solver` + the twelve `--sgd-*` flags; exp field tuple.
 4. `tucker_tensor.py` — `_is_sgd` branch in
    `non_negative_tucker_with_similarity`: torch-COO input check, guard rails
    (rejects `decomposition=cp`, `subsample_frac<1`, `max_nnz`, SVD init,

@@ -1309,6 +1309,7 @@ class SparseTupleTensor:
             sgd_micro_batch = getattr(cfg.exp, "sgd_micro_batch", None)
             sgd_cuda_graph = getattr(cfg.exp, "sgd_cuda_graph", False)
             sgd_comm_backend = getattr(cfg.exp, "sgd_comm_backend", "auto")
+            sgd_eval_sample = getattr(cfg.exp, "sgd_eval_sample", None)
             if solver not in ("mu", "sgd"):
                 raise ValueError(
                     f"cfg.exp.solver must be 'mu' or 'sgd'; got {solver!r}"
@@ -1522,6 +1523,7 @@ class SparseTupleTensor:
                 random_state=random_state,
                 steps_per_iteration=sgd_steps_per_iteration, epsilon=epsilon,
                 micro_batch=sgd_micro_batch, cuda_graph=sgd_cuda_graph,
+                eval_sample=sgd_eval_sample,
                 resume_payload=_sgd_resume_payload,
             )
             if _n_gpus > 1:
@@ -1650,7 +1652,7 @@ class SparseTupleTensor:
                 print(f"Warning: could not load SimLex-999 from {_SIMLEX_PATH}: {_e}")
 
         # --- dimension-consistency judge (optional, default off) ---
-        # The judge model (~1 GB fp16 on GPU for the default 0.5B judge or 3.5 for the 2B one)
+        # The judge model (~1 GB fp16 on GPU for the default 0.5B judge or 3.5GB for the 2B one)
         # is loaded HERE, before the iteration loop sizes any GPU batches — NOT lazily at the
         # first semantic check. The per-iteration batch estimators size against free
         # VRAM (_gpu_free_bytes); a judge added mid-run steals ~1 GB that batches
@@ -2246,6 +2248,17 @@ class SparseTupleTensor:
 
         decomp_seconds = time.time() - _decomp_loop_start
 
+        # With --sgd-eval-sample the logged curve is a subsampled estimate; pay
+        # for one exact pass at the end so the reported final_error is exact.
+        # (Like rec_errors[-1], it describes the trainer's current state, which
+        # is not necessarily the best-semantics model returned below.)
+        _sgd_exact_final_error = None
+        if _is_sgd and getattr(_sgd_trainer, "eval_sample", None):
+            _sgd_exact_final_error = _sgd_trainer.final_relative_error()
+            print(f"Exact final reconstruction error: {_sgd_exact_final_error:.6f} "
+                  f"(logged curve used --sgd-eval-sample "
+                  f"{_sgd_trainer.eval_sample})")
+
         # Restore whatever SIGINT handler was in place before this run.
         if _sigint_installed:
             signal.signal(signal.SIGINT, _original_sigint)
@@ -2278,7 +2291,10 @@ class SparseTupleTensor:
                 "fitness_scores": fitness_scores,
                 "sem_primary_key": sem_primary_key,
                 "iterations": iteration + 1,
-                "final_error": rec_errors[-1] if len(rec_errors) > 0 else None,
+                "final_error": (
+                    _sgd_exact_final_error if _sgd_exact_final_error is not None
+                    else (rec_errors[-1] if len(rec_errors) > 0 else None)
+                ),
                 "decomp_seconds": decomp_seconds,
             }
         else:

@@ -42,6 +42,7 @@ from tensormet.experimental.SGD.sgd_tucker import (
     GradStepper,
     SGDTuckerModel,
     full_relative_error,
+    make_eval_subset,
 )
 
 
@@ -67,6 +68,7 @@ class SGDTrainer:
         device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float32,
         eval_chunk: Optional[int] = None,
+        eval_sample: Optional[int] = None,
         micro_batch: Optional[int] = None,
         cuda_graph: bool = False,
         resume_payload: Optional[dict] = None,
@@ -102,6 +104,17 @@ class SGDTrainer:
         self.batcher = EntryBatcher(self.nnz, batch_size, seed=random_state,
                                     device=self.device)
         self.scale = self.nnz / self.batcher.batch_size
+
+        # The error pass costs the same per entry as a training step, so at
+        # nnz >> batch_size * steps_per_iteration * check_every it dominates the
+        # run. eval_sample trades it for a fixed random subset (see
+        # make_eval_subset); None keeps the exact pass.
+        (self._eval_indices, self._eval_values,
+         self._eval_scale, self._eval_totals) = make_eval_subset(
+            self.indices, self.values, eval_sample, random_state
+        )
+        self.eval_sample = (None if self._eval_scale == 1.0
+                            else int(self._eval_values.shape[0]))
 
         # Loss normalized by the data scale (same constants the relative errors
         # use) so lr defaults transfer across datasets.
@@ -159,10 +172,26 @@ class SGDTrainer:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
-    def _full_relative_error(self) -> float:
+    def final_relative_error(self) -> float:
+        """The exact error over all nnz, whatever ``eval_sample`` is set to.
+
+        The loop calls this once at the end so a run whose logged curve is
+        subsampled still reports an exact final number."""
+        return self._full_relative_error(exact=True)
+
+    def _full_relative_error(self, exact: bool = False) -> float:
+        """The loop's logged error. Subsampled when ``eval_sample`` is set;
+        ``exact=True`` forces the full pass (used for the final report)."""
+        if exact or self._eval_scale == 1.0:
+            return full_relative_error(
+                self.model, self.indices, self.values, self.divergence,
+                masked=self.masked, chunk=self.eval_chunk,
+                totals=self._eval_totals,
+            )
         return full_relative_error(
-            self.model, self.indices, self.values, self.divergence,
+            self.model, self._eval_indices, self._eval_values, self.divergence,
             masked=self.masked, chunk=self.eval_chunk,
+            sample_scale=self._eval_scale, totals=self._eval_totals,
         )
 
     # --- materialization / checkpointing ------------------------------------

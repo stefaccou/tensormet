@@ -86,6 +86,7 @@ from tensormet.experimental.SGD.sgd_tucker import (
     GradStepper,
     SGDTuckerModel,
     _default_eval_chunk,
+    make_eval_subset,
     sampled_loss,
 )
 
@@ -117,6 +118,7 @@ class ShardedSGDTrainer:
         epsilon: float = _EPS,
         dtype: torch.dtype = torch.float32,
         eval_chunk: Optional[int] = None,
+        eval_sample: Optional[int] = None,
         batch_scope: str = "per_device",
         sync_every: int = 1,
         micro_batch: Optional[int] = None,
@@ -175,11 +177,14 @@ class ShardedSGDTrainer:
         # the CUDA-graph capture below, which must not record a lazy cubin load.
         self._warm_up_devices(dtype)
 
-        # Global normalization constant (identical to the single-GPU trainer).
+        # Global normalization constants (identical to the single-GPU trainer).
+        # ``_totals`` are the error denominators; computed once here rather than
+        # re-reduced over every shard on every eval.
+        self._totals = (float(values_all.sum()), float(values_all.pow(2).sum()))
         if divergence == "kl":
-            self.norm_const = float(values_all.sum().clamp_min(_EPS))
+            self.norm_const = max(self._totals[0], _EPS)
         else:
-            self.norm_const = float(values_all.pow(2).sum().clamp_min(_EPS))
+            self.norm_const = max(self._totals[1], _EPS)
 
         # Contiguous NNZ shards, one per device, with per-shard batchers seeded
         # like sharded_sparse (base * 1000 + shard). No device holds the full
@@ -227,6 +232,25 @@ class ShardedSGDTrainer:
         self.micro_batch = self.steppers[0].micro_batch
 
         self.eval_chunk = eval_chunk or _default_eval_chunk(self.master.rank)
+        # Per-shard eval subsets, sized proportionally so the union is a uniform
+        # sample of the whole tensor and each shard's rescaled accumulator is an
+        # unbiased estimate of its own nnz term (see make_eval_subset).
+        self.eval_indices: List[torch.Tensor] = []
+        self.eval_values: List[torch.Tensor] = []
+        self.eval_scales: List[float] = []
+        for g in range(n_shards):
+            nnz_g = int(self.shard_values[g].shape[0])
+            n_g = (None if not eval_sample
+                   else max(1, round(int(eval_sample) * nnz_g / self.nnz)))
+            e_idx, e_val, e_scale, _ = make_eval_subset(
+                self.shard_indices[g], self.shard_values[g], n_g,
+                int(random_state) * 1000 + g,
+            )
+            self.eval_indices.append(e_idx)
+            self.eval_values.append(e_val)
+            self.eval_scales.append(e_scale)
+        self.eval_sample = (None if all(s == 1.0 for s in self.eval_scales)
+                            else sum(int(v.shape[0]) for v in self.eval_values))
 
         if optimizer == "adam":
             self._opts = [torch.optim.Adam(m.parameters(), lr=lr) for m in self._models]
@@ -436,16 +460,22 @@ class ShardedSGDTrainer:
     # --- exact error (sharded) ------------------------------------------------
 
     @torch.no_grad()
-    def _shard_error_terms(self, g: int, out: list) -> None:
+    def _shard_error_terms(self, g: int, out: list, exact: bool) -> None:
         eps = _EPS
         model = self._models[g]
-        indices = self.shard_indices[g]
-        values = self.shard_values[g]
+        if exact:
+            indices, values, scale = (self.shard_indices[g],
+                                      self.shard_values[g], 1.0)
+        else:
+            indices, values, scale = (self.eval_indices[g],
+                                      self.eval_values[g], self.eval_scales[g])
+        # One parametrization pass for the whole shard, not one per chunk.
+        core, factors = model.nonneg_views()
         shard_acc = values.new_zeros(())
         for s in range(0, values.shape[0], self.eval_chunk):
             idx = indices[:, s:s + self.eval_chunk]
             x = values[s:s + self.eval_chunk]
-            x_hat = model.predict_entries(idx)
+            x_hat = model.predict_from(core, factors, idx)
             if self.divergence == "kl":
                 x_safe = x.clamp_min(eps)
                 term = x_safe * torch.log(x_safe / (x_hat + eps)) - x
@@ -456,20 +486,28 @@ class ShardedSGDTrainer:
                 if not self.masked:
                     term = term - x_hat ** 2
             shard_acc = shard_acc + term.sum()
-        out[g] = (float(shard_acc), float(values.sum()), float(values.pow(2).sum()))
+        out[g] = float(shard_acc) * scale
+
+    def final_relative_error(self) -> float:
+        """The exact error over all nnz, whatever ``eval_sample`` is set to —
+        same contract as ``SGDTrainer.final_relative_error``."""
+        return self._full_relative_error(exact=True)
 
     @torch.no_grad()
-    def _full_relative_error(self) -> float:
+    def _full_relative_error(self, exact: bool = False) -> float:
         """Per-shard chunked accumulation of the nnz term (one worker per
         device), host-summed; the analytic zero-entry term is added once. Same
         normalization as ``sgd_tucker.full_relative_error`` / the MU error
-        kernels."""
+        kernels.
+
+        Subsampled when ``eval_sample`` is set — each shard rescales its own
+        accumulator, so the host sum stays an unbiased estimate of the whole nnz
+        term. ``exact=True`` forces the full pass over every shard."""
         eps = _EPS
         sinks: list = [None] * len(self.devices)
-        self._fan_out(self._shard_error_terms, sinks)
-        acc = sum(s[0] for s in sinks)
-        vals_sum = sum(s[1] for s in sinks)
-        vals_sq_sum = sum(s[2] for s in sinks)
+        self._fan_out(self._shard_error_terms, sinks, exact)
+        acc = sum(sinks)
+        vals_sum, vals_sq_sum = self._totals
 
         if self.divergence == "kl":
             total = acc if self.masked else acc + float(self.master.total_sum())

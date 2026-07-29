@@ -10,6 +10,7 @@ _SUBMODULE_BY_NAME = {
     "EntryBatcher": "sgd_tucker",
     "GradStepper": "sgd_tucker",
     "full_relative_error": "sgd_tucker",
+    "make_eval_subset": "sgd_tucker",
     "resolve_micro_batch": "sgd_tucker",
     "sampled_loss": "sgd_tucker",
     "zero_entry_term": "sgd_tucker",

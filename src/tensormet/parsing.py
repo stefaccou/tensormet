@@ -328,8 +328,9 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--sgd-micro-batch", type=int, dest="sgd_micro_batch", default=None,
                         help="SGD only: entries per forward/backward inside one optimizer "
                              "step (gradients accumulate, so this is exact — memory only). "
-                             "Default derives it from the rank; this is what makes "
-                             "--order 4 --rank 100 fit.")
+                             "Default derives it from the rank, which under the two-group "
+                             "contraction is the whole batch up to ~order 4 / rank 200; "
+                             "set it explicitly at order 5+ or on a tight-VRAM device.")
     parser.add_argument("--sgd-cuda-graph", type=_parse_bool, dest="sgd_cuda_graph", default=None,
                         help="SGD only: capture the fixed-shape step body as a CUDA graph "
                              "(default false). Worth trying whenever step time is nearly "
@@ -339,6 +340,13 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="SGD multi-GPU: cross-device reduction backend. 'auto' (default) "
                              "picks single-process NCCL when it is available and the devices "
                              "have a full peer-access mesh, else pinned-host staging.")
+    parser.add_argument("--sgd-eval-sample", type=int, dest="sgd_eval_sample", default=None,
+                        help="SGD only: nnz evaluated per logged reconstruction error. "
+                             "Default (unset) evaluates every nnz exactly, which costs the "
+                             "same per entry as a training step and on a large tensor is "
+                             "several times a whole block's compute. Setting it (e.g. 1000000) "
+                             "evaluates a fixed random subset instead — unbiased, and the "
+                             "final reported error is still exact.")
 
     # Eval-level args
     parser.add_argument("--rec-check-every", type=int, dest="rec_check_every", default=None)
@@ -392,7 +400,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                   "solver", "sgd_lr", "sgd_batch_size", "sgd_optimizer",
                   "sgd_parametrization", "sgd_steps_per_iteration", "sgd_warm_start",
                   "sgd_batch_scope", "sgd_sync_every", "sgd_micro_batch",
-                  "sgd_cuda_graph", "sgd_comm_backend"):
+                  "sgd_cuda_graph", "sgd_comm_backend", "sgd_eval_sample"):
         v = parsed_dict.get(field, None)
         if v is not None:
             exp_kwargs[field] = v
