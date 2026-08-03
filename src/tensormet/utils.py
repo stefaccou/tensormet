@@ -123,6 +123,38 @@ def make_lazy_cupy_pair() -> Tuple[Any, Any]:
     return _LazyGPU(0), _LazyGPU(1)
 
 
+def sync_devices(n_gpus: int = 1, backend: str = "cupy") -> None:
+    """Block until every device in use has drained its queue.
+
+    CuPy and torch kernel launches are asynchronous, so a bare ``time.time()``
+    delta around a decomposition iteration measures *queueing*, not execution:
+    the real cost only surfaces at the next blocking transfer (an error
+    kernel's ``.get()``, the semantic eval, a checkpoint), which charges one
+    iteration's work to whichever iteration happens to synchronize. Call this
+    on both sides of a region that is being timed. One sync per iteration is
+    negligible next to the updates themselves.
+
+    Silently no-ops on CPU-only environments, where everything is synchronous
+    already and there is nothing to wait for.
+    """
+    try:
+        if backend == "torch":
+            import torch  # local: keeps this callable from cupy-only contexts
+            if not torch.cuda.is_available():
+                return
+            for device in range(max(int(n_gpus), 1)):
+                torch.cuda.synchronize(device)
+        else:
+            cp, _ = guarded_cupy_import()
+            if cp is None:
+                return
+            for device in range(max(int(n_gpus), 1)):
+                cp.cuda.Device(device).synchronize()
+    except Exception:
+        # A timing helper must never be the thing that kills a run.
+        pass
+
+
 class _LazyModule:
     """Proxy that imports a module on first attribute access.
 
@@ -439,6 +471,16 @@ def cp_einsum_optimize(n_operands: int) -> str:
     # 'optimal' exhaustively searches all O(3^n * n^2) contraction paths.
     # For n <= 6 (our typical N+1 with N <= 5 tensor order) this is negligible overhead.
     # 'greedy' is used above that threshold to avoid exponential path-search cost.
+    #
+    # ONLY for rank-space contractions (core × grams / × per-mode sum vectors),
+    # where every axis is an R_n and the worst intermediate is a few core-sized
+    # arrays. NEVER use it for a contraction carrying a batch/NNZ index: both
+    # path rules minimize FLOPs with no memory ceiling, and CuPy's binary einsum
+    # materializes each intermediate in full, so a batched equation can be routed
+    # through a (batch, R0, ..., R_{N-1}) array. Because the batch size is itself
+    # derived from free VRAM, that turns into a machine-dependent OOM — see the
+    # note on _rhat_from_factor_rows_sequential in distance.py. Write those
+    # contractions out as an explicit mode-at-a-time loop instead.
     return 'optimal' if n_operands <= 6 else 'greedy'
 
 def voc_index(role: str) -> str:

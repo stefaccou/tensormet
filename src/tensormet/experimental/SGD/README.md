@@ -55,7 +55,13 @@ steps (default 100). All iteration-based knobs (`n_iter_max`,
 - `collectives.py` — the `Collective` seam: `NcclSingleProcess`
   (`torch.cuda.nccl.all_reduce`, single-process multi-device — no process
   group, no spawn), `HostReduce` (preallocated pinned staging, the fallback
-  when NCCL or peer access is missing), `SingleDevice` (no-op).
+  when NCCL or peer access is missing), `SingleDevice` (no-op). The `auto`
+  backend probes NCCL with a real 1-element all-reduce **under a 30s watchdog**
+  (`TENSORMET_NCCL_PROBE_TIMEOUT`) — comm init's usual failure mode is to block,
+  not to raise, and a `try/except` cannot catch that. A timeout is treated as a
+  failed probe and falls back to `HostReduce`. The resolved backend is printed
+  at construction, so a run that silently measured the host path is visible in
+  the log rather than hiding in the timings.
 - `sharded_sgd.py` — `ShardedSGDTrainer` for `--n_gpus > 1`: single-process
   data parallelism (contiguous NNZ shards + per-shard batchers seeded
   `random_state*1000+g`, a full model + optimizer + `GradStepper` per device,
@@ -166,7 +172,16 @@ others idle. Worth doing if the sweep shows that imbalance dominating.
 If `torch.cuda.nccl.all_reduce` misbehaves (single-process multi-device NCCL is
 the less-travelled API), `--sgd-comm-backend host` is a working fallback and
 the sweep numbers stay meaningful — it is the same collective, staged through
-pinned host memory.
+pinned host memory. From the benchmark driver, set `BENCH_SGD_COMM_BACKEND`.
+
+Observed in the wild: on the VSC wice H100 nodes, `ncclCommInitAll` blocked
+indefinitely while the same code ran fine on dodrio A100s (job 61599897,
+2026-07-30 — 2.5h of walltime with zero output). Hopper enables NVLS (NVLink
+SHARP / CUDA multicast) by default and Ampere has no such path, so
+`NCCL_NVLS_ENABLE=0` is the first thing to try on H100; `NCCL_P2P_DISABLE=1` and
+`NCCL_SHM_DISABLE=1` are the next two. `NCCL_DEBUG=INFO` shows where init
+blocks. The probe watchdog means this now costs 30s and a slower backend rather
+than the whole job.
 
 ## Integration seams (guarded; revert = delete this dir + these hunks)
 

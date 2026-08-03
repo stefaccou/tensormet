@@ -73,6 +73,7 @@ resume-compatibility key; under ``batch_scope="global"`` with
 from __future__ import annotations
 
 import copy
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional, Sequence, Tuple, Union
 
@@ -261,7 +262,16 @@ class ShardedSGDTrainer:
             raise ValueError(f"optimizer must be 'adam' or 'sgd', got {optimizer!r}")
         self.opt = self._opts[0]
 
+        # Announced, not silent: the auto backend can legitimately fall back to
+        # HostReduce (NCCL missing, no peer mesh, or a probe that failed/hung),
+        # and that changes the meaning of every timing this run produces. A
+        # benchmark that silently measured the host path would be
+        # indistinguishable in the log from one that measured NCCL.
+        print(f"[{time.strftime('%H:%M:%S')}] building SGD collective "
+              f"(requested backend={comm_backend!r})...", flush=True)
         self.collective = make_collective(self.devices, backend=comm_backend)
+        print(f"[{time.strftime('%H:%M:%S')}] SGD collective: {self.collective!r}",
+              flush=True)
 
         # Precomputed (src, dst) tensor pairs for the cold-path broadcast — the
         # old code rebuilt two OrderedDicts per call, and called it every step.

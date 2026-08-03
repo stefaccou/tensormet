@@ -36,6 +36,7 @@ from tensormet.utils import (DATA_DIR,
                             np_dispatch,
                             np_sim,
                             resolve_checkpoint_path,
+                            sync_devices,
                             _to_np,
                    )
 from tensormet.hpc_helpers import mirror_checkpoint
@@ -1526,6 +1527,11 @@ class SparseTupleTensor:
                 eval_sample=sgd_eval_sample,
                 resume_payload=_sgd_resume_payload,
             )
+            # Construction is the last silent stretch before the loop announces
+            # itself, and on the sharded path it is where the collective gets
+            # built — historically the place a run could stall with no output.
+            print(f"[{time.strftime('%H:%M:%S')}] constructing SGD trainer "
+                  f"(n_gpus={_n_gpus})...", flush=True)
             if _n_gpus > 1:
                 from tensormet.experimental.SGD.sharded_sgd import ShardedSGDTrainer
                 _sgd_trainer = ShardedSGDTrainer(
@@ -1538,6 +1544,7 @@ class SparseTupleTensor:
             else:
                 from tensormet.experimental.SGD.sgd_trainer import SGDTrainer
                 _sgd_trainer = SGDTrainer(self.tensor, **_sgd_kwargs)
+            print(f"[{time.strftime('%H:%M:%S')}] SGD trainer ready", flush=True)
 
         if _n_gpus > 1 and not _is_sgd:
             _sst = ShardedSparseTensor.from_coo(
@@ -1738,12 +1745,21 @@ class SparseTupleTensor:
         # launch.py's runtime_seconds). Persisted so benchmarks can report a
         # decomposition time distinct from total process runtime.
         _decomp_loop_start = time.time()
+        # Per-iteration solve time (updates + error kernel), excluding the
+        # semantic evaluation that also runs inside the loop. Summed into
+        # solve_seconds below so benchmarks can separate "time spent actually
+        # decomposing" from eval and data-loading overhead. GPU work is
+        # asynchronous, so the timer is bracketed by sync_devices() — without
+        # it the per-iteration numbers measure kernel *queueing* and the cost
+        # lands on whichever later iteration happens to block.
+        _iter_seconds = []
+        _sync_backend = "torch" if _is_sgd else "cupy"
         # Initialized so post-loop bookkeeping (e.g. "iterations": iteration + 1) is well
         # defined even if the loop body never executes (start_iteration >= n_iter_max).
         iteration = start_iteration - 1
         for iteration in range(start_iteration, n_iter_max):
-            if time_iteration:
-                start_time = time.time()
+            sync_devices(_n_gpus, _sync_backend)
+            _iter_start = time.time()
             log_step = get_log_step(iteration, rec_log_every, rec_check_every)
             if _is_sgd:
                 # --- EXPERIMENTAL SGD solver (experimental/SGD/README.md) ---
@@ -1881,6 +1897,9 @@ class SparseTupleTensor:
                 if normalize_factors:
                     core, factors = tucker_normalize((core, factors))
 
+            sync_devices(_n_gpus, _sync_backend)
+            _iter_seconds.append(time.time() - _iter_start)
+
             if log_step:
                 rec_errors.append(rel_err)
 
@@ -1892,8 +1911,7 @@ class SparseTupleTensor:
 
                     message = f"{iteration}: reconstruction error={rec_errors[-1]} (Δ={delta:+.3e})"
                     if time_iteration:
-                        end_time = time.time()
-                        message += f", time={end_time - start_time}"
+                        message += f", time={_iter_seconds[-1]}"
                     print(message)
 
                 do_rec_check = (
@@ -2247,6 +2265,16 @@ class SparseTupleTensor:
                 break
 
         decomp_seconds = time.time() - _decomp_loop_start
+        # solve_seconds counts only the iteration updates/error kernels;
+        # decomp_seconds additionally covers in-loop semantic evaluation and
+        # checkpointing.
+        solve_seconds = float(sum(_iter_seconds))
+        print(
+            f"decomposition time: {solve_seconds:.2f}s "
+            f"(sum of {len(_iter_seconds)} device-synced iteration time(s)"
+            + (f", mean {solve_seconds / len(_iter_seconds):.2f}s" if _iter_seconds else "")
+            + f"); {decomp_seconds:.2f}s for the whole loop including in-loop evaluation"
+        )
 
         # With --sgd-eval-sample the logged curve is a subsampled estimate; pay
         # for one exact pass at the end so the reported final_error is exact.
@@ -2296,6 +2324,8 @@ class SparseTupleTensor:
                     else (rec_errors[-1] if len(rec_errors) > 0 else None)
                 ),
                 "decomp_seconds": decomp_seconds,
+                "solve_seconds": solve_seconds,
+                "iter_seconds": list(_iter_seconds),
             }
         else:
             return tensor

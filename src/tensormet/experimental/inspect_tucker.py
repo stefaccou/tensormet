@@ -3,7 +3,9 @@
 Three layers, smallest to largest:
 
 * **loading**  -- :func:`load_metrics` / :func:`load_vocab` parse a run's log
-  into (iters, rec_error, sem_dicts). :func:`resume_chain` expands one config
+  into (iters, rec_error, sem_dicts), and :func:`load_iter_times` pulls the
+  per-iteration decomposition times out of the same log.
+  :func:`resume_chain` expands one config
   into the log segments a resumed run is split across (a resumed run's own log
   holds only the tail), and :func:`describe_run` prints what a config resolves
   to when a curve looks wrong.
@@ -68,6 +70,19 @@ def _read_log(cfg):
     return iters, rec, sem
 
 
+# Per-iteration timing line shape (written when eval.time_iteration is on,
+# the default):
+#   "17: reconstruction error=0.53 (Δ=+1.2e-03), time=4.87"
+# The number here is the loop's 0-based ``iteration``, while the metric line for
+# that same pass prints ``iteration + 1`` (see tucker_tensor's decomposition
+# loop) — _read_times adds the 1 back so both series share one x-axis.
+# Unanchored like _METRIC_RE: a tqdm bar's carriage returns leave no newline, so
+# a metric line can share a "line" with the bar that preceded it.
+_TIME_RE = re.compile(
+    r"(?:^|[\s\r])(\d+):\s+reconstruction error=.*?,\s*time=([\d\.eE+-]+)"
+)
+
+
 def _monotonic(iters, rec, sem):
     """Sort a parsed series by iteration and drop duplicate iterations.
 
@@ -106,6 +121,40 @@ def load_metrics(*cfgs):
         all_rec.extend(rec)
         all_sem.extend(sem)
     return _monotonic(all_iters, all_rec, all_sem)
+
+
+def _read_times(cfg):
+    its, secs = [], []
+    with open(cfg.log_path, "r") as f:
+        for line in f:
+            m = _TIME_RE.search(line)
+            if m:
+                its.append(int(m.group(1)) + 1)
+                secs.append(float(m.group(2)))
+    return its, secs
+
+
+def load_iter_times(*cfgs):
+    """Parse per-iteration decomposition times (seconds) out of one or more logs.
+
+    Returns ``(iters, seconds)``. Several configs are concatenated (the resume
+    segments of one run), then sorted with duplicate iterations keeping their
+    **last** occurrence — the same repairs :func:`_monotonic` applies to the
+    metric series, and for the same reasons (append-mode relaunches, unordered
+    segments).
+
+    These are the device-synced update+error timings the decomposition loop sums
+    into ``solve_seconds``; they exclude the in-loop semantic evaluation and
+    checkpointing that ``decomp_seconds`` also covers. The result is empty for a
+    run launched with ``time_iteration`` off, and skips the first logged
+    iteration (the timing line rides along with the Δ report, which needs a
+    previous error to exist).
+    """
+    by_iter = {}
+    for cfg in cfgs:
+        by_iter.update(zip(*_read_times(cfg)))
+    order = sorted(by_iter)
+    return order, [by_iter[i] for i in order]
 
 
 def load_vocab(cfg):
@@ -173,12 +222,34 @@ def average_runs(configs, n_grid=500, stitch=True):
 
 # === plotting ==========================================================
 
+# Horizontal step between stacked right-hand y-axes, and where the legend sits
+# once one axis is out there. Both are in axes coordinates.
+_AXIS_OFFSET = 0.11
+_LEGEND_X = 1.12
+
+
+def _time_axis(ax1, n_right):
+    """Twin axis for the iteration-time curve, offset clear of ``n_right`` existing ones."""
+    axt = ax1.twinx()
+    if n_right:
+        axt.spines["right"].set_position(("axes", 1.0 + _AXIS_OFFSET * n_right))
+    axt.set_ylabel("Iteration time (s)")
+    return axt
+
+
 def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
-                 plot_rec_error=True, title="", ax=None, stitch=True):
-    """Plot reconstruction error and/or semantic scores for one run.
+                 plot_rec_error=True, plot_iter_time=False, title="", ax=None,
+                 stitch=True):
+    """Plot reconstruction error, semantic scores and/or iteration time for one run.
 
     Pass ``ax`` to draw into an existing axis (a twin axis is created
     internally for the score curves). Returns the figure.
+
+    With ``plot_iter_time``, the per-iteration decomposition time from
+    :func:`load_iter_times` is drawn in grey on its own right-hand axis (or on
+    the primary axis when nothing else is plotted). Seconds share no scale with
+    errors or scores, hence the separate axis. Silently skipped when the log
+    holds no timing lines.
 
     With ``stitch`` (the default), a single config is expanded into its resume
     chain via :func:`resume_chain`, so a run that was resumed to a higher
@@ -198,9 +269,11 @@ def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
     all_lines = []
 
     split_axes = (not plot_rec_error) and (len(sem_keys) == 2)
+    n_right = 0  # right-hand axes in use, so the time axis lands beside them
 
     if split_axes:
         ax2 = ax1.twinx()
+        n_right = 1
         its0, vals0 = _values_for_key(sem_keys[0], all_its, all_sem)
         (l0,) = ax1.plot(its0, vals0, label=sem_keys[0], color=colors[0])
         ax1.set_ylabel(sem_keys[0])
@@ -215,6 +288,7 @@ def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
             all_lines.append(l)
         if sem_keys:
             ax2 = ax1.twinx()
+            n_right = 1
             ax2.set_ylabel("Score")
             for i, key in enumerate(sem_keys):
                 # Offset so the first score curve isn't solid like rec error.
@@ -224,9 +298,24 @@ def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
                                 linestyle=ls)
                 all_lines.append(l)
 
+    if plot_iter_time:
+        t_its, t_secs = load_iter_times(*cfgs)
+        if t_its:
+            # With nothing else drawn, the time curve owns the primary axis.
+            if n_right or plot_rec_error:
+                axt = _time_axis(ax1, n_right)
+                n_right += 1
+            else:
+                axt = ax1
+                ax1.set_ylabel("Iteration time (s)")
+            (l,) = axt.plot(t_its, t_secs, color="0.35",
+                            linestyle=_LINESTYLES[-1], label="Iteration time (s)")
+            all_lines.append(l)
+
     # Park the legend outside the axes so it never sits on top of the curves.
-    ax1.legend(all_lines, [l.get_label() for l in all_lines],
-               loc="center left", bbox_to_anchor=(1.12, 0.5), frameon=False)
+    ax1.legend(all_lines, [l.get_label() for l in all_lines], loc="center left",
+               bbox_to_anchor=(_LEGEND_X + _AXIS_OFFSET * max(0, n_right - 1), 0.5),
+               frameon=False)
     ax1.set_title(title or cfgs[0].stem)
     return fig
 
@@ -348,7 +437,8 @@ def _is_preloaded(run):
 
 
 def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
-                    plot_rec_error=True, title="Training Metrics Comparison",
+                    plot_rec_error=True, plot_iter_time=False,
+                    title="Training Metrics Comparison",
                     ax=None, clip_common=False, color_by=None, stitch=True):
     """Overlay any number of runs on a shared figure.
 
@@ -373,6 +463,13 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
 
     Reconstruction error and the semantic keys are told apart by line style.
     Returns the figure.
+
+    With ``plot_iter_time``, each run's per-iteration decomposition time
+    (:func:`load_iter_times`) is added in the run's own color on a shared
+    right-hand axis of its own — seconds share no scale with errors or scores.
+    Runs whose log holds no timing lines (``time_iteration`` off), and averaged
+    triples from :func:`average_runs` (which carry no timing series), are
+    skipped.
 
     With ``clip_common`` set, the x-axis is capped at the last iteration shared by
     every run (the smallest of their final iterations), so short and long runs are
@@ -424,6 +521,7 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
     all_lines = []
 
     split_axes = (not plot_rec_error) and (len(sem_keys) == 2)
+    n_right = 1 if (split_axes or sem_keys) else 0
 
     if split_axes:
         # One semantic key per axis; runs separated by color, keys by axis and style.
@@ -456,13 +554,34 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
                                 label=f"{lbl} · {key}")
                 all_lines.append(l)
 
+    if plot_iter_time:
+        axt = None  # created lazily, so a run set with no timings adds no axis
+        for run, lbl, c in zip(runs, labels, run_colors):
+            if _is_preloaded(run):
+                continue
+            t_its, t_secs = load_iter_times(*run)
+            if not t_its:
+                continue
+            if axt is None:
+                # With nothing else drawn, the time curves own the primary axis.
+                if n_right or plot_rec_error:
+                    axt = _time_axis(ax1, n_right)
+                    n_right += 1
+                else:
+                    axt = ax1
+                    ax1.set_ylabel("Iteration time (s)")
+            (l,) = axt.plot(t_its, t_secs, color=c, linestyle=_LINESTYLES[-1],
+                            label=f"{lbl} · iter time")
+            all_lines.append(l)
+
     if clip_common:
         finals = [max(its) for its, _, _ in loaded if its]
         if finals:
             ax1.set_xlim(right=min(finals))
 
-    ax1.legend(all_lines, [l.get_label() for l in all_lines],
-               loc="center left", bbox_to_anchor=(1.12, 0.5), frameon=False)
+    ax1.legend(all_lines, [l.get_label() for l in all_lines], loc="center left",
+               bbox_to_anchor=(_LEGEND_X + _AXIS_OFFSET * max(0, n_right - 1), 0.5),
+               frameon=False)
     ax1.set_title(title)
     return fig
 
@@ -737,6 +856,13 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     than at the iteration the resume began. Chained entries are marked ``⛓×N``.
     Untick to view a single segment (e.g. just the resumed tail) in isolation.
 
+    Tick *plot iter time* to add each run's per-iteration decomposition time on a
+    dedicated right-hand axis (seconds, so it gets its own scale). This is the
+    device-synced update+error time the run logged per iteration — the quantity
+    summed into ``solve_seconds`` — and excludes in-loop semantic evaluation.
+    Runs launched with ``time_iteration`` off simply contribute no curve. Untick
+    *plot rec error* and clear *sem_keys* to look at timing on its own.
+
     When comparing two runs of unequal length, tick *clip to common iters* to cap
     the x-axis at the shorter run's final iteration (e.g. 250 vs 2000 → x stops at
     250), so the shared range is compared head-to-head rather than squashed.
@@ -804,6 +930,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     sem_box = widgets.Text(value=",".join(default_sem_keys), description="sem_keys",
                            style={"description_width": "75px"}, layout=widgets.Layout(width="55%"))
     rec_chk = widgets.Checkbox(value=False, description="plot rec error", indent=False)
+    time_chk = widgets.Checkbox(value=False, description="plot iter time", indent=False)
     stitch_chk = widgets.Checkbox(value=True, description="stitch resume chains", indent=False)
     clip_chk = widgets.Checkbox(value=False, description="clip to common iters", indent=False)
     after_box = widgets.Text(value="", description="after", placeholder="YYYY-MM-DD",
@@ -929,11 +1056,13 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                 # so the plot functions must not re-expand them.
                 if b is None:
                     plot_metrics(*a, sem_keys=keys, plot_rec_error=rec_chk.value,
+                                 plot_iter_time=time_chk.value,
                                  title=a[-1].stem, ax=ax, stitch=False)
                 else:
                     shared, (la, lb) = _diff_labels([a[-1].insp, b[-1].insp])
                     compare_metrics([list(a), list(b)], [la, lb],
                                     sem_keys=keys, plot_rec_error=rec_chk.value,
+                                    plot_iter_time=time_chk.value,
                                     title=shared, ax=ax, clip_common=clip_chk.value,
                                     stitch=False)
             except FileNotFoundError as e:
@@ -1009,6 +1138,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     run_b.observe(_on_select, "value")
     sem_box.observe(_on_select, "value")
     rec_chk.observe(_on_select, "value")
+    time_chk.observe(_on_select, "value")
     # Clipping only changes the x-axis limit on the existing curves — just redraw.
     clip_chk.observe(_on_select, "value")
     # Toggling stitch changes the A/B option values (chains vs single runs), so it
@@ -1026,7 +1156,9 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         widgets.HBox(list(dataset_chk.values()), layout=widgets.Layout(flex_flow="row wrap")),
     ])
     filters = widgets.HBox(list(facet_dd.values()), layout=widgets.Layout(flex_flow="row wrap"))
-    controls = widgets.HBox([sem_box, rec_chk, stitch_chk, clip_chk, after_box, refresh_btn, save_name, save_btn])
+    controls = widgets.HBox([sem_box, rec_chk, time_chk, stitch_chk, clip_chk, after_box,
+                             refresh_btn, save_name, save_btn],
+                            layout=widgets.Layout(flex_flow="row wrap"))
     ui = widgets.VBox([datasets_box, filters, status, run_a, run_b, controls, plot_out])
     # Expose the live state so callers can grab the current Figure out of the UI,
     # e.g. `fig = browser.get_figure(); fig.savefig(...)` or display it elsewhere.

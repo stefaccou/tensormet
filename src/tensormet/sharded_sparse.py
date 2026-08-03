@@ -91,7 +91,16 @@ from tensormet.distance import (
     _tucker_den_row_full,
     _tucker_gram_ZtZ,
 )
-from tensormet.sparse_ops import compute_Zcols_batch, safe_ravel
+from tensormet.sparse_ops import (
+    compute_Zcols_batch,
+    safe_ravel,
+    use_legacy_factor_batch,
+    sampled_row_dots,
+    group_batch_by_column,
+    build_batch_csr_T,
+    same_pattern_csr,
+    spmm_T,
+)
 from tensormet.utils import make_lazy_cupy_pair
 
 cp, cpx_sparse = make_lazy_cupy_pair()
@@ -428,7 +437,6 @@ def _partial_numerator_for_shard(
                 r_i = rows[nz_idx]
                 v_i = vals[nz_idx]
                 u_i = inv[nz_idx] - batch_start
-            Z_rows = Z_u[u_i]
 
             if _DEBUG_SHARD:
                 # Fancy-index gathers (A_d[r_i], Z_u[u_i]) are NOT bounds-checked
@@ -444,39 +452,80 @@ def _partial_numerator_for_shard(
                     )
 
             nnz_b = int(r_i.size)
-            col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
-            row_idx_b = r_i.astype(cp.int32)
 
-            if divergence == "kl":
-                A_rows = A_d[r_i]
-                R_nz = cp.clip(cp.sum(A_rows * Z_rows, axis=1), a_min=epsilon, a_max=None)
-                w = v_i / R_nz
-            else:  # "fr"
-                w = v_i
+            if use_legacy_factor_batch():
+                # Legacy body (pre 2026-07-29), kept behind
+                # TENSORMET_LEGACY_FACTOR_BATCH=1 for A/B validation.
+                Z_rows = Z_u[u_i]
+                col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
+                row_idx_b = r_i.astype(cp.int32)
 
-            # numerator[row] += w * Z  — cuSPARSE SpMM (no serialised atomics).
-            # Build contributions into locals first so a failure below leaves the
-            # accumulators untouched and the batch can be retried cleanly.
-            S_b = cpx_sparse.csr_matrix(
-                (w, (row_idx_b, col_idx_b)),
-                shape=(numerator.shape[0], nnz_b),
-            )
-            num_contrib = S_b @ Z_rows
-
-            den_contrib = None
-            if masked:
-                # Observed-only denominator weight:
-                #   KL -> 1 (sum of Z over observed columns)
-                #   FR -> Xhat at the observed entry = <A[row], Z[col]>
                 if divergence == "kl":
-                    den_w = cp.full(nnz_b, den_scale, dtype=Z_rows.dtype)
+                    A_rows = A_d[r_i]
+                    R_nz = cp.clip(cp.sum(A_rows * Z_rows, axis=1), a_min=epsilon, a_max=None)
+                    w = v_i / R_nz
                 else:  # "fr"
-                    den_w = cp.sum(A_d[r_i] * Z_rows, axis=1) * den_scale
-                S_den = cpx_sparse.csr_matrix(
-                    (den_w, (row_idx_b, col_idx_b)),
+                    w = v_i
+
+                # numerator[row] += w * Z  — cuSPARSE SpMM (no serialised atomics).
+                # Build contributions into locals first so a failure below leaves the
+                # accumulators untouched and the batch can be retried cleanly.
+                S_b = cpx_sparse.csr_matrix(
+                    (w, (row_idx_b, col_idx_b)),
                     shape=(numerator.shape[0], nnz_b),
                 )
-                den_contrib = S_den @ Z_rows
+                num_contrib = S_b @ Z_rows
+
+                den_contrib = None
+                if masked:
+                    # Observed-only denominator weight:
+                    #   KL -> 1 (sum of Z over observed columns)
+                    #   FR -> Xhat at the observed entry = <A[row], Z[col]>
+                    if divergence == "kl":
+                        den_w = cp.full(nnz_b, den_scale, dtype=Z_rows.dtype)
+                    else:  # "fr"
+                        den_w = cp.sum(A_d[r_i] * Z_rows, axis=1) * den_scale
+                    S_den = cpx_sparse.csr_matrix(
+                        (den_w, (row_idx_b, col_idx_b)),
+                        shape=(numerator.shape[0], nnz_b),
+                    )
+                    den_contrib = S_den @ Z_rows
+            else:
+                # CHANGED (2026-07-29): scatter-free batch body — mirrors
+                # distance.py::kl_factor_update_largedim. The row-dot is a fused
+                # sampled dot (SDDMM) and the SpMM runs against the UNGATHERED
+                # Z_u via the (m, I) transposed batch matrix P, so the
+                # (nnz_b, R) Z_rows gather is never materialized. With a
+                # grouping, P is built sort-free from the segment offsets.
+                # Contributions still land in locals first (atomic commit).
+                m_b = batch_end - batch_start
+                if grouping is not None:
+                    indptr_b = (segment_offsets[batch_start:batch_end + 1] - seg_lo).astype(cp.int32)
+                else:
+                    # Uncached batches must be column-grouped up front so
+                    # P.data order equals entry order (see group_batch_by_column).
+                    indptr_b, u_i, r_i, v_i = group_batch_by_column(u_i, m_b, r_i, v_i)
+
+                if divergence == "kl":
+                    R_nz = cp.clip(sampled_row_dots(A_d, Z_u, r_i, u_i), a_min=epsilon, a_max=None)
+                    w = v_i / R_nz
+                else:  # "fr"
+                    w = v_i
+
+                P = build_batch_csr_T(w, r_i, m_b, numerator.shape[0], indptr_b)
+                num_contrib = spmm_T(P, Z_u)
+
+                den_contrib = None
+                if masked:
+                    # Observed-only denominator weight:
+                    #   KL -> 1 (sum of Z over observed columns)
+                    #   FR -> Xhat at the observed entry = <A[row], Z[col]>
+                    if divergence == "kl":
+                        den_w = cp.full(nnz_b, den_scale, dtype=Z_u.dtype)
+                    else:  # "fr"
+                        den_w = sampled_row_dots(A_d, Z_u, r_i, u_i) * den_scale
+                    P_den = same_pattern_csr(P, den_w)
+                    den_contrib = spmm_T(P_den, Z_u)
 
             # Every allocation for this batch succeeded → commit atomically.
             numerator += num_contrib
@@ -489,7 +538,7 @@ def _partial_numerator_for_shard(
             # Drop this attempt's large temporaries, return cached blocks to the
             # driver so the out-of-pool cuBLAS/cuSPARSE workspace has room, then
             # retry the *same* columns at half the width.
-            Z_u = Z_rows = num_contrib = den_contrib = S_b = None
+            Z_u = Z_rows = num_contrib = den_contrib = S_b = P = P_den = None
             mempool.free_all_blocks()
             try:
                 free_b, total_b = cp.cuda.runtime.memGetInfo()

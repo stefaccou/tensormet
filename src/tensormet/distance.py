@@ -20,7 +20,13 @@ from tensormet.sparse_ops import (
     ptl_tucker_to_tensor,
     gather_dense_at_block_nz,
     safe_ravel,
-    compute_Zcols_batch
+    compute_Zcols_batch,
+    use_legacy_factor_batch,
+    sampled_row_dots,
+    group_batch_by_column,
+    build_batch_csr_T,
+    same_pattern_csr,
+    spmm_T,
 )
 from tensormet.utils import ThreadBudget, einsum_letters, cp_einsum_optimize, make_lazy_cupy_pair, lazy_import
 
@@ -481,23 +487,34 @@ def _rhat_from_factor_rows_sequential(core, mats, epsilon=1e-12):
     Returns
     -------
     r_hat : (b,)
+
+    DO NOT rewrite this as a single ``cp.einsum("abc,ia,ib,ic->i", ...)``.
+    The batch index ``i`` is free in every operand, so a contraction path that
+    pairs the factor-row matrices with each other before touching the core
+    materializes the full (b, R0, R1, ..., R_{N-1}) outer product — and CuPy's
+    binary einsum has no memory-efficient (fused) kernel, so it really does
+    allocate it (``arr0 * arr1`` in cupy/linalg/_einsum.py). Worse, the path
+    choice depends on ``b``, which ``_estimate_batch_rhat_for_tensordot`` derives
+    from *free VRAM*: the same code picked a safe path on a 24 GB card and a
+    1.3 TB intermediate on an 80 GB node at rank 100 (b ≈ 166k).
+
+    The fixed order below peels one mode at a time, so the largest live array is
+    (b, prod(R[1:])) — exactly what ``_estimate_batch_rhat_for_tensordot``
+    budgets for, on every machine.
     """
     N = core.ndim
-    letters = einsum_letters(N)
-    core_sub = "".join(letters)                   # e.g. 'abc' for N=3
-    mat_subs = ["i" + l for l in letters]         # e.g. ['ia', 'ib', 'ic']
-    eq = core_sub + "," + ",".join(mat_subs) + "->i"
-    r_hat = cp.einsum(eq, core, *mats, optimize=cp_einsum_optimize(1 + N))
-    return cp.clip(r_hat, a_min=epsilon, a_max=None)
+    b = int(mats[0].shape[0])
 
-    # -- old sequential tensordot+loop approach (kept for reference) --
-    # b = mats[0].shape[0]
-    # # tmp[b, R1, R2, ...] = sum_{r0} mats0[b,r0] * core[r0, R1, ...]
-    # tmp = cp.tensordot(mats[0], core, axes=(1, 0))  # (b, R1, R2, ..., R_{N-1})
-    # for n in range(1, N):
-    #     shp = (b, mats[n].shape[1]) + (1,) * (tmp.ndim - 2)
-    #     tmp = cp.sum(tmp * mats[n].reshape(shp), axis=1)
-    # return cp.clip(tmp, a_min=epsilon, a_max=None)
+    # tmp[b, (R1 R2 ... R_{N-1})] = sum_{r0} mats[0][b, r0] * core[r0, ...]
+    tmp = mats[0] @ core.reshape(core.shape[0], -1)
+    for n in range(1, N):
+        Rn = int(mats[n].shape[1])
+        # (b, 1, Rn) @ (b, Rn, rest) -> (b, 1, rest): a strided-batched GEMM, so
+        # the Rn axis is reduced inside cuBLAS instead of via a broadcast
+        # multiply that would need a second (b, Rn, rest) temporary.
+        tmp = cp.matmul(mats[n][:, None, :], tmp.reshape(b, Rn, -1))[:, 0, :]
+
+    return cp.clip(tmp.reshape(b), a_min=epsilon, a_max=None)
 
 def _accumulate_core_num_outer(Num, w, mats):
     """
@@ -1166,32 +1183,64 @@ def kl_factor_update_largedim(
             v_i = vals[nz_idx]             # (nnz_b,)
             u_i = inv[nz_idx] - start      # local [0..m)
 
-        A_rows = A[r_i]                # (nnz_b, R_mode)
-        Z_rows = Z_u[u_i]              # (nnz_b, R_mode)
-
-        # (A Z)_nz
-        R_nz = cp.sum(A_rows * Z_rows, axis=1)
-        R_nz = cp.clip(R_nz, a_min=epsilon, a_max=None)
-
-        W_data = v_i / R_nz            # (nnz_b,)
-
-        # numerator[row] += W * Z  — cuSPARSE SpMM (no serialised atomics)
         nnz_b = int(r_i.size)
-        col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
-        row_idx_b = r_i.astype(cp.int32)
-        S_b = cpx_sparse.csr_matrix(
-            (W_data, (row_idx_b, col_idx_b)),
-            shape=(numerator.shape[0], nnz_b),
-        )
-        numerator += S_b @ Z_rows
 
-        if masked:
-            # denominator[i, r] += sum_{k: row=i} Z_rows[k, r]  (weight 1 per observed entry)
-            S_one = cpx_sparse.csr_matrix(
-                (cp.ones(nnz_b, dtype=Z_rows.dtype), (row_idx_b, col_idx_b)),
+        if use_legacy_factor_batch():
+            # Legacy body (pre 2026-07-29): two (nnz_b, R) gathers + an
+            # (I, nnz_b) arange-column CSR faking the scatter-add. Kept behind
+            # TENSORMET_LEGACY_FACTOR_BATCH=1 for A/B validation.
+            A_rows = A[r_i]                # (nnz_b, R_mode)
+            Z_rows = Z_u[u_i]              # (nnz_b, R_mode)
+
+            # (A Z)_nz
+            R_nz = cp.sum(A_rows * Z_rows, axis=1)
+            R_nz = cp.clip(R_nz, a_min=epsilon, a_max=None)
+
+            W_data = v_i / R_nz            # (nnz_b,)
+
+            # numerator[row] += W * Z  — cuSPARSE SpMM (no serialised atomics)
+            col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
+            row_idx_b = r_i.astype(cp.int32)
+            S_b = cpx_sparse.csr_matrix(
+                (W_data, (row_idx_b, col_idx_b)),
                 shape=(numerator.shape[0], nnz_b),
             )
-            denominator_acc += S_one @ Z_rows
+            numerator += S_b @ Z_rows
+
+            if masked:
+                # denominator[i, r] += sum_{k: row=i} Z_rows[k, r]  (weight 1 per observed entry)
+                S_one = cpx_sparse.csr_matrix(
+                    (cp.ones(nnz_b, dtype=Z_rows.dtype), (row_idx_b, col_idx_b)),
+                    shape=(numerator.shape[0], nnz_b),
+                )
+                denominator_acc += S_one @ Z_rows
+            continue
+
+        # CHANGED (2026-07-29): scatter-free batch body. R_nz comes from a
+        # fused sampled row-dot (SDDMM) instead of two (nnz_b, R) gathers, and
+        # the numerator SpMM runs against the UNGATHERED Z_u via the (m, I)
+        # transposed batch matrix P — Z_rows is never materialized. With a
+        # grouping, P is built sort-free straight from the segment offsets.
+        m_b = end - start                  # rows of P == Z_u.shape[0]
+        if grouping is not None:
+            indptr_b = (segment_offsets[start:end + 1] - seg_lo).astype(cp.int32)
+        else:
+            # Uncached batches must be column-grouped up front so P.data order
+            # equals entry order (see group_batch_by_column).
+            indptr_b, u_i, r_i, v_i = group_batch_by_column(u_i, m_b, r_i, v_i)
+
+        R_nz = sampled_row_dots(A, Z_u, r_i, u_i)
+        R_nz = cp.clip(R_nz, a_min=epsilon, a_max=None)
+        W_data = v_i / R_nz                # (nnz_b,)
+
+        P = build_batch_csr_T(W_data, r_i, m_b, numerator.shape[0], indptr_b)
+        numerator += spmm_T(P, Z_u)
+
+        if masked:
+            # denominator[i, r] += sum_{k: row=i} Z_u[u_k, r]  (weight 1 per
+            # observed entry) — same pattern as P, data swapped to ones.
+            P_one = same_pattern_csr(P, cp.ones(nnz_b, dtype=Z_u.dtype))
+            denominator_acc += spmm_T(P_one, Z_u)
 
     if masked:
         denominator = denominator_acc
@@ -1506,26 +1555,51 @@ def fr_factor_update_largedim(
             v_i = vals[nz_idx]          # (nnz_b,)
             u_i = inv[nz_idx] - start   # local index into this batch [0..m)
 
-        Z_rows = Z_u[u_i]           # (nnz_b, R_mode)
-
-        # numerator[row] += X_ij * Z[j,:]  — cuSPARSE SpMM (no serialised atomics)
         nnz_b = int(r_i.size)
-        col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
-        row_idx_b = r_i.astype(cp.int32)
-        S_b = cpx_sparse.csr_matrix(
-            (v_i, (row_idx_b, col_idx_b)),
-            shape=(numerator.shape[0], nnz_b),
-        )
-        numerator += S_b @ Z_rows
+
+        if use_legacy_factor_batch():
+            # Legacy body (pre 2026-07-29), kept behind
+            # TENSORMET_LEGACY_FACTOR_BATCH=1 for A/B validation.
+            Z_rows = Z_u[u_i]           # (nnz_b, R_mode)
+
+            # numerator[row] += X_ij * Z[j,:]  — cuSPARSE SpMM (no serialised atomics)
+            col_idx_b = cp.arange(nnz_b, dtype=cp.int32)
+            row_idx_b = r_i.astype(cp.int32)
+            S_b = cpx_sparse.csr_matrix(
+                (v_i, (row_idx_b, col_idx_b)),
+                shape=(numerator.shape[0], nnz_b),
+            )
+            numerator += S_b @ Z_rows
+
+            if masked:
+                # Xhat at these observed entries = <A[row], Z[col]>
+                xhat_b = cp.sum(A[r_i] * Z_rows, axis=1)  # (nnz_b,)
+                S_den = cpx_sparse.csr_matrix(
+                    (xhat_b, (row_idx_b, col_idx_b)),
+                    shape=(numerator.shape[0], nnz_b),
+                )
+                denominator_acc += S_den @ Z_rows
+            continue
+
+        # CHANGED (2026-07-29): scatter-free batch body — same restructuring as
+        # kl_factor_update_largedim (see there). FR numerator weights are the
+        # raw values v_i, so no sampled row-dot is needed unless masked.
+        m_b = end - start
+        if grouping is not None:
+            indptr_b = (segment_offsets[start:end + 1] - seg_lo).astype(cp.int32)
+        else:
+            # Uncached batches must be column-grouped up front so P.data order
+            # equals entry order (see group_batch_by_column).
+            indptr_b, u_i, r_i, v_i = group_batch_by_column(u_i, m_b, r_i, v_i)
+
+        P = build_batch_csr_T(v_i, r_i, m_b, numerator.shape[0], indptr_b)
+        numerator += spmm_T(P, Z_u)
 
         if masked:
             # Xhat at these observed entries = <A[row], Z[col]>
-            xhat_b = cp.sum(A[r_i] * Z_rows, axis=1)  # (nnz_b,)
-            S_den = cpx_sparse.csr_matrix(
-                (xhat_b, (row_idx_b, col_idx_b)),
-                shape=(numerator.shape[0], nnz_b),
-            )
-            denominator_acc += S_den @ Z_rows
+            xhat_b = sampled_row_dots(A, Z_u, r_i, u_i)  # (nnz_b,)
+            P_den = same_pattern_csr(P, xhat_b)
+            denominator_acc += spmm_T(P_den, Z_u)
 
     if masked:
         denominator = cp.clip(denominator_acc, a_min=epsilon, a_max=None)

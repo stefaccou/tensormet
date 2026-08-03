@@ -3,7 +3,9 @@ import tensorly as tl
 import numpy as np
 from typing import List, Tuple, Optional, Union
 import math
-from tensormet.utils import einsum_letters, cp_einsum_optimize, make_lazy_cupy_pair, lazy_import
+import os
+import threading
+from tensormet.utils import make_lazy_cupy_pair, lazy_import
 
 # pytensorlab transitively imports TensorFlow + VTK (~200s); defer it until used.
 ptl = lazy_import("pytensorlab")
@@ -398,38 +400,311 @@ def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=
     Z_u : (m, R_mode)
         Row t is the reconstructed unfolded column corresponding to the
         coordinates encoded in idxs_by_mode for batch item t.
+
+    DO NOT rewrite this as a single ``cp.einsum("abc,ib,ic->ia", ...)`` — same
+    trap as ``_rhat_from_factor_rows_sequential`` in distance.py, see the note
+    there. The batch index is free in every factor-row operand, so an einsum
+    path that pairs those operands first blows up to (m, R0, ..., R_{N-1}).
     """
     if not other_modes:
         m = len(list(idxs_by_mode.values())[0]) if idxs_by_mode else 1
         return cp.clip(cp.tile(core, (m, 1)), a_min=epsilon, a_max=None)
 
-    N = core.ndim
-    letters = einsum_letters(N)
-    core_sub = "".join(letters)                              # e.g. 'abc' for N=3
-    mat_subs = ["i" + letters[k] for k in other_modes]      # batch × rank for each contracted mode
-    out_sub  = "i" + letters[mode]                           # keep batch + target-mode rank
-    eq = core_sub + "," + ",".join(mat_subs) + "->" + out_sub
-    mats = [factors[k][idxs_by_mode[k]] for k in other_modes]
-    tmp = cp.einsum(eq, core, *mats, optimize=cp_einsum_optimize(1 + len(other_modes)))
-    return cp.clip(tmp, a_min=epsilon, a_max=None)
+    R_mode = int(core.shape[mode])
+    k0 = other_modes[0]
+    M0 = factors[k0][idxs_by_mode[k0]]                       # (m, R_k0)
+    m = int(M0.shape[0])
 
-    # -- old tensordot+broadcast-sum loop (kept for reference) --
-    # k0 = other_modes[0]
-    # M0 = factors[k0][idxs_by_mode[k0]]  # (m, R_k0)
-    # m = M0.shape[0]
-    # tmp = cp.tensordot(M0, core, axes=(1, k0))
-    # remaining_axes = [i for i in range(core.ndim) if i != k0]
-    # for k in other_modes[1:]:
-    #     M = factors[k][idxs_by_mode[k]]  # (m, R_k)
-    #     axis_idx = 1 + remaining_axes.index(k)
-    #     bcast_shape = [1] * tmp.ndim
-    #     bcast_shape[0] = m
-    #     bcast_shape[axis_idx] = M.shape[1]
-    #     tmp = cp.sum(tmp * M.reshape(bcast_shape), axis=axis_idx)
+    # Lay the core out as (R_k0, R_k1, ..., R_mode) so the contracted modes are
+    # peeled off the front in a fixed order and `mode` survives as the last axis.
+    # The copy is core-sized (negligible next to the m-row intermediates) and is
+    # what cp.tensordot would have done internally anyway.
+    G = cp.ascontiguousarray(cp.transpose(core, tuple(other_modes) + (mode,)))
+
+    # Peak live array is (m, prod(R_k) for k != k0) — exactly the working set
+    # _estimate_batch_cols_for_Z budgets for.
+    tmp = M0 @ G.reshape(G.shape[0], -1)
+    for k in other_modes[1:]:
+        M = factors[k][idxs_by_mode[k]]                      # (m, R_k)
+        Rk = int(M.shape[1])
+        tmp = cp.matmul(M[:, None, :], tmp.reshape(m, Rk, -1))[:, 0, :]
+
+    return cp.clip(tmp.reshape(m, R_mode), a_min=epsilon, a_max=None)
     #     remaining_axes.remove(k)
     # if tmp.ndim != 2:
     #     raise RuntimeError(f"Expected 2D result after contractions, got shape {tmp.shape}")
     # return cp.clip(tmp, a_min=epsilon, a_max=None)
+
+
+# ---------------------------------------------------------------------------
+# Factor-update batch helpers (2026-07-29: SDDMM-style sampled row-dot and
+# scatter-free SpMM for the largedim MU inner loop).
+#
+# The legacy batch body gathered two (nnz_b, R) dense temporaries per batch
+# (A[r_i], Z_u[u_i]) and faked a scatter-add with an (I, nnz_b) CSR whose
+# columns were arange(nnz_b). These helpers replace that with:
+#   - sampled_row_dots: per-entry <A[r], Z[u]> without materializing either
+#     gather (an SDDMM: entries of A @ Z.T at the NNZ pattern);
+#   - build_batch_csr_T + spmm_T: one (m, I) CSR against the UNGATHERED Z_u,
+#     built sort-free from a ModeGrouping's segment offsets when available.
+# Set TENSORMET_LEGACY_FACTOR_BATCH=1 to restore the old batch body (A/B).
+# ---------------------------------------------------------------------------
+
+LEGACY_FACTOR_BATCH = os.environ.get("TENSORMET_LEGACY_FACTOR_BATCH", "") not in ("", "0", "false", "False")
+
+
+def use_legacy_factor_batch():
+    """Read the legacy-batch flag at call time, so the validation script can
+    toggle ``sparse_ops.LEGACY_FACTOR_BATCH`` in-process for A/B comparison
+    (a ``from``-import of the constant would freeze the import-time value)."""
+    return LEGACY_FACTOR_BATCH
+
+# Opt-out of the fused kernel (fall back to gather + row-dot) without touching
+# the SpMM restructuring: TENSORMET_SAMPLED_DOT=gather.
+_SAMPLED_DOT_MODE = os.environ.get("TENSORMET_SAMPLED_DOT", "kernel")
+
+_sampled_row_dot_kernel = None
+
+
+def _get_sampled_row_dot_kernel():
+    global _sampled_row_dot_kernel
+    if _sampled_row_dot_kernel is None:
+        _sampled_row_dot_kernel = cp.ElementwiseKernel(
+            "int64 r, int64 u, raw T A, raw T Z, int64 ncol",
+            "T y",
+            """
+            T acc = (T)0;
+            const long long ra = r * ncol;
+            const long long za = u * ncol;
+            for (long long k = 0; k < ncol; ++k) {
+                acc += A[ra + k] * Z[za + k];
+            }
+            y = acc;
+            """,
+            "tensormet_sampled_row_dot",
+        )
+    return _sampled_row_dot_kernel
+
+
+def sampled_row_dots(A, Z, r_idx, u_idx):
+    """Per-entry row dot <A[r_idx[k], :], Z[u_idx[k], :]> -> (nnz_b,).
+
+    Equivalent to ``cp.sum(A[r_idx] * Z[u_idx], axis=1)`` (the entries of the
+    dense product ``A @ Z.T`` sampled at ``(r_idx, u_idx)``, i.e. an SDDMM),
+    but computed by a fused kernel that never materializes the two (nnz_b, R)
+    gathers or the (nnz_b, R) product temporary.
+
+    ``A`` and ``Z`` must have the same number of columns (both are R_mode wide
+    in the factor update). Mixed dtypes are promoted to their common dtype.
+    """
+    if _SAMPLED_DOT_MODE == "gather":
+        return cp.sum(A[r_idx] * Z[u_idx], axis=1)
+    if A.dtype != Z.dtype:
+        common = cp.result_type(A.dtype, Z.dtype)
+        A = A.astype(common, copy=False)
+        Z = Z.astype(common, copy=False)
+    A = cp.ascontiguousarray(A)
+    Z = cp.ascontiguousarray(Z)
+    kern = _get_sampled_row_dot_kernel()
+    return kern(r_idx.astype(cp.int64, copy=False), u_idx.astype(cp.int64, copy=False),
+                A, Z, cp.int64(A.shape[1]))
+
+
+def group_batch_by_column(u_idx, m, *arrays):
+    """Sort one batch's per-entry arrays by local column ``u_idx`` and build
+    the CSR indptr of the (m, I) transposed batch matrix.
+
+    Uncached-path counterpart of the ModeGrouping segment offsets. Returns
+    ``(indptr, u_sorted, *arrays_sorted)``.
+
+    CHANGED (2026-07-29 fix): the uncached path originally built P through the
+    COO->CSR constructor, whose internal sort left ``P.data`` in SORTED order
+    while per-entry weights handed to ``same_pattern_csr`` (masked FR
+    denominator) stayed in ENTRY order — silently misaligning them. Sorting
+    the batch up front makes entry order and P.data order identical, exactly
+    like the grouping path, so pattern reuse is valid by construction.
+    """
+    order = cp.argsort(u_idx)
+    u_sorted = u_idx[order]
+    counts = cp.bincount(u_sorted, minlength=m)
+    indptr = cp.concatenate(
+        (cp.zeros(1, dtype=counts.dtype), cp.cumsum(counts))
+    ).astype(cp.int32)
+    return (indptr, u_sorted) + tuple(a[order] for a in arrays)
+
+
+def build_batch_csr_T(data, r_idx, m, n_rows, indptr):
+    """Build the transposed batch matrix P of shape (m, n_rows) for one
+    factor-update column batch: row j holds the batch entries of local
+    column j, at columns ``r_idx`` with values ``data``.
+
+    ``P.T @ Z_u`` then scatter-adds each entry's weighted Z row into the
+    numerator without ever gathering ``Z_u[u_idx]`` (see spmm_T).
+
+    ``data``/``r_idx`` MUST be grouped by local column with ``indptr`` marking
+    the runs — straight from the ModeGrouping segment offsets, or from
+    group_batch_by_column on the uncached path. Construction is then sort-free
+    and ``P.data`` preserves entry order (same_pattern_csr relies on this).
+    """
+    return cpx_sparse.csr_matrix(
+        (data, r_idx.astype(cp.int32, copy=False), indptr),
+        shape=(m, n_rows),
+    )
+
+
+def same_pattern_csr(P, data):
+    """CSR sharing P's indices/indptr (no copy) with different values."""
+    return cpx_sparse.csr_matrix((data, P.indices, P.indptr), shape=P.shape)
+
+
+# spmm_T backend, resolved on the first call (or explicitly via
+# probe_spmm_backends). Candidates, tried in order:
+#   "cusparse_f" -> cupyx.cusparse.spmm(P, asfortranarray(B), transa=True)
+#                   (several CuPy versions ASSERT the dense operand is
+#                   F-contiguous, so this is the variant most likely to work)
+#   "cusparse_c" -> same call with a C-contiguous dense operand
+#   "operator"   -> P.T @ B (always correct; cupyx may convert internally)
+# Set TENSORMET_SPMM_T to any of the three names to pin the backend and skip
+# the probe. Rejected candidates and their reasons land in _SPMM_T_PROBE.
+_SPMM_T_BACKEND = os.environ.get("TENSORMET_SPMM_T") or None
+_SPMM_T_PROBE: dict = {}
+
+# The probe writes a module global that every shard thread reads
+# (_sharded_factor_update runs n_shards workers in one process), so it needs a
+# lock: without one, two threads can probe concurrently and a third can observe
+# _SPMM_T_BACKEND between the assignment and the probe completing.
+_SPMM_T_LOCK = threading.Lock()
+_SPMM_T_NONCANONICAL = 0        # count of calls that needed canonicalization
+
+
+def _is_canonical(P) -> bool:
+    """Whether P satisfies cuSPARSE's canonical-format precondition.
+
+    CuPy computes ``has_canonical_format`` from the actual indices (sorted
+    within each row, no duplicates) rather than tracking it as a construction
+    flag, so it is a property of THIS matrix, not of the build path.
+    """
+    try:
+        return bool(P.has_canonical_format)
+    except Exception:
+        return False
+
+
+def _canonicalize(P):
+    """A canonical copy of P, leaving the caller's P untouched.
+
+    ``sum_duplicates`` sorts indices within each row and adds any duplicate
+    (row, col) entries — which is what P.T @ B does with them anyway, so the
+    product is unchanged. Copying matters: the caller may still hold P for
+    ``same_pattern_csr``, and mutating it in place would leave those reused
+    indices sorted while the separately-computed weights stay in entry order,
+    reintroducing exactly the misalignment the 2026-07-29 group_batch_by_column
+    fix removed.
+    """
+    Pc = P.copy()
+    Pc.sum_duplicates()
+    return Pc
+
+
+def _spmm_call(backend, P, B):
+    if backend == "operator":
+        return P.T @ B
+    import cupyx.cusparse as _cux
+    if backend == "cusparse_f":
+        return _cux.spmm(P, cp.asfortranarray(B), transa=True)
+    if backend == "cusparse_c":
+        return _cux.spmm(P, cp.ascontiguousarray(B), transa=True)
+    raise ValueError(
+        f"unknown spmm_T backend {backend!r} "
+        "(valid: 'cusparse_f', 'cusparse_c', 'operator')"
+    )
+
+
+def probe_spmm_backends(P=None, B=None, verbose=False):
+    """Validate each cuSPARSE spmm_T candidate against the operator path and
+    cache the first one that matches; fall back to "operator" if none does.
+
+    Per-candidate outcomes (exception repr, shape/numeric mismatch, or "ok")
+    are recorded in ``_SPMM_T_PROBE`` so a fallback is diagnosable instead of
+    silent. Call with no arguments (a tiny built-in example is used) from a
+    notebook to inspect availability; ``spmm_T`` calls it lazily otherwise.
+    """
+    global _SPMM_T_BACKEND
+    if P is None:
+        rs = np.random.default_rng(0)
+        m, n_rows, R = 6, 5, 3
+        u = cp.asarray(np.sort(rs.integers(0, m, 20)))
+        r = cp.asarray(rs.integers(0, n_rows, 20))
+        w = cp.asarray(rs.random(20))
+        indptr, u, r, w = group_batch_by_column(u, m, r, w)
+        P = build_batch_csr_T(w, r, m, n_rows, indptr)
+        B = cp.asarray(rs.random((m, R)))
+    ref = P.T @ B
+    # Probe the BACKEND, not this particular matrix: feed the cuSPARSE
+    # candidates a canonical P so a non-canonical first batch cannot condemn
+    # them permanently. spmm_T canonicalizes per call for the same reason.
+    P_probe = P if _is_canonical(P) else _canonicalize(P)
+    chosen = "operator"
+    for backend in ("cusparse_f", "cusparse_c"):
+        try:
+            out = _spmm_call(backend, P_probe, B)
+        except Exception as exc:
+            _SPMM_T_PROBE[backend] = f"raised: {exc!r}"
+            continue
+        if out.shape != ref.shape:
+            _SPMM_T_PROBE[backend] = f"wrong shape {out.shape}, expected {ref.shape}"
+        elif not bool(cp.allclose(out, ref, rtol=1e-5, atol=1e-8)):
+            _SPMM_T_PROBE[backend] = "numeric mismatch vs operator path"
+        else:
+            _SPMM_T_PROBE[backend] = "ok"
+            chosen = backend
+            break
+    _SPMM_T_BACKEND = chosen
+    if verbose:
+        for k, v in _SPMM_T_PROBE.items():
+            print(f"  {k:12s}: {v}")
+        print(f"  -> spmm_T backend: {chosen}")
+    return chosen
+
+
+def spmm_T_backend():
+    """The resolved spmm_T backend name, or 'unresolved' before first use."""
+    return _SPMM_T_BACKEND or "unresolved"
+
+
+def spmm_T(P, B):
+    """Compute ``P.T @ B`` for CSR P (m, I) and dense B (m, R) -> (I, R).
+
+    Prefers cuSPARSE SpMM with the transposed-A op (no materialized transpose
+    or format conversion); the backend is resolved once by probe_spmm_backends
+    (or pinned via TENSORMET_SPMM_T) and reused for every call.
+
+    The canonical-format check is per call, deliberately. cupyx.cusparse.spmm
+    asserts ``a.has_canonical_format``, and that is a property of the individual
+    matrix, not a capability of the backend — so the one-shot probe cannot
+    settle it. build_batch_csr_T orders P's columns by the tensor row ids
+    ``r_idx`` in entry order, which is ascending-and-unique for some batches and
+    not for others; probing on a batch that happened to be canonical and then
+    reusing that verdict is what produced the AssertionError at
+    cupyx/cusparse.py:1481 on 2026-07-31.
+    """
+    global _SPMM_T_NONCANONICAL
+    if _SPMM_T_BACKEND is None:
+        with _SPMM_T_LOCK:
+            if _SPMM_T_BACKEND is None:        # re-check: another thread may have probed
+                probe_spmm_backends(P, B)
+    backend = _SPMM_T_BACKEND
+    if backend != "operator" and not _is_canonical(P):
+        _SPMM_T_NONCANONICAL += 1
+        P = _canonicalize(P)
+    return _spmm_call(backend, P, B)
+
+
+def spmm_T_stats():
+    """(backend, calls that needed canonicalization). A large count means the
+    sort-free build in build_batch_csr_T is not paying off and the batch would
+    be better grouped by (column, row) up front."""
+    return spmm_T_backend(), _SPMM_T_NONCANONICAL
 
 
 def _nndsvd_factors(U: np.ndarray, s: np.ndarray) -> np.ndarray:

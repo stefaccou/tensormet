@@ -266,11 +266,21 @@ def launch_nnt_decomposition(cfg):
         if roles is not None
         else ["root", "nsubj", "obj"]  # legacy fallback default
     )
+    # The stretch from here to the decomposition loop's "routing path:" line used
+    # to print nothing at all — vocab load, eval-sentence load, tensor load and
+    # trainer construction were one silent block. A stall anywhere in it (shared
+    # filesystem, or a hung NCCL comm init on the sharded path) produced a job
+    # that sat until walltime with no clue where. These markers make the stall
+    # point readable straight off the .out file.
+    print(f"[{time.strftime('%H:%M:%S')}] vocab loaded ({len(vocab)} entries), "
+          f"roles={parquet_roles}", flush=True)
 
 
 
 
     vector_path = os.path.join(DATA_DIR, "vectors", cfg.exp.dataset)
+    print(f"[{time.strftime('%H:%M:%S')}] loading eval sentences from {vector_path}...",
+          flush=True)
     sentence_sample = load_eval_sentences_cached_parquet(vector_path=vector_path,
                                                          dataset=cfg.exp.dataset,
                                                          roles=parquet_roles,
@@ -283,8 +293,8 @@ def launch_nnt_decomposition(cfg):
         # print("cleaned sample in ", time.time() - start)
     else:
         clean_sample = sentence_sample
-
-    # print("loaded sentence sample")
+    print(f"[{time.strftime('%H:%M:%S')}] eval sentences ready "
+          f"({len(clean_sample)} samples)", flush=True)
 
     # Working paths follow train.hpc: under HPC mode they live on node-local
     # $TMPDIR so the hot-loop writes never hit shared GPFS. final_paths is the
@@ -315,6 +325,9 @@ def launch_nnt_decomposition(cfg):
 
     start_time = time.time()
 
+    print(f"[{time.strftime('%H:%M:%S')}] loading sparse tensor from disk "
+          f"(dataset={cfg.exp.dataset}, order={cfg.exp.order}, dim={cfg.exp.dim})...",
+          flush=True)
     sparse_tensor = SparseTupleTensor.load_from_disk(
         dataset=cfg.exp.dataset,
         method=cfg.exp.method,
@@ -323,6 +336,8 @@ def launch_nnt_decomposition(cfg):
         tier1=cfg.train.tier1,
         shared_factors=cfg.exp.shared_factors,
     )
+    print(f"[{time.strftime('%H:%M:%S')}] sparse tensor loaded; entering "
+          f"non_negative_tucker_with_similarity", flush=True)
 
 
 
@@ -372,13 +387,16 @@ def launch_nnt_decomposition(cfg):
 
         # Persist timings next to the other per-run artifacts so downstream
         # tooling (e.g. scripts/benchmarking.sh) can report a decomposition time
-        # distinct from total process runtime. decomp_seconds is the loop-only
-        # time from non_negative_tucker_with_similarity; runtime_seconds also
-        # includes data loading and sparse conversion.
+        # distinct from total process runtime. solve_seconds is the summed
+        # iteration time (updates + error kernels), decomp_seconds the full loop
+        # (adds in-loop semantic evaluation), and runtime_seconds also includes
+        # data loading and sparse conversion.
         with open(paths["timing_json"], "w") as f:
             json.dump(
                 {
                     "decomp_seconds": tucker_decomp_info.get("decomp_seconds"),
+                    "solve_seconds": tucker_decomp_info.get("solve_seconds"),
+                    "iter_seconds": tucker_decomp_info.get("iter_seconds"),
                     "runtime_seconds": round(end_time - start_time, 2),
                 },
                 f,
