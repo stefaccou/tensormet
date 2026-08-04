@@ -5,7 +5,7 @@ from typing import List, Tuple, Optional, Union
 import math
 import os
 import threading
-from tensormet.utils import make_lazy_cupy_pair, lazy_import
+from tensormet.utils import einsum_letters, cp_einsum_optimize, make_lazy_cupy_pair, lazy_import
 
 # pytensorlab transitively imports TensorFlow + VTK (~200s); defer it until used.
 ptl = lazy_import("pytensorlab")
@@ -391,6 +391,25 @@ def gather_dense_at_block_nz(dense_nd: np.ndarray,
 #     Z_u = cp.clip(Z_u, a_min=epsilon, a_max=None)
 #     return Z_u
 
+# CHANGED (2026-08-04, perf regression fix): the einsum bodies of
+# compute_Zcols_batch and distance._rhat_from_factor_rows_sequential are the
+# default again. Their 2026-07-30 mode-at-a-time peel rewrites (m-batched
+# (1,R)x(R,rest) GEMVs) were identified by the Aug-03/04 bisect as the
+# iteration-time regression: the jul29 snapshot (einsum) is fast, the peel is
+# ~2x slower, and TENSORMET_LEGACY_FACTOR_BATCH=1 does not recover it. The
+# peel is kept behind TENSORMET_PEEL_CONTRACTION=1: it bounds the einsum's
+# machine-dependent path choice (a (b, R0..R_{N-1}) intermediate was once
+# materialized on an 80 GB node), so switch it on if a rank-space contraction
+# ever OOMs.
+PEEL_CONTRACTION = os.environ.get("TENSORMET_PEEL_CONTRACTION", "") not in ("", "0", "false", "False")
+
+
+def use_peel_contraction():
+    """Read the peel-contraction flag at call time so it can be toggled
+    in-process (``sparse_ops.PEEL_CONTRACTION = True``) for A/B comparison."""
+    return PEEL_CONTRACTION
+
+
 def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=1e-12):
     """
     Compute Z columns (as rows) for a batch of unfolding columns, without building full Z.
@@ -400,40 +419,37 @@ def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=
     Z_u : (m, R_mode)
         Row t is the reconstructed unfolded column corresponding to the
         coordinates encoded in idxs_by_mode for batch item t.
-
-    DO NOT rewrite this as a single ``cp.einsum("abc,ib,ic->ia", ...)`` — same
-    trap as ``_rhat_from_factor_rows_sequential`` in distance.py, see the note
-    there. The batch index is free in every factor-row operand, so an einsum
-    path that pairs those operands first blows up to (m, R0, ..., R_{N-1}).
     """
     if not other_modes:
         m = len(list(idxs_by_mode.values())[0]) if idxs_by_mode else 1
         return cp.clip(cp.tile(core, (m, 1)), a_min=epsilon, a_max=None)
 
-    R_mode = int(core.shape[mode])
-    k0 = other_modes[0]
-    M0 = factors[k0][idxs_by_mode[k0]]                       # (m, R_k0)
-    m = int(M0.shape[0])
+    if use_peel_contraction():
+        # Memory-bounded fallback: peel one mode at a time in a fixed order.
+        # Peak live array is (m, prod(R_k) for k != k0) — the working set
+        # _estimate_batch_cols_for_Z budgets for — but the m-batched tiny
+        # GEMVs make it measurably slower than the einsum path.
+        R_mode = int(core.shape[mode])
+        k0 = other_modes[0]
+        M0 = factors[k0][idxs_by_mode[k0]]                   # (m, R_k0)
+        m = int(M0.shape[0])
+        G = cp.ascontiguousarray(cp.transpose(core, tuple(other_modes) + (mode,)))
+        tmp = M0 @ G.reshape(G.shape[0], -1)
+        for k in other_modes[1:]:
+            M = factors[k][idxs_by_mode[k]]                  # (m, R_k)
+            Rk = int(M.shape[1])
+            tmp = cp.matmul(M[:, None, :], tmp.reshape(m, Rk, -1))[:, 0, :]
+        return cp.clip(tmp.reshape(m, R_mode), a_min=epsilon, a_max=None)
 
-    # Lay the core out as (R_k0, R_k1, ..., R_mode) so the contracted modes are
-    # peeled off the front in a fixed order and `mode` survives as the last axis.
-    # The copy is core-sized (negligible next to the m-row intermediates) and is
-    # what cp.tensordot would have done internally anyway.
-    G = cp.ascontiguousarray(cp.transpose(core, tuple(other_modes) + (mode,)))
-
-    # Peak live array is (m, prod(R_k) for k != k0) — exactly the working set
-    # _estimate_batch_cols_for_Z budgets for.
-    tmp = M0 @ G.reshape(G.shape[0], -1)
-    for k in other_modes[1:]:
-        M = factors[k][idxs_by_mode[k]]                      # (m, R_k)
-        Rk = int(M.shape[1])
-        tmp = cp.matmul(M[:, None, :], tmp.reshape(m, Rk, -1))[:, 0, :]
-
-    return cp.clip(tmp.reshape(m, R_mode), a_min=epsilon, a_max=None)
-    #     remaining_axes.remove(k)
-    # if tmp.ndim != 2:
-    #     raise RuntimeError(f"Expected 2D result after contractions, got shape {tmp.shape}")
-    # return cp.clip(tmp, a_min=epsilon, a_max=None)
+    N = core.ndim
+    letters = einsum_letters(N)
+    core_sub = "".join(letters)                              # e.g. 'abc' for N=3
+    mat_subs = ["i" + letters[k] for k in other_modes]      # batch × rank for each contracted mode
+    out_sub  = "i" + letters[mode]                           # keep batch + target-mode rank
+    eq = core_sub + "," + ",".join(mat_subs) + "->" + out_sub
+    mats = [factors[k][idxs_by_mode[k]] for k in other_modes]
+    tmp = cp.einsum(eq, core, *mats, optimize=cp_einsum_optimize(1 + len(other_modes)))
+    return cp.clip(tmp, a_min=epsilon, a_max=None)
 
 
 # ---------------------------------------------------------------------------

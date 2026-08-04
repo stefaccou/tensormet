@@ -22,6 +22,7 @@ from tensormet.sparse_ops import (
     safe_ravel,
     compute_Zcols_batch,
     use_legacy_factor_batch,
+    use_peel_contraction,
     sampled_row_dots,
     group_batch_by_column,
     build_batch_csr_T,
@@ -488,33 +489,34 @@ def _rhat_from_factor_rows_sequential(core, mats, epsilon=1e-12):
     -------
     r_hat : (b,)
 
-    DO NOT rewrite this as a single ``cp.einsum("abc,ia,ib,ic->i", ...)``.
-    The batch index ``i`` is free in every operand, so a contraction path that
-    pairs the factor-row matrices with each other before touching the core
-    materializes the full (b, R0, R1, ..., R_{N-1}) outer product — and CuPy's
-    binary einsum has no memory-efficient (fused) kernel, so it really does
-    allocate it (``arr0 * arr1`` in cupy/linalg/_einsum.py). Worse, the path
-    choice depends on ``b``, which ``_estimate_batch_rhat_for_tensordot`` derives
-    from *free VRAM*: the same code picked a safe path on a 24 GB card and a
-    1.3 TB intermediate on an 80 GB node at rank 100 (b ≈ 166k).
-
-    The fixed order below peels one mode at a time, so the largest live array is
-    (b, prod(R[1:])) — exactly what ``_estimate_batch_rhat_for_tensordot``
-    budgets for, on every machine.
+    The einsum body is the default: the 2026-08-03/04 bisect measured its
+    2026-07-30 peel rewrite (the branch below) as part of a ~2x iteration-time
+    regression. The peel is kept behind TENSORMET_PEEL_CONTRACTION=1 because
+    it bounds the einsum's machine-dependent path choice: the einsum path
+    depends on ``b`` (derived from free VRAM), and once materialized a
+    (b, R0, ..., R_{N-1}) intermediate on an 80 GB node at rank 100
+    (b ≈ 166k). If this contraction ever OOMs, flip the flag rather than
+    shrinking the batch estimate.
     """
+    if use_peel_contraction():
+        # Memory-bounded fallback: fixed-order peel, largest live array is
+        # (b, prod(R[1:])) — what _estimate_batch_rhat_for_tensordot budgets
+        # for — at the cost of b-batched (1, Rn) x (Rn, rest) GEMVs.
+        N = core.ndim
+        b = int(mats[0].shape[0])
+        tmp = mats[0] @ core.reshape(core.shape[0], -1)
+        for n in range(1, N):
+            Rn = int(mats[n].shape[1])
+            tmp = cp.matmul(mats[n][:, None, :], tmp.reshape(b, Rn, -1))[:, 0, :]
+        return cp.clip(tmp.reshape(b), a_min=epsilon, a_max=None)
+
     N = core.ndim
-    b = int(mats[0].shape[0])
-
-    # tmp[b, (R1 R2 ... R_{N-1})] = sum_{r0} mats[0][b, r0] * core[r0, ...]
-    tmp = mats[0] @ core.reshape(core.shape[0], -1)
-    for n in range(1, N):
-        Rn = int(mats[n].shape[1])
-        # (b, 1, Rn) @ (b, Rn, rest) -> (b, 1, rest): a strided-batched GEMM, so
-        # the Rn axis is reduced inside cuBLAS instead of via a broadcast
-        # multiply that would need a second (b, Rn, rest) temporary.
-        tmp = cp.matmul(mats[n][:, None, :], tmp.reshape(b, Rn, -1))[:, 0, :]
-
-    return cp.clip(tmp.reshape(b), a_min=epsilon, a_max=None)
+    letters = einsum_letters(N)
+    core_sub = "".join(letters)                   # e.g. 'abc' for N=3
+    mat_subs = ["i" + l for l in letters]         # e.g. ['ia', 'ib', 'ic']
+    eq = core_sub + "," + ",".join(mat_subs) + "->i"
+    r_hat = cp.einsum(eq, core, *mats, optimize=cp_einsum_optimize(1 + N))
+    return cp.clip(r_hat, a_min=epsilon, a_max=None)
 
 def _accumulate_core_num_outer(Num, w, mats):
     """

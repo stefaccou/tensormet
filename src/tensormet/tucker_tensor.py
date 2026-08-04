@@ -1752,15 +1752,21 @@ class SparseTupleTensor:
         # asynchronous, so the timer is bracketed by sync_devices() — without
         # it the per-iteration numbers measure kernel *queueing* and the cost
         # lands on whichever later iteration happens to block.
+        # CHANGED (2026-08-04, perf regression fix): the barriers run on log
+        # steps only. Syncing every iteration serialized the loop against the
+        # devices and was part of the Aug-03 iteration-time regression; the
+        # cost of the looser bracketing is only that a non-log iteration's
+        # queued tail is charged to the next log step's time=.
         _iter_seconds = []
         _sync_backend = "torch" if _is_sgd else "cupy"
         # Initialized so post-loop bookkeeping (e.g. "iterations": iteration + 1) is well
         # defined even if the loop body never executes (start_iteration >= n_iter_max).
         iteration = start_iteration - 1
         for iteration in range(start_iteration, n_iter_max):
-            sync_devices(_n_gpus, _sync_backend)
-            _iter_start = time.time()
             log_step = get_log_step(iteration, rec_log_every, rec_check_every)
+            if log_step:
+                sync_devices(_n_gpus, _sync_backend)
+            _iter_start = time.time()
             if _is_sgd:
                 # --- EXPERIMENTAL SGD solver (experimental/SGD/README.md) ---
                 # One iteration = a block of sgd_steps_per_iteration optimizer
@@ -1897,7 +1903,8 @@ class SparseTupleTensor:
                 if normalize_factors:
                     core, factors = tucker_normalize((core, factors))
 
-            sync_devices(_n_gpus, _sync_backend)
+            if log_step:
+                sync_devices(_n_gpus, _sync_backend)
             _iter_seconds.append(time.time() - _iter_start)
 
             if log_step:
@@ -2271,7 +2278,7 @@ class SparseTupleTensor:
         solve_seconds = float(sum(_iter_seconds))
         print(
             f"decomposition time: {solve_seconds:.2f}s "
-            f"(sum of {len(_iter_seconds)} device-synced iteration time(s)"
+            f"(sum of {len(_iter_seconds)} iteration time(s), device-synced at log steps"
             + (f", mean {solve_seconds / len(_iter_seconds):.2f}s" if _iter_seconds else "")
             + f"); {decomp_seconds:.2f}s for the whole loop including in-loop evaluation"
         )

@@ -4,30 +4,32 @@
 # checkpoint I/O) so per-iteration speed can be compared across code versions.
 #
 # usage:
-#   bash scripts/ngram/2026-08-03-regression_ab.sh <tag>                  # current code
-#   bash scripts/ngram/2026-08-03-regression_ab.sh <tag> <worktree-dir>   # old code
+#   bash scripts/ngram/2026-08-03-regression_ab.sh <tag>                        # current code
+#   bash scripts/ngram/2026-08-03-regression_ab.sh <tag> regression_code/<tag>  # old code
 #
-#   <tag>           short label, e.g. now / jul06 / jul02. Artifacts get the name
-#                   regr_<tag>, keeping every bisect rung separate.
-#   <worktree-dir>  optional: a git-worktree folder holding an old snapshot of the
-#                   repo. Its src/ is put on PYTHONPATH so python imports THAT
-#                   version of tensormet instead of the installed one. The script
-#                   verifies the import really comes from the worktree and ABORTS
-#                   if not — a run can no longer silently test the wrong code.
+#   <tag>          short label, e.g. now / jul06 / jul02. Artifacts get the name
+#                  regr_<tag>, keeping every bisect rung separate.
+#   second arg     optional: a snapshot folder from regression_code/ holding an
+#                  old version of the code (pre-extracted from git history; see
+#                  reviews/2026-08-03_bisect-walkthrough.md). Its src/ is put on
+#                  PYTHONPATH so python imports THAT version of tensormet instead
+#                  of the installed one. The script verifies the import really
+#                  comes from the snapshot and ABORTS if not — a run can no
+#                  longer silently test the wrong code.
 #
 # Compare across tags: the printed "time=" lines (median, skip the first) and the
 # final "TOTAL WALL TIME" line. Wall time is the safest cross-version metric —
-# the per-iteration time= changed meaning in the 2026-08-03 commit (it now
+# the per-iteration time= changed meaning in the 2026-08-03 code (it now
 # measures true execution instead of kernel queueing).
 
 set -euo pipefail
 
-TAG="${1:?usage: bash $0 <tag> [worktree-dir]}"
+TAG="${1:?usage: bash $0 <tag> [snapshot-dir]}"
 
 if [[ $# -ge 2 ]]; then
     WT="$(realpath "$2")"
     if [[ ! -d "$WT/src/tensormet" ]]; then
-        echo "ERROR: $WT/src/tensormet does not exist - is '$2' really a worktree folder?" >&2
+        echo "ERROR: $WT/src/tensormet does not exist - is '$2' really a snapshot folder?" >&2
         exit 1
     fi
     export PYTHONPATH="$WT/src"
@@ -36,7 +38,7 @@ fi
 CODE_FILE="$(python3 -c 'import tensormet, inspect; print(inspect.getfile(tensormet))')"
 echo "=== code under test: $CODE_FILE"
 if [[ $# -ge 2 && "$CODE_FILE" != "$WT"* ]]; then
-    echo "ERROR: python imported tensormet from OUTSIDE the worktree shown above." >&2
+    echo "ERROR: python imported tensormet from OUTSIDE the snapshot shown above." >&2
     echo "       Aborting so the run does not measure the wrong code." >&2
     exit 1
 fi

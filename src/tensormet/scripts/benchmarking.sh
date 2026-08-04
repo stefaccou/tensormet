@@ -84,7 +84,7 @@ read -r -a RANKS       <<< "${BENCH_RANKS:-10 50 100}"
 read -r -a DIVERGENCES <<< "${BENCH_DIVERGENCES:-kl fr}"
 DIM="${BENCH_DIM:-10000}"
 N_GPUS="${BENCH_N_GPUS:-2}"
-METHOD="${BENCH_METHOD:-scSoftPlus}"
+METHOD="${BENCH_METHOD:-counting}"
 # Free-text session label. Purely descriptive: it never touches run names or
 # combo keys, so a labelled session still diffs against an unlabelled one.
 NAME="${BENCH_NAME:-}"
