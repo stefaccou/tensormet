@@ -662,7 +662,14 @@ def resolve_checkpoint_path(path, decomp_path=None):
             "when path is None or an int."
         )
     decomp_path = Path(decomp_path)
-    checkpoint_dir = decomp_path.parent / f"{decomp_path.stem}_checkpoints"
+    # A prior update_from_path() call may have repointed decomp_path at a file
+    # already living inside a *_checkpoints/ dir; deriving "{stem}_checkpoints"
+    # from that would look for a nested dir that doesn't exist. Reuse the dir
+    # directly in that case instead.
+    if decomp_path.parent.name.endswith("_checkpoints"):
+        checkpoint_dir = decomp_path.parent
+    else:
+        checkpoint_dir = decomp_path.parent / f"{decomp_path.stem}_checkpoints"
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 

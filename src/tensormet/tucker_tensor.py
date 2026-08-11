@@ -311,8 +311,15 @@ class TuckerDecomposition:
     def update_from_path(self, path=None):
         resolved = resolve_checkpoint_path(path, self.decomp_path)
         tensor = torch.load(resolved, map_location="cpu", weights_only=False)
-        self.core = np_dispatch(tensor.core)
-        self.factors = np_dispatch(tensor.factors)
+        # SGD checkpoints are resumable dict payloads ({"core", "factors",
+        # "raw_state_dict", "optim_state", ...}, see SGDTrainer.checkpoint_payload)
+        # rather than a TuckerTensor, so plain attribute access fails on them.
+        if isinstance(tensor, dict):
+            core, factors = tensor["core"], tensor["factors"]
+        else:
+            core, factors = tensor.core, tensor.factors
+        self.core = np_dispatch(core)
+        self.factors = np_dispatch(factors)
         self.decomp_path = resolved
 
 

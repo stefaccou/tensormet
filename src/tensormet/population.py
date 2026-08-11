@@ -83,10 +83,36 @@ def _is_complete_pt(path: str) -> bool:
 
 
 # ── new top-level worker (must be picklable → module level) ─────
+def _required_subsets(cols_to_build, need_sii: bool) -> list[tuple]:
+    """Column subsets Pass 2 actually has to count.
+
+    The full joint is always needed — every value channel reads it. The *proper*
+    subsets of size 2..order-1 exist solely to feed the inclusion-exclusion
+    product in ``_sii_range`` / ``specific_interaction_information``; without sii
+    they are pure dead weight, since ``_build_pp_arrays`` only materialises them
+    under ``need["sii"]`` and ``subset_counters.clear()`` throws the rest away.
+
+    Skipping them is what makes high orders tractable. The full set has
+    ``2**order - 1 - order`` members (11 at order 4, 26 at order 5) and the
+    largest of them — the (order-1)-way subsets — each approach the joint in
+    entry count, so with sii off this cuts the per-batch group-by work and,
+    more importantly, the parent's peak RAM by close to that factor.
+    """
+    full = tuple(cols_to_build)
+    if not need_sii:
+        return [full]
+    return [
+        subset
+        for r in range(2, len(cols_to_build) + 1)
+        for subset in combinations(cols_to_build, r)
+    ]
+
+
 def _pass2_worker(
     shard_paths: list[str],
     cols_to_build: list[str],
     vocabs_max: dict[str, list],   # col → list of strings (picklable)
+    subsets: list[tuple],          # which subsets to count (see _required_subsets)
     batch_rows: int,
     batch_readahead: int,
     fragment_readahead: int,
@@ -99,7 +125,6 @@ def _pass2_worker(
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
     from collections import Counter
-    from itertools import combinations
     from functools import reduce
 
     # Parallelism here is across processes (one per shard task); pin each worker to
@@ -111,11 +136,7 @@ def _pass2_worker(
     # Reconstruct Arrow membership arrays locally (not picklable across processes)
     max_arrs = {col: pa.array(vocabs_max[col]) for col in cols_to_build}
 
-    subset_counters = {
-        subset: Counter()
-        for r in range(2, len(cols_to_build) + 1)
-        for subset in combinations(cols_to_build, r)
-    }
+    subset_counters = {subset: Counter() for subset in subsets}
 
     dataset = ds.dataset(shard_paths, format="parquet")
     batches = dataset.to_batches(
@@ -134,19 +155,18 @@ def _pass2_worker(
         })
         masks = {col: pc.is_in(t[col], value_set=max_arrs[col]) for col in cols_to_build}
 
-        for r in range(2, len(cols_to_build) + 1):
-            for subset in combinations(cols_to_build, r):
-                subset_mask = reduce(pc.and_, (masks[col] for col in subset))
-                t_subset = t.filter(subset_mask)
-                if t_subset.num_rows:
-                    g_subset = (
-                        t_subset.group_by(list(subset))
-                        .aggregate([(subset[0], "count")])
-                        .rename_columns(list(subset) + ["count"])
-                    )
-                    _update_counter_from_grouped(
-                        subset_counters[subset], g_subset, list(subset), "count"
-                    )
+        for subset in subsets:
+            subset_mask = reduce(pc.and_, (masks[col] for col in subset))
+            t_subset = t.filter(subset_mask)
+            if t_subset.num_rows:
+                g_subset = (
+                    t_subset.group_by(list(subset))
+                    .aggregate([(subset[0], "count")])
+                    .rename_columns(list(subset) + ["count"])
+                )
+                _update_counter_from_grouped(
+                    subset_counters[subset], g_subset, list(subset), "count"
+                )
 
     return subset_counters  # Counter is picklable → returned to parent via pickle
 
@@ -516,19 +536,19 @@ def _compute_subset_counters(
     parquet_files, total_rows, cols_to_build, vocabs_max, max_ks,
     batch_rows, batch_readahead, fragment_readahead,
     max_workers, shards_per_task, cpu_frac, max_mem_gb, mem_per_worker_gb,
+    *, need_sii: bool,
 ):
     """PASS 2: restricted joint counts, parallelised across shards.
 
-    Returns ``subset_counters`` ({subset_tuple: Counter} for all subsets of size
-    >= 2). Extracted from the populator so a cache hit can bypass it entirely.
+    Returns ``subset_counters`` ({subset_tuple: Counter}) for the subsets
+    ``_required_subsets`` says are live: every subset of size >= 2 when sii is
+    wanted, otherwise the full joint alone. Extracted from the populator so a
+    cache hit can bypass it entirely.
     """
     import time as _time
 
-    subset_counters = {
-        subset: Counter()
-        for r in range(2, len(cols_to_build) + 1)
-        for subset in combinations(cols_to_build, r)
-    }
+    subsets = _required_subsets(cols_to_build, need_sii)
+    subset_counters = {subset: Counter() for subset in subsets}
 
     shards_per_task = max(1, shards_per_task)
 
@@ -545,9 +565,12 @@ def _compute_subset_counters(
         cpu_budget = compute_num_threads(cpu_frac)
         total_parquet_bytes = sum(p.stat().st_size for p in parquet_files)
 
-        # Per-worker estimate from ROWS: each worker holds ~one entry per sub-counter
-        # per row of its task. (Compressed parquet bytes under-count this ~20x.)
-        n_subcounters = max(1, (2 ** len(cols_to_build)) - 1 - len(cols_to_build))
+        # Per-worker estimate from ROWS: each worker holds ~one entry per live
+        # counter per row of its task. (Compressed parquet bytes under-count this
+        # ~20x.) Counting the *live* subsets rather than the full 2**order - 1 -
+        # order set matters: with sii off there is exactly one, so the estimate no
+        # longer collapses the fan-out to a single worker at high order.
+        n_subcounters = max(1, len(subsets))
         rows_per_task = (total_rows / max(1, len(parquet_files))) * shards_per_task
         if mem_per_worker_gb and mem_per_worker_gb > 0:
             per_worker_gb = float(mem_per_worker_gb)
@@ -588,8 +611,11 @@ def _compute_subset_counters(
     # vocabs_max values are plain lists → picklable
     vocabs_max_plain = {col: list(vocabs_max[col]) for col in cols_to_build}
 
+    n_all_subsets = (2 ** len(cols_to_build)) - 1 - len(cols_to_build)
     print(f"Pass 2/2: computing joint counts restricted to max_ks={max_ks} vocab "
-          f"[{n_workers} workers, {n_tasks} tasks, {len(parquet_files)} shards] ...")
+          f"[{n_workers} workers, {n_tasks} tasks, {len(parquet_files)} shards, "
+          f"{len(subsets)}/{n_all_subsets} subset counter(s)"
+          f"{'' if need_sii else ' — sii not requested, proper subsets skipped'}] ...")
 
     # Only keep n_workers + small buffer tasks in-flight at once.
     # Submitting all tasks upfront causes completed results to pile up as pickled
@@ -607,7 +633,7 @@ def _compute_subset_counters(
                 batch = next(task_iter)
                 fut = pool.submit(
                     _pass2_worker, batch, cols_to_build, vocabs_max_plain,
-                    batch_rows, batch_readahead, fragment_readahead,
+                    subsets, batch_rows, batch_readahead, fragment_readahead,
                 )
                 pending[fut] = None
             except StopIteration:
@@ -1092,6 +1118,7 @@ def populate_tensors_parquet(
             parquet_files, total_rows, cols_to_build, vocabs_max, max_ks,
             batch_rows, batch_readahead, fragment_readahead,
             max_workers, shards_per_task, cpu_frac, max_mem_gb, mem_per_worker_gb,
+            need_sii=need_sii,
         )
 
         # Alternative hapax removal: remove 1-count tuples, not 1-count words
