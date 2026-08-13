@@ -16,6 +16,7 @@ import math
 import random
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -304,6 +305,7 @@ class DimConsistencyJudge:
 
     def score(self,
               tucker_decomp,
+              intruder_choice_option: str = "teaLeaves",
               seed: int = 1,
               role: Optional[str] = None,
               verbose: bool = False,
@@ -313,6 +315,21 @@ class DimConsistencyJudge:
         The candidate/outlier draws come from a local RNG seeded with `seed`, so the
         global random state is untouched and the same tasks are posed at every
         semantic check of a run (scores stay comparable across iterations).
+
+        `intruder_choice_option` picks where the injected outlier comes from:
+          "random"     a uniform draw from the vocabulary, absent from the top words.
+          "teaLeaves"  a word that ranks in this dimension's bottom half but in the
+                       top 10% of some dimension -- salient elsewhere, weak here, so
+                       the judge cannot win by spotting a rare/odd token.
+
+        The current `efficient` implementation for "teaLeaves": True ranks the whole (N, R) factor with
+        one np.argsort, while the old reference implementation calls
+        get_top_words_for_dimension once per dimension (which re-materializes the
+        factor as numpy every time). The two can disagree on words with tied
+        loadings, the rows under our sparsity setting, mostly and commonly, because torch.topk
+        and argsort break ties differently, so many dimensions may draw a
+        different intruder
+        -> This hurts reproducibility, so we only ship the efficient version which is correct
 
         Returns a dict of [0,1] scores:
           dim_consistency           final score (accuracy × diversity multiplier when
@@ -334,25 +351,101 @@ class DimConsistencyJudge:
         role_idx = tucker_decomp.get_role_index(role)
         rank = int(tucker_decomp.core.shape[role_idx])
         vocab_list = tucker_decomp.vocab[f"vocab_{role}"]
+        dims = tucker_decomp.get_dims()[role_idx]
 
         # 1. Build one outlier task per dimension.
         tasks = []
         all_dim_words = set() if self.diversity_aware else None
-        for i in range(rank):
-            seq = tucker_decomp.get_top_words_for_dimension(role, i, self.num_dim_words)
-            words = [w for w, score in seq]
-            if self.diversity_aware:
-                all_dim_words.update(words)
-            # Draw an outlier that is absent from the top words, otherwise the
-            # candidate list would contain a duplicate and the scores dict would
-            # silently collapse it (making `outlier == random_word` ambiguous).
-            pool = [w for w in vocab_list if w not in words]
-            random_word = rng.choice(pool)
 
-            candidates = words + [random_word]
-            rng.shuffle(candidates)
-            tasks.append({"dim": i, "words": words, "candidates": candidates,
-                          "random_word": random_word})
+
+        # Option 1: random from vocab
+        if intruder_choice_option == "random":
+            for i in range(rank):
+                seq = tucker_decomp.get_top_words_for_dimension(role, i, self.num_dim_words)
+                words = [w for w, score in seq]
+                if self.diversity_aware:
+                    all_dim_words.update(words)
+                # Draw an outlier that is absent from the top words, otherwise the
+                # candidate list would contain a duplicate and the scores dict would
+                # silently collapse it (making `outlier == random_word` ambiguous).
+                pool = [w for w in vocab_list if w not in words]
+                random_word = rng.choice(pool)
+
+                candidates = words + [random_word]
+                rng.shuffle(candidates)
+                tasks.append({"dim": i, "words": words, "candidates": candidates,
+                              "random_word": random_word})
+        # Option 2: a word from the bottom 50% of dimension i that is ALSO in the
+        # top 10% of some dimension: plausible-looking but wrong for this dimension.
+        elif intruder_choice_option == "teaLeaves":
+            # Deferred import: tucker_tensor pulls in tensorly/CuPy and imports
+            # this module lazily itself, so keep it out of judge's import time.
+
+            from tensormet.tucker_tensor import _to_np
+            n_words = dims                       # vocabulary size of this mode
+            n_bottom = n_words // 2              # first index of the bottom half
+            n_top = max(1, n_words // 10)
+
+            # One descending argsort of the whole (N, R) factor, against `rank`
+            # separate topk calls that each convert the factor to numpy again.
+            factor = _to_np(tucker_decomp.factors[role_idx])[:, :rank]  # (N, R)
+            order = np.argsort(-factor, axis=0, kind="stable")          # (N, R) vocab ids
+            top_dim_words = {
+                i: [vocab_list[j] for j in order[:self.num_dim_words, i]]
+                for i in range(rank)
+            }
+            bottom_50_percents = {
+                i: {vocab_list[j] for j in order[n_bottom:, i]}
+                for i in range(rank)
+            }
+            top_10_percent_of_some_dimension_words = {
+                vocab_list[j] for j in order[:n_top, :].ravel()
+            }
+
+            # # Reference implementation: one full topk per dimension.
+            # top_10_percent_of_some_dimension_words = set()
+            # top_dim_words = {}
+            # bottom_50_percents = {}
+            # for i in range(rank):
+            #     seq = tucker_decomp.get_top_words_for_dimension(role, i, n_words)
+            #     scored_list = [w for w, score in seq]
+            #     bottom_50_percents[i] = set(scored_list[n_bottom:])
+            #     top_dim_words[i] = scored_list[:self.num_dim_words]
+            #     top_10_percent_of_some_dimension_words.update(scored_list[:n_top])
+
+            if verbose:
+                print(f"{len(top_10_percent_of_some_dimension_words)} candidate "
+                      f"intruder words to choose from")
+
+            for i in range(rank):
+                words = top_dim_words[i]
+                if self.diversity_aware:
+                    all_dim_words.update(words)
+
+                # Intersection, not union: salient elsewhere, weak here.
+                # sorted() because set order over strings varies with PYTHONHASHSEED,
+                # which would break seed reproducibility across processes.
+                pool = sorted(
+                    bottom_50_percents[i] & top_10_percent_of_some_dimension_words
+                )
+                if not pool:
+                    raise ValueError(
+                        f"No teaLeaves intruder available for dimension {i} of role "
+                        f"{role!r}: no word is both in this dimension's bottom half "
+                        f"and in the top 10% of another dimension."
+                    )
+                random_word = rng.choice(pool)
+
+                candidates = words + [random_word]
+                rng.shuffle(candidates)
+                tasks.append({"dim": i, "words": words, "candidates": candidates,
+                              "random_word": random_word})
+        else:
+            raise ValueError(
+                f"intruder_choice_option must be 'random' or 'teaLeaves'; "
+                f"got {intruder_choice_option!r}"
+            )
+
 
         # 2. Flatten to parallel (prompt, completion) lists, remembering the owning task.
         prompts, completions, owner = [], [], []

@@ -863,6 +863,11 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     Runs launched with ``time_iteration`` off simply contribute no curve. Untick
     *plot rec error* and clear *sem_keys* to look at timing on its own.
 
+    Ticking *plot rec error* reveals a *log scale (rec error)* checkbox next to
+    it; tick that to draw the rec-error axis on a log scale (useful once the
+    curve has decayed enough that a linear axis flattens it out). It's hidden
+    (and cleared) whenever *plot rec error* is off, since it has no effect there.
+
     When comparing two runs of unequal length, tick *clip to common iters* to cap
     the x-axis at the shorter run's final iteration (e.g. 250 vs 2000 → x stops at
     250), so the shared range is compared head-to-head rather than squashed.
@@ -930,6 +935,11 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     sem_box = widgets.Text(value=",".join(default_sem_keys), description="sem_keys",
                            style={"description_width": "75px"}, layout=widgets.Layout(width="55%"))
     rec_chk = widgets.Checkbox(value=False, description="plot rec error", indent=False)
+    # Only meaningful once rec error is actually being plotted; hidden until then
+    # (see _on_rec_toggle) rather than just disabled, so the control row doesn't
+    # carry a permanently-irrelevant checkbox.
+    log_rec_chk = widgets.Checkbox(value=False, description="log scale (rec error)", indent=False,
+                                   layout=widgets.Layout(display="none"))
     time_chk = widgets.Checkbox(value=False, description="plot iter time", indent=False)
     stitch_chk = widgets.Checkbox(value=True, description="stitch resume chains", indent=False)
     clip_chk = widgets.Checkbox(value=False, description="clip to common iters", indent=False)
@@ -1070,6 +1080,8 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                 state["fig"] = None
                 print(f"Log file missing:\n{e}")
                 return
+            if rec_chk.value and log_rec_chk.value:
+                ax.set_yscale("log")
             # Keep a handle on the Figure object before plt.show() closes it (under
             # the inline backend) so it can still be saved/returned afterwards.
             state["fig"] = fig
@@ -1101,6 +1113,16 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     def _on_select(_change):
         if not state["mute"]:
             _redraw()
+
+    def _on_rec_toggle(change):
+        # Show the log-scale toggle only while it does something; untick it
+        # along with hiding it so a stale check doesn't silently apply once
+        # rec error is switched back on.
+        if change["new"]:
+            log_rec_chk.layout.display = ""
+        else:
+            log_rec_chk.layout.display = "none"
+            log_rec_chk.value = False
 
     def _save(_btn=None):
         fig = state["fig"]
@@ -1138,6 +1160,10 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     run_b.observe(_on_select, "value")
     sem_box.observe(_on_select, "value")
     rec_chk.observe(_on_select, "value")
+    # Second observer on the same trait: toggles log_rec_chk's visibility
+    # (and clears it when hidden) independently of the redraw triggered above.
+    rec_chk.observe(_on_rec_toggle, "value")
+    log_rec_chk.observe(_on_select, "value")
     time_chk.observe(_on_select, "value")
     # Clipping only changes the x-axis limit on the existing curves — just redraw.
     clip_chk.observe(_on_select, "value")
@@ -1156,7 +1182,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         widgets.HBox(list(dataset_chk.values()), layout=widgets.Layout(flex_flow="row wrap")),
     ])
     filters = widgets.HBox(list(facet_dd.values()), layout=widgets.Layout(flex_flow="row wrap"))
-    controls = widgets.HBox([sem_box, rec_chk, time_chk, stitch_chk, clip_chk, after_box,
+    controls = widgets.HBox([sem_box, rec_chk, log_rec_chk, time_chk, stitch_chk, clip_chk, after_box,
                              refresh_btn, save_name, save_btn],
                             layout=widgets.Layout(flex_flow="row wrap"))
     ui = widgets.VBox([datasets_box, filters, status, run_a, run_b, controls, plot_out])

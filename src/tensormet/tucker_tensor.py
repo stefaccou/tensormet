@@ -349,6 +349,9 @@ class TuckerDecomposition:
     #     s = S[s_idx]                                     # (R,)
     #     o = O[o_idx]                                     # (R,)
     #     return v, s, o
+    def get_dims(self):
+        """Mode dimensions of the reconstructed tensor, i.e. (N_0, ..., N_{k-1})."""
+        return tuple(int(f.shape[0]) for f in self.factors)
 
     def fetch_latents(self, triple: Tuple[str, ...]) -> Tuple[np.ndarray, ...]:
         """Fetches the latent representations for a given tuple of elements."""
