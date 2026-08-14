@@ -12,6 +12,7 @@ disabled (the default).
 """
 from __future__ import annotations
 
+import gc
 import math
 import random
 from typing import Optional
@@ -41,15 +42,15 @@ def _gpu_free_bytes(device) -> int:
 
 
 def _estimate_chunk_rows(vocab_size: int, seq_len: int, free_b: int,
-                          safety: float = 0.7, temp_mult: float = 6.0) -> int:
+                          safety: float = 0.7, temp_mult: float = 2.0) -> int:
     """Estimate how many rows of length ``seq_len`` fit in ``free_b`` bytes.
 
     Mirrors ``distance._estimate_batch_*``: bytes-per-row times a safety
-    fraction of currently-free memory. The bottleneck is the logits/log-probs
-    tensors of shape ``[rows, seq_len, vocab_size]`` that ``score_sequences``
-    materializes in float32 — the fp16 model output, its ``.float()`` cast, and
-    ``log_softmax``'s own output tensor all briefly coexist, so temp_mult=6.0
-    (~1.5x a single fp32 copy) covers that overlap instead of just one copy.
+    fraction of currently-free memory. The bottleneck is the model's own
+    ``[rows, seq_len, vocab_size]`` logits; ``score_sequences`` normalizes only
+    the handful of completion positions, so its fp32 tensor is negligible beside
+    them. temp_mult=2.0 (8 bytes/element) covers the logits whether the modeling
+    code hands them back in fp16 or casts them to fp32, with ~2x headroom.
     """
     bytes_per_row = int(math.ceil(seq_len * vocab_size * 4 * temp_mult))
     budget_b = int(free_b * safety)
@@ -106,10 +107,21 @@ class DimConsistencyJudge:
             self.model_name, dtype=torch.float16
         ).to(device)
         self.model.eval()
+        # transformers <4.56 named this kwarg torch_dtype and silently ignores
+        # `dtype`, loading fp32 at twice the footprint every batch estimate assumes.
+        got_dtype = next(self.model.parameters()).dtype
+        if got_dtype != torch.float16:
+            raise RuntimeError(
+                f"Judge {self.model_name!r} loaded in {got_dtype}, not float16. "
+                "This needs transformers>=4.56 (earlier versions ignore the "
+                "`dtype=` argument and load fp32, doubling the GPU footprint)."
+            )
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self._pad_id = (self.tokenizer.pad_token_id
                         if self.tokenizer.pad_token_id is not None
                         else self.tokenizer.eos_token_id)
+        if self._pad_id is None:
+            self._pad_id = 0  # torch.full() in score_sequences cannot take None
         self.device = device
         if is_cuda:
             torch.cuda.synchronize(device)
@@ -131,6 +143,9 @@ class DimConsistencyJudge:
             print(f"WARNING: not enough GPU memory to load judge {self.model_name!r}; "
                   "falling back to CPU (dimension-consistency scoring will be slower).")
             self.model = None
+            # The failed model is still held by the live traceback frame, so
+            # empty_cache() alone would free nothing.
+            gc.collect()
             torch.cuda.empty_cache()
             self._load_on(torch.device("cpu"))
         if self.gpu_memory_gb is not None:
@@ -182,12 +197,13 @@ class DimConsistencyJudge:
         #     {"role": "assistant", "content": "mail"},
         #     {"role": "user", "content": f"Which word does not belong? {listing}. Answer with only the word."},
         # ]
+        # enable_thinking is a template variable, so it must be passed directly:
+        # nesting it under extra_body (vLLM syntax) leaves it undefined. Sampling
+        # settings have no place here — nothing is generated, score_sequences
+        # reads log-probs off a single forward pass.
         return self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
-            temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0,
-            extra_body={
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
+            enable_thinking=False,
         )
 
     @torch.no_grad()
@@ -210,8 +226,19 @@ class DimConsistencyJudge:
         chunk from overshooting available memory when a batch happens to contain
         an unusually long prompt/completion.
         """
-        prefix_ids = [self.tokenizer(p, add_special_tokens=False).input_ids for p in prompts]
-        comp_ids   = [self.tokenizer(c, add_special_tokens=False).input_ids for c in completions]
+        # Every candidate of a task repeats that task's prompt, so only `rank` of
+        # the `rank * (k+1)` strings are distinct.
+        _tok_cache: dict[str, list[int]] = {}
+
+        def _tok(s: str) -> list[int]:
+            ids = _tok_cache.get(s)
+            if ids is None:
+                ids = self.tokenizer(s, add_special_tokens=False).input_ids
+                _tok_cache[s] = ids
+            return ids
+
+        prefix_ids = [_tok(p) for p in prompts]
+        comp_ids   = [_tok(c) for c in completions]
         row_lens = [len(p) + len(c) for p, c in zip(prefix_ids, comp_ids)]
 
         is_cuda = self.device.type == "cuda"
@@ -244,15 +271,34 @@ class DimConsistencyJudge:
             ids, attn = ids.to(self.device), attn.to(self.device)
 
             logits = self.model(ids, attention_mask=attn).logits
-            # logits at position t predict token t+1, so shift by one.
-            log_probs = F.log_softmax(logits[:, :-1, :].float(), dim=-1)
-            tgt = ids[:, 1:]
-            token_logps = log_probs.gather(2, tgt.unsqueeze(-1)).squeeze(-1)  # [b, L-1]
 
+            # Only the completion positions are ever read, so normalize just
+            # those instead of all [rows, L-1, vocab]: with a ~70-token prompt
+            # and a 1-3 token word that is a ~35x smaller fp32 tensor, at
+            # identical numerics. Position t's logits predict token t+1, hence
+            # the -1 shift.
+            sel_row, sel_pos, sel_tgt, spans = [], [], [], []
             for i, (p, c) in enumerate(zip(pref, comp)):
-                start = len(p) - 1          # -1 for the shift above
-                end = start + len(c)
-                out[s + i] = token_logps[i, start:end].mean().item()
+                spans.append((len(sel_row), len(c)))
+                start = len(p) - 1
+                for j, tok in enumerate(c):
+                    sel_row.append(i)
+                    sel_pos.append(start + j)
+                    sel_tgt.append(tok)
+
+            if sel_row:
+                dev = self.device
+                sel = logits[torch.tensor(sel_row, device=dev),
+                             torch.tensor(sel_pos, device=dev), :].float()  # [M, vocab]
+                token_logps = F.log_softmax(sel, dim=-1).gather(
+                    1, torch.tensor(sel_tgt, device=dev).unsqueeze(-1)
+                ).squeeze(-1)  # [M]
+
+            for i, (off, n_c) in enumerate(spans):
+                if n_c == 0:
+                    out[s + i] = float("-inf")   # empty completion: never the pick
+                    continue
+                out[s + i] = token_logps[off:off + n_c].mean().item()
             s = e
         return out
 
@@ -298,7 +344,8 @@ class DimConsistencyJudge:
             t["correct"] = predicted == t[answer_key]
             correct += t["correct"]
             if verbose:
-                print(f"  {t[answer_key]!r} added to {t['candidates']}")
+                where = f"dim {t['dim']}: " if "dim" in t else "  "
+                print(f"{where}{t[answer_key]!r} added to {t['candidates']}")
                 print("  scores:", {k: round(v, 3) for k, v in scores.items()})
                 print("  predicted:", predicted)
         return correct
@@ -447,48 +494,20 @@ class DimConsistencyJudge:
             )
 
 
-        # 2. Flatten to parallel (prompt, completion) lists, remembering the owning task.
-        prompts, completions, owner = [], [], []
-        for t_idx, t in enumerate(tasks):
-            prompt = self.build_prompt(t["candidates"])
-            for c in t["candidates"]:
-                prompts.append(prompt)
-                completions.append(c)
-                owner.append(t_idx)
+        # 2. Batched scoring + evaluation (shared with
+        #    score_similarity_consistency()/benchmark()).
+        correct = self._evaluate_tasks(tasks, answer_key="random_word", verbose=verbose)
 
-        # 3. One batched sweep over everything.
-        flat_scores = self.score_sequences(prompts, completions)
-
-        # 4. Regroup scores back onto their task.
-        for t in tasks:
-            t["scores"] = {}
-        for t_idx, comp, sc in zip(owner, completions, flat_scores):
-            tasks[t_idx]["scores"][comp] = sc
-
-        # 5. Evaluate. The model is *asked* to name the word that doesn't belong,
-        # so the candidate it is most likely to emit (highest log-prob) is the
-        # predicted outlier -> max, not min.
-        correct = 0
         details = []
-        for t in tasks:
-            scores = t["scores"]
-            outlier = max(scores, key=scores.get)
-            if verbose:
-                print(f"dim {t['dim']}: {t['random_word']} added to {t['candidates']}")
-                print("  scores:", {k: round(v, 3) for k, v in scores.items()})
-                print("  outlier:", outlier)
-            is_correct = outlier == t["random_word"]
-            if is_correct:
-                correct += 1
-            if return_details:
-                details.append({
-                    "dim": t["dim"],
-                    "words": t["words"],
-                    "outlier": t["random_word"],
-                    "predicted": outlier,
-                    "correct": is_correct,
-                    "scores": {k: round(v, 3) for k, v in scores.items()},
-                })
+        if return_details:
+            details = [{
+                "dim": t["dim"],
+                "words": t["words"],
+                "outlier": t["random_word"],
+                "predicted": t["predicted"],
+                "correct": t["correct"],
+                "scores": {k: round(v, 3) for k, v in t["scores"].items()},
+            } for t in tasks]
 
         raw = correct / rank
         out = {"dim_consistency": raw, "dim_consistency_raw": raw}
@@ -621,12 +640,25 @@ class DimConsistencyJudge:
 
         rng = random.Random(seed)
         names = list(categories.keys())
+        # sorted() for the same reason as in score()'s teaLeaves pool: set order
+        # over strings varies with PYTHONHASHSEED, which would make `seed` mean
+        # different trials in different processes.
+        members = {name: sorted(words) for name, words in categories.items()}
         tasks = []
         for i in range(n_trials):
             cat = rng.choice(names)
-            words = rng.sample(categories[cat], k)
+            words = rng.sample(members[cat], k)
             outlier_cat = rng.choice([n for n in names if n != cat])
-            outlier = rng.choice(categories[outlier_cat])
+            # Overlapping categories can otherwise put the intruder in `words`,
+            # where the duplicate collapses in the scores dict and leaves the
+            # trial unanswerable.
+            pool = [w for w in members[outlier_cat] if w not in words]
+            if not pool:
+                raise ValueError(
+                    f"No intruder available for trial {i}: every word of "
+                    f"{outlier_cat!r} also appears in the sample drawn from {cat!r}."
+                )
+            outlier = rng.choice(pool)
             candidates = words + [outlier]
             rng.shuffle(candidates)
             tasks.append({"trial": i, "category": cat, "outlier_category": outlier_cat,

@@ -83,7 +83,7 @@ def _parse_shared_factors(s: str):
     s2 = str(s).strip().lower()
     if s2 in ("", "none", "null", "no"):
         return None
-    if s2 == "all":
+    if s2 in ("all", "full"):
         return "all"
 
     pairs = set()
