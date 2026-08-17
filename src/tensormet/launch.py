@@ -14,6 +14,7 @@ from tensormet.utils import (select_gpu,
                              )
 from tensormet.naming import vocab_filename, vocab_filename_legacy
 from tensormet.hpc_helpers import stage_artifacts_back
+from tensormet.routing import needs_largedim
 import os
 import sys
 import pickle
@@ -345,7 +346,17 @@ def launch_nnt_decomposition(cfg):
         with tee_output(paths["log"]):
             if not _is_sgd:
                 # SGD trains straight on the torch COO from load_from_disk.
-                sparse_tensor.tensor_to_sparse("cupy")
+                #
+                # The largedim kernels consume per-mode coordinates, so skip the
+                # block-encoded linear index they would only decode back. Also
+                # the only form that exists at order 5 (prod(shape) = 1e20).
+                _use_coords = needs_largedim(
+                    cfg.exp.dim,
+                    largedim=cfg.train.largedim,
+                    # getattr: older saved configs predate the masked objective.
+                    masked=(getattr(cfg.exp, "objective", "full") == "masked"),
+                )
+                sparse_tensor.tensor_to_sparse("cupy", use_coords=_use_coords)
             tucker_decomp_info = sparse_tensor.non_negative_tucker_with_similarity(
                 cfg=cfg,
                 thread_budget=thread_budget,

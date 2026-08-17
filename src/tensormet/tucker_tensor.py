@@ -40,7 +40,11 @@ from tensormet.utils import (DATA_DIR,
                             _to_np,
                    )
 from tensormet.hpc_helpers import mirror_checkpoint
-from tensormet.sparse_ops import initialize_nonnegative_tucker
+from tensormet.sparse_ops import (
+    initialize_nonnegative_tucker,
+    CoordCOO,
+    block_encoding_fits,
+)
 from tensormet.naming import (
     ALL_METHODS,
     candidate_stems,
@@ -51,7 +55,12 @@ from tensormet.naming import (
 )
 from tensormet.similarity import evaluate_sample, get_eval_num_threads, load_simlex, evaluate_simlex
 from tensormet.routing import get_update_routing_step, get_log_step, UpdateRouting, needs_largedim
-from tensormet.distance import null_compute_errors, NNZGroupingCache, precompute_largedim_batches
+from tensormet.distance import (
+    null_compute_errors,
+    NNZGroupingCache,
+    precompute_largedim_batches,
+    coords_nnz,
+)
 from tensormet.stochastic_sparse import CooSubsampler
 from tensormet.sharded_sparse import (
             ShardedSparseTensor,
@@ -805,6 +814,43 @@ class TuckerDecomposition:
 
 
 
+def _torch_numel_fits(shape) -> bool:
+    """Whether ``torch.sparse_coo_tensor`` can hold *shape* (numel is int64)."""
+    return math.prod(tuple(int(s) for s in shape)) <= np.iinfo(np.int64).max
+
+
+def _resolve_use_coords(use_coords: Optional[bool], shape) -> bool:
+    """Decide the N-D CuPy representation for *shape*.
+
+    ``TENSORMET_COORD_TENSOR`` overrides the caller (``launch.py`` asks for
+    coordinates explicitly, so an env var that only applied to ``None`` would be
+    a dead kill-switch): ``1`` forces coordinates, ``0`` pins the block encoding
+    wherever it fits and degrades to coordinates where it cannot.
+
+    Otherwise ``None`` picks coordinates only when the block encoding does not
+    fit, and an explicit ``False`` on a shape it cannot represent raises rather
+    than producing wrapped indices.
+    """
+    fits = block_encoding_fits(shape)
+
+    env = os.environ.get("TENSORMET_COORD_TENSOR", "")
+    if env in ("1", "true", "True"):
+        return True
+    if env in ("0", "false", "False"):
+        return not fits
+
+    if use_coords is None:
+        return not fits
+    if not use_coords and not fits:
+        raise ValueError(
+            f"shape={shape} has prod(shape)={math.prod(shape)} > int32_max**2, which the "
+            f"block-encoded coo_matrix cannot represent (its linear index would overflow). "
+            f"This shape requires the coordinate representation; do not force use_coords=False "
+            f"here."
+        )
+    return bool(use_coords)
+
+
 def cupy_to_torch_sparse(
     cu_mat: cpx_sparse.spmatrix,
     orig_shape: Optional[Tuple[int, ...]] = None,
@@ -832,6 +878,21 @@ def cupy_to_torch_sparse(
     Returns:
         torch.sparse_coo_tensor on the requested device.
     """
+    # Coordinate-backed tensors already hold what the block decoding below would
+    # have to reconstruct, and are used precisely when that decoding is impossible
+    # (prod(shape) overflows the linear index). Short-circuit straight to torch.
+    if isinstance(cu_mat, CoordCOO):
+        shape = tuple(orig_shape) if orig_shape is not None else cu_mat.shape
+        indices_t = torch.from_numpy(cp.asnumpy(cu_mat.coords)).long()
+        values_t = torch.from_numpy(cp.asnumpy(cu_mat.data))
+        if dtype is not None:
+            values_t = values_t.to(dtype)
+        if not _torch_numel_fits(shape):
+            # torch.sparse_coo_tensor computes prod(shape) in int64 and overflows;
+            # SparseCOOTensor is the load-time container for exactly this case.
+            return SparseCOOTensor(indices_t, values_t, shape).to(device)
+        return torch.sparse_coo_tensor(indices_t, values_t, size=shape).coalesce().to(device)
+
     # Ensure COO format
 
     if not cpx_sparse.isspmatrix_coo(cu_mat):
@@ -874,17 +935,35 @@ def cupy_to_torch_sparse(
 
 def torch_sparse_to_cupy(
     x: torch.Tensor,
-) -> Tuple[cpx_sparse.coo_matrix, Tuple[int, ...]]:
+    use_coords: Optional[bool] = None,
+) -> Tuple[Union[cpx_sparse.coo_matrix, CoordCOO], Tuple[int, ...]]:
     """
-    Convert a torch sparse COO tensor to a CuPy COO sparse matrix.
+    Convert a torch sparse COO tensor to a CuPy sparse representation.
 
     For 2D tensors, the mapping is straightforward.
-    For N-D tensors (N>2), we flatten the N-D indices to a single row index
-    using np.ravel_multi_index and store them in a (prod(shape), 1) matrix.
+    For N-D tensors (N>2) there are two representations:
+
+    ``CoordCOO`` (coordinate encoding)
+        Keeps the ``(ndim, nnz)`` int32 coordinates as they are. Consumed
+        directly by the NNZ-streaming ``*_largedim`` kernels. No linear index
+        exists, so ``prod(shape)`` is unbounded.
+    ``cupyx.scipy.sparse.coo_matrix`` (block encoding)
+        Flattens the N-D indices with ``np.ravel_multi_index`` and splits the
+        result into ``(row, col)`` blocks of ``int32_max``. Required by the
+        dense-unfolding kernels and the SVD initialisers, which do real matrix
+        algebra. Only representable while ``prod(shape) <= int32_max**2``.
+
+    Parameters
+    ----------
+    use_coords :
+        ``True``/``False`` to force a representation; ``None`` (default) picks
+        ``CoordCOO`` when the block encoding cannot represent the shape, and
+        otherwise honours ``TENSORMET_COORD_TENSOR`` (see
+        ``_resolve_use_coords``).
 
     The original shape is returned for reconstruction.
     Returns:
-        (cupy_coo_matrix, original_shape)
+        (cupy_coo_matrix | CoordCOO, original_shape)
     """
     if not (isinstance(x, (torch.Tensor, SparseCOOTensor)) and x.is_sparse):
         raise TypeError("torch_sparse_to_cupy expects a torch sparse tensor (COO).")
@@ -906,6 +985,21 @@ def torch_sparse_to_cupy(
         col_cp = cp.asarray(col)
         data_cp = cp.asarray(values_np)
         cu_mat = cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=shape)
+    elif _resolve_use_coords(use_coords, shape):
+        # --- COORDINATE ENCODING ---
+        # No linear index is formed, so prod(shape) is irrelevant: only each
+        # individual dimension has to fit int32. This is the only representation
+        # that works once prod(shape) passes int32_max**2 (~4.6e18) — a 5-gram at
+        # dim=10000 needs 1e20 — and it saves the largedim kernels the decode
+        # they otherwise redo every iteration.
+        too_wide = [d for d in shape if d > np.iinfo(np.int32).max]
+        if too_wide:
+            raise ValueError(
+                f"CoordCOO stores coordinates as int32; mode dimension(s) {too_wide} "
+                f"exceed int32_max. shape={shape}"
+            )
+        coords_cp = cp.asarray(indices_np.astype(np.int32))
+        cu_mat = CoordCOO(coords_cp, cp.asarray(values_np), shape)
     else:
         # --- NEW BLOCK ENCODING ---
         coords = [indices_np[d] for d in range(ndim)]
@@ -1038,7 +1132,7 @@ class SparseTupleTensor:
 
 
     # -- Sparsity methods ---
-    def sparse_representation(self, sparse_type):
+    def sparse_representation(self, sparse_type, use_coords: Optional[bool] = None):
         # we return the sparse representation of the tensor
         if sparse_type == self.sparsity_type:
             return self.tensor
@@ -1097,15 +1191,15 @@ class SparseTupleTensor:
         elif sparse_type == "cupy":
             if not (isinstance(self.tensor, (torch.Tensor, SparseCOOTensor)) and self.tensor.is_sparse):
                 raise TypeError("cupy expects self.tensor to be a torch sparse tensor.")
-            tensor_cupy, shape = torch_sparse_to_cupy(self.tensor)
+            tensor_cupy, shape = torch_sparse_to_cupy(self.tensor, use_coords=use_coords)
             return tensor_cupy
         else:
             raise NotImplementedError(f"Sparse representation for type {sparse_type} not implemented.")
 
 
 
-    def tensor_to_sparse(self, sparse_type="tensorflow"):
-        self.tensor = self.sparse_representation(sparse_type)
+    def tensor_to_sparse(self, sparse_type="tensorflow", use_coords: Optional[bool] = None):
+        self.tensor = self.sparse_representation(sparse_type, use_coords=use_coords)
         self.sparsity_type = sparse_type
         if sparse_type in ["tensorflow", "cupy"]:
             self.device = "cuda"
@@ -1139,7 +1233,10 @@ class SparseTupleTensor:
             memory_size = nnz * (self.tensor.indices().element_size() * self.tensor.indices().shape[0] + dtype_size)
 
         elif self.sparsity_type == "cupy":
-            memory_size = self.tensor.data.nbytes + self.tensor.row.nbytes + self.tensor.col.nbytes
+            if isinstance(self.tensor, CoordCOO):
+                memory_size = self.tensor.data.nbytes + self.tensor.coords.nbytes
+            else:
+                memory_size = self.tensor.data.nbytes + self.tensor.row.nbytes + self.tensor.col.nbytes
         elif self.sparsity_type == "sparse":
             memory_size = self.tensor.nbytes
         elif self.sparsity_type == "tensorflow":
@@ -1475,9 +1572,9 @@ class SparseTupleTensor:
         _max_nnz = int(getattr(cfg.exp, "max_nnz", None) or 0)
         if _max_nnz < 0:
             raise ValueError(f"cfg.exp.max_nnz must be >= 0, got {_max_nnz}")
-        # .tocoo() is CuPy-only; the SGD path holds a torch sparse COO.
+        # coords_nnz covers both CuPy forms; the SGD path holds a torch sparse COO.
         _full_nnz = (int(self.tensor._nnz()) if _is_sgd
-                     else int(self.tensor.tocoo().row.size))
+                     else coords_nnz(self.tensor))
         if _max_nnz and _full_nnz > _max_nnz:
             _subsample_frac = min(_subsample_frac, _max_nnz / _full_nnz)
             print(f"max_nnz={_max_nnz}: effective subsample_frac -> "
@@ -1615,7 +1712,8 @@ class SparseTupleTensor:
         # (_full_nnz is computed once above, alongside the max_nnz resolution.)
         _nnz_live = _iter_sampler.n_sample if _iter_sampler is not None else _full_nnz
         _largedim_batches = (
-            precompute_largedim_batches(core, factors, modes, masked=masked, nnz_live=_nnz_live)
+            precompute_largedim_batches(core, factors, modes, masked=masked, nnz_live=_nnz_live,
+                                        coord_backed=isinstance(self.tensor, CoordCOO))
             if (divergence == "kl" and _sst is None and _factor_is_largedim
                 and not _is_sgd)
             else None

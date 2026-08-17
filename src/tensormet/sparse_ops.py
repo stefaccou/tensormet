@@ -36,6 +36,126 @@ def safe_ravel(coords, shape, xp):
     return flat
 # -------------------------------------------------------------------
 
+
+# -------------------------------------------------------------------
+# Coordinate-backed sparse tensor (replaces the block-encoded linear index
+# for the NNZ-streaming kernels).
+# -------------------------------------------------------------------
+class CoordCOO:
+    """GPU-resident coordinate-backed sparse tensor for the NNZ-streaming kernels.
+
+    The alternative, produced by ``torch_sparse_to_cupy``, is a 2-D
+    ``coo_matrix`` holding a linearised index split into ``(row, col)`` blocks
+    of ``int32_max``. It tops out at ``int32_max**2`` (~4.6e18) elements, and
+    the linear index itself at int64 (~9.2e18) — a 5-gram at dim=10000 needs
+    1e20, which ``np.ravel_multi_index`` rejects outright.
+
+    Keeping the coordinates removes that ceiling (only each individual
+    dimension must fit int32) and the per-iteration decode: the largedim
+    kernels' first act was always to undo the block encoding, making
+    ``coords -> flat -> (row, col) -> flat -> coords`` pure overhead.
+
+    Memory: ``ndim·4`` bytes/NNZ stored vs the block form's ``2·4``, but cheaper
+    at peak — the block form also materialises ``flat`` + N ``idxs`` (int64)
+    every iteration. Tell ``precompute_largedim_batches(coord_backed=)`` which
+    form it is, or it reserves headroom for a decode that never runs.
+
+    ``shape`` is the N-D tensor shape, not a matrix shape: this is not an
+    ``spmatrix``. Only the ``*_largedim`` kernels accept it; the dense-unfolding
+    kernels and SVD initialisers raise on it.
+
+    See ``utils.SparseCOOTensor`` for the torch-side analogue used at load time.
+    """
+    is_sparse = True
+
+    def __init__(self, coords, data, shape: tuple):
+        # coords: (ndim, nnz) int32 device array; data: (nnz,) device array
+        self.coords = coords
+        self.data = data
+        self.shape = tuple(int(d) for d in shape)
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    @property
+    def nnz(self) -> int:
+        return int(self.data.size)
+
+    # As on coo_matrix, these describe the VALUES, not the coordinates.
+    # `tl.context()` reads .dtype to build the random init (sparse_ops.py:1283).
+    @property
+    def dtype(self):
+        return self.data.dtype
+
+    @property
+    def device(self):
+        return self.data.device
+
+    def coord_list(self) -> list:
+        """Per-mode index arrays ``[(nnz,)] * ndim`` (views — no copy, no decode)."""
+        return [self.coords[n] for n in range(self.coords.shape[0])]
+
+    def take(self, idx) -> "CoordCOO":
+        """Select NNZ by index array or slice, preserving ``shape``."""
+        return CoordCOO(self.coords[:, idx], self.data[idx], self.shape)
+
+    def to_device(self, device_id: int) -> "CoordCOO":
+        """Copy the NNZ onto *device_id* (host round-trip for cross-device)."""
+        if _array_device_id(self.coords) == device_id:
+            with cp.cuda.Device(device_id):
+                return CoordCOO(self.coords.copy(), self.data.copy(), self.shape)
+        coords_np = cp.asnumpy(self.coords)
+        data_np = cp.asnumpy(self.data)
+        with cp.cuda.Device(device_id):
+            return CoordCOO(cp.asarray(coords_np), cp.asarray(data_np), self.shape)
+
+    def __repr__(self) -> str:
+        return (f"CoordCOO(shape={self.shape}, nnz={self.nnz}, "
+                f"coord_dtype={self.coords.dtype}, dtype={self.data.dtype})")
+
+
+def _array_device_id(arr):
+    """Best-effort CUDA device ordinal for *arr*; ``None`` if it is not on a GPU.
+
+    CuPy arrays expose ``.device`` as a ``cupy.cuda.Device`` whose ``int()`` is the
+    ordinal. NumPy >= 2.0 also exposes ``.device``, but as the string ``'cpu'`` (so
+    ``int(...)`` raises) — those arrays are not CUDA-resident and must take the
+    host-transfer path, hence ``None``.
+    """
+    dev = getattr(arr, "device", None)
+    if dev is None:
+        return None
+    try:
+        return int(dev)
+    except (TypeError, ValueError):
+        return None
+
+
+def block_encoding_fits(shape) -> bool:
+    """Whether the ``(row, col)`` block-encoded linear index can hold *shape*.
+
+    The encoding stores ``flat % int32_max`` and ``flat // int32_max`` as int32,
+    so the total element count must not exceed ``int32_max**2``. (The linear
+    index would also have to fit int64, but that bound is the looser of the
+    two.) When this is False the tensor must use :class:`CoordCOO`.
+    """
+    int32_max = int(np.iinfo(np.int32).max)
+    return math.prod(tuple(int(s) for s in shape)) <= int32_max * int32_max
+
+
+def require_matrix_form(vec_tensor, who: str) -> None:
+    """Raise a directed error when a matrix-only kernel is handed a CoordCOO."""
+    if isinstance(vec_tensor, CoordCOO):
+        raise TypeError(
+            f"{who} requires the block-encoded coo_matrix form, but received a "
+            f"CoordCOO ({vec_tensor!r}). This tensor is too large for the linear "
+            f"index that form needs (prod(shape) > int32_max**2), so only the "
+            f"NNZ-streaming '*_largedim' kernels can consume it. Use largedim "
+            f"routing, or reduce --dim/--order."
+        )
+
+
 def unfold_from_vectorized_sparse(
     vec_tensor: cpx_sparse.spmatrix,
     orig_shape,
@@ -73,6 +193,7 @@ def unfold_from_vectorized_sparse(
         (orig_shape[mode], np.prod(orig_shape) // orig_shape[mode]).
     """
     # Make sure we're in COO format
+    require_matrix_form(vec_tensor, "unfold_from_vectorized_sparse")
 
     cu = vec_tensor.tocoo()
 
@@ -358,6 +479,7 @@ def ptl_tucker_to_tensor(tucker: ptl.TuckerTensor,
 def gather_dense_at_block_nz(dense_nd: np.ndarray,
                              vec_tensor: cpx_sparse.spmatrix,
                              orig_shape) -> cp.ndarray:
+    require_matrix_form(vec_tensor, "gather_dense_at_block_nz")
     orig_shape = tuple(orig_shape)
     # new: use math.prod instead of numpy
     size = math.prod(orig_shape)
@@ -1025,8 +1147,7 @@ def _compute_tucker_core_batched(sparse_tensor, shape, factors, modes):
     Batch size is estimated from free GPU memory via _estimate_batch_num_for_outer.
     """
     from tensormet.distance import (
-        _blocked_coo_to_flat_indices,
-        _unravel_flat_indices_C,
+        coo_to_coords,
         _accumulate_core_num_outer,
         _estimate_batch_num_for_outer,
     )
@@ -1034,11 +1155,10 @@ def _compute_tucker_core_batched(sparse_tensor, shape, factors, modes):
     core_shape = tuple(factors[n].shape[1] for n in range(N))
     core = cp.zeros(core_shape, dtype=factors[0].dtype)
 
-    flat, xvals = _blocked_coo_to_flat_indices(sparse_tensor, shape)
-    nnz = int(flat.size)
+    idxs, xvals = coo_to_coords(sparse_tensor, shape)
+    nnz = int(xvals.size)
     if nnz == 0:
         return core
-    idxs = _unravel_flat_indices_C(flat, shape)
 
     batch_num = _estimate_batch_num_for_outer(core, factors)
     for start in range(0, nnz, int(batch_num)):

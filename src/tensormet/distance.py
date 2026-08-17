@@ -20,6 +20,8 @@ from tensormet.sparse_ops import (
     ptl_tucker_to_tensor,
     gather_dense_at_block_nz,
     safe_ravel,
+    CoordCOO,
+    require_matrix_form,
     compute_Zcols_batch,
     use_legacy_factor_batch,
     use_peel_contraction,
@@ -305,6 +307,8 @@ def fr_compute_errors(
     core       : current core G
     factors    : list of factor matrices A^{(n)}
     """
+
+    require_matrix_form(vec_tensor, "fr_compute_errors")
 
     if verbose:
         print("  Computing Frobenius errors...")
@@ -661,6 +665,35 @@ def _blocked_coo_to_flat_indices(vec_tensor, orig_shape):
     return flat, vals
 
 
+def coo_to_coords(vec_tensor, orig_shape):
+    """Per-mode NNZ coordinates and values, whatever the storage form.
+
+    The single seam every NNZ-streaming (``*_largedim``) kernel goes through,
+    replacing the ``_blocked_coo_to_flat_indices`` + ``_unravel_flat_indices_C``
+    pair they used to open with.
+
+    Free for a ``CoordCOO`` (coordinates are already stored, and no linear index
+    is formed — which is what lets order-5 tensors work at all); an identical
+    decode to before for the legacy block-encoded ``coo_matrix``.
+
+    Returns
+    -------
+    idxs : list of N arrays, each (nnz,) — idxs[n] indexes mode n
+    vals : (nnz,) values
+    """
+    if isinstance(vec_tensor, CoordCOO):
+        return vec_tensor.coord_list(), vec_tensor.data
+    flat, vals = _blocked_coo_to_flat_indices(vec_tensor, orig_shape)
+    return _unravel_flat_indices_C(flat, orig_shape), vals
+
+
+def coords_nnz(vec_tensor) -> int:
+    """NNZ count for either storage form, without decoding anything."""
+    if isinstance(vec_tensor, CoordCOO):
+        return vec_tensor.nnz
+    return int(vec_tensor.tocoo().row.size)
+
+
 # ---------------------------------------------------------------------------
 # Per-mode NNZ grouping cache (2026-06-12 review, Task 3 — findings E-1/E-2/E-3)
 # ---------------------------------------------------------------------------
@@ -713,8 +746,7 @@ def _build_mode_grouping(vec_tensor, shape, mode) -> ModeGrouping:
     Must be called on the device that owns ``vec_tensor`` (the sort and gather
     run there). The result is reusable for every subsequent iteration.
     """
-    flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
-    idxs = _unravel_flat_indices_C(flat, shape)
+    idxs, vals = coo_to_coords(vec_tensor, shape)
     rows = idxs[mode]
 
     other_modes = [m for m in range(len(shape)) if m != mode]
@@ -1009,7 +1041,8 @@ def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.8, temp_mult=4.0,
     return min(int(b), hard_cap)
 
 
-def precompute_largedim_batches(core, factors, modes, masked=False, nnz_live=0):
+def precompute_largedim_batches(core, factors, modes, masked=False, nnz_live=0,
+                                coord_backed=False):
     """
     Precompute the single-GPU largedim KL per-iteration batch sizes ONCE.
 
@@ -1029,12 +1062,17 @@ def precompute_largedim_batches(core, factors, modes, masked=False, nnz_live=0):
         reserving those bytes here reproduces the headroom the in-kernel
         estimate got from snapshotting after that bookkeeping (review Task 1),
         so hoisting the call out does not regress peak-memory safety.
+    coord_backed :
+        True when the kernels consume a ``CoordCOO``, whose coordinates are
+        persistent (already in the snapshot) and passed as views — ``flat`` and
+        the N ``idxs`` are never allocated, leaving only cols/ucols/inv
+        transient. Reserving the full (N+3) tail would shrink every batch.
 
     Returns a dict with ``batch_cols`` (mode -> int), ``batch_rhat`` and
     ``batch_num``.
     """
     N = core.ndim
-    transient_b = (N + 3) * 8 * int(nnz_live)
+    transient_b = (3 if coord_backed else (N + 3)) * 8 * int(nnz_live)
     batch_cols = {
         m: _estimate_batch_cols_for_Z(
             core, factors, m, masked=masked,
@@ -1107,9 +1145,10 @@ def kl_factor_update_largedim(
         inv = None  # contiguous segments replace the inv-scan
     else:
         # Uncached path: decode + group this iteration (subsampled tensors land
-        # here, since their NNZ pattern changes every call).
-        flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
-        idxs = _unravel_flat_indices_C(flat, shape)
+        # here, since their NNZ pattern changes every call). Coordinate-backed
+        # tensors have nothing to decode — coo_to_coords hands back its stored
+        # coordinates, so only the grouping below costs anything.
+        idxs, vals = coo_to_coords(vec_tensor, shape)
 
         rows = idxs[mode]
 
@@ -1277,11 +1316,10 @@ def kl_core_update_largedim(
         modes = list(range(N))
     if list(modes) != list(range(N)):
         raise NotImplementedError("This version assumes modes == all modes (0..N-1).")
-    flat, xvals = _blocked_coo_to_flat_indices(vec_tensor, shape)
-    nnz = int(flat.size)
+    idxs, xvals = coo_to_coords(vec_tensor, shape)  # list length N, each (nnz,)
+    nnz = int(xvals.size)
     if nnz == 0:
         return core
-    idxs = _unravel_flat_indices_C(flat, shape)  # list length N, each (nnz,)
 
     # Full objective: denominator is the outer product of factor column sums
     # (= sum over ALL tensor entries). Masked objective: denominator is summed
@@ -1379,8 +1417,8 @@ def kl_compute_errors_largedim(
     shape = tuple(int(s) for s in shape)
     N = len(shape)
 
-    flat, x_nz = _blocked_coo_to_flat_indices(vec_tensor, shape)
-    nnz = int(flat.size)
+    idxs, x_nz = coo_to_coords(vec_tensor, shape)  # list of N arrays, each (nnz,)
+    nnz = int(x_nz.size)
     if nnz == 0:
         # If X is all-zeros, KL reduces to sum_R. Relative term is ill-defined; mirror your style:
         sum_R = _tucker_sum_all_entries(core, factors, epsilon=epsilon)
@@ -1388,8 +1426,6 @@ def kl_compute_errors_largedim(
 
     x_nz = cp.asarray(x_nz)
     x_nz = cp.clip(x_nz, a_min=epsilon, a_max=None)
-
-    idxs = _unravel_flat_indices_C(flat, shape)  # list of N arrays, each (nnz,)
 
     # --- compute r_nz in batches (like your core update r_hat pass) ---
     r_nz = cp.empty_like(x_nz)
@@ -1484,8 +1520,7 @@ def fr_factor_update_largedim(
         inv = None
     else:
         # Uncached path: decode + group this iteration (subsampled tensors).
-        flat, vals = _blocked_coo_to_flat_indices(vec_tensor, shape)
-        idxs = _unravel_flat_indices_C(flat, shape)
+        idxs, vals = coo_to_coords(vec_tensor, shape)
 
         rows = idxs[mode]
 
@@ -1652,12 +1687,10 @@ def fr_core_update_largedim(
         raise NotImplementedError("This version assumes modes == all modes (0..N-1).")
 
     # --- decode NNZ coordinates (same approach as KL core v2) ---
-    flat, xvals = _blocked_coo_to_flat_indices(vec_tensor, shape)
-    nnz = int(flat.size)
+    idxs, xvals = coo_to_coords(vec_tensor, shape)  # list length N, each (nnz,)
+    nnz = int(xvals.size)
     if nnz == 0:
         return core
-
-    idxs = _unravel_flat_indices_C(flat, shape)  # list length N, each (nnz,)
 
     # --- numerator: core-shaped accumulator, streamed over NNZ ---
     Num = cp.zeros_like(core)
@@ -1734,12 +1767,10 @@ def fr_combined_core_errors_largedim(
     if list(modes) != list(range(N)):
         raise NotImplementedError("This version assumes modes == all modes (0..N-1).")
 
-    flat, xvals = _blocked_coo_to_flat_indices(vec_tensor, shape)
-    nnz = int(flat.size)
+    idxs, xvals = coo_to_coords(vec_tensor, shape)
+    nnz = int(xvals.size)
     if nnz == 0:
         return core, cp.asarray(0.0, dtype=core.dtype)
-
-    idxs = _unravel_flat_indices_C(flat, shape)
 
     Num = cp.zeros_like(core)
     Den_masked = cp.zeros_like(core) if masked else None
@@ -1832,8 +1863,8 @@ def fr_compute_errors_largedim(
     N = len(shape)
 
     # --- decode NNZ (same helpers as your KL largedim) ---
-    flat, x_nz = _blocked_coo_to_flat_indices(vec_tensor, shape)
-    nnz = int(flat.size)
+    idxs, x_nz = coo_to_coords(vec_tensor, shape)  # list of N arrays, each (nnz,)
+    nnz = int(x_nz.size)
 
     x_nz = cp.asarray(x_nz)
     # Frobenius is fine with zeros, but keep nonneg pipeline consistent
@@ -1852,10 +1883,8 @@ def fr_compute_errors_largedim(
         norm_Xhat = cp.sqrt(cp.maximum(norm_Xhat_sq, epsilon))
         return norm_Xhat / cp.maximum(norm_X, epsilon)
 
-    idxs = _unravel_flat_indices_C(flat, shape)  # list of N arrays, each (nnz,)
-
     # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
-    # (flat, x_nz, idxs) is live so the free-memory snapshot is accurate.
+    # (x_nz, idxs) is live so the free-memory snapshot is accurate.
     # Previously estimated at the top of the function (only triggered when the
     # caller passed batch_rhat=None explicitly; the default is 1000).
     if batch_rhat is None:

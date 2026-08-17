@@ -63,6 +63,7 @@ from typing import Optional
 import numpy as np
 
 from tensormet.utils import make_lazy_cupy_pair
+from tensormet.sparse_ops import CoordCOO
 cp, cpx_sparse = make_lazy_cupy_pair()
 
 
@@ -103,9 +104,12 @@ class CooSubsampler:
         frac: float,
         base_seed: Optional[int] = 0,
     ) -> None:
-        self.coo = coo.tocoo()
+        # CoordCOO carries no linear index and needs no .tocoo(); its `take`
+        # applies the same window along the NNZ axis.
+        self._is_coord = isinstance(coo, CoordCOO)
+        self.coo = coo if self._is_coord else coo.tocoo()
         self.frac = float(frac)
-        self.nnz = int(self.coo.row.size)
+        self.nnz = self.coo.nnz if self._is_coord else int(self.coo.row.size)
         self.n_sample = max(1, int(round(self.frac * self.nnz))) if self.nnz else 0
         if self.nnz > 0 and self.frac < 1.0:
             # Host-side permutation transferred once; cheaper and more
@@ -137,6 +141,10 @@ class CooSubsampler:
             idx = cp.concatenate((self._perm[start:], self._perm[: end - self.nnz]))
 
         scale = self.coo.data.dtype.type(1.0 / self.frac)
+        if self._is_coord:
+            sampled = self.coo.take(idx)
+            sampled.data = sampled.data * scale
+            return sampled
         return cpx_sparse.coo_matrix(
             (self.coo.data[idx] * scale,
              (self.coo.row[idx], self.coo.col[idx])),

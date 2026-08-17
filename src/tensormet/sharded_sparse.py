@@ -67,10 +67,10 @@ _DEBUG_SHARD = os.environ.get("TENSORMET_DEBUG_SHARD", "") not in ("", "0", "fal
 
 from tensormet.distance import (
     # Factor update helpers
-    _blocked_coo_to_flat_indices,
+    coo_to_coords,
+    coords_nnz,
     _build_mode_grouping,
     _estimate_batch_cols_for_Z,
-    _unravel_flat_indices_C,
     _unravel_cols_for_mode,
     ModeGrouping,
     fr_factor_update_largedim,
@@ -92,6 +92,8 @@ from tensormet.distance import (
     _tucker_gram_ZtZ,
 )
 from tensormet.sparse_ops import (
+    CoordCOO,
+    _array_device_id,
     compute_Zcols_batch,
     safe_ravel,
     use_legacy_factor_batch,
@@ -109,21 +111,43 @@ cp, cpx_sparse = make_lazy_cupy_pair()
 # Internal utilities
 # ---------------------------------------------------------------------------
 
-def _array_device_id(arr) -> Optional[int]:
-    """Best-effort CUDA device ordinal for *arr*; ``None`` if it is not on a GPU.
+def _build_coord_shard(
+    src: CoordCOO,
+    start: int,
+    end: int,
+    target_device: int,
+    shuffle_seed: Optional[int] = None,
+) -> CoordCOO:
+    """Coordinate-backed counterpart of :func:`_build_shard`.
 
-    CuPy arrays expose ``.device`` as a ``cupy.cuda.Device`` whose ``int()`` is the
-    ordinal. NumPy >= 2.0 also exposes ``.device``, but as the string ``'cpu'`` (so
-    ``int(...)`` raises) — those arrays are not CUDA-resident and must take the
-    host-transfer path, hence ``None``.
+    Same slicing, shuffling and device-placement semantics; the NNZ payload is
+    a ``(ndim, nnz)`` coordinate block instead of ``(row, col)``.
     """
-    dev = getattr(arr, "device", None)
-    if dev is None:
-        return None
-    try:
-        return int(dev)
-    except (TypeError, ValueError):
-        return None
+    coords, data = src.coords, src.data
+    source_device = _array_device_id(coords)
+
+    if source_device is not None and source_device == target_device:
+        with cp.cuda.Device(target_device):
+            c, d = coords[:, start:end], data[start:end]
+            if shuffle_seed is not None:
+                perm = cp.asarray(
+                    np.random.default_rng(int(shuffle_seed)).permutation(int(d.size))
+                )
+                c, d = c[:, perm], d[perm]
+            else:
+                # Slices are views into the full COO; copy so the parent NNZ can
+                # be freed instead of being pinned alive (see _build_shard).
+                c, d = c.copy(), d.copy()
+            return CoordCOO(c, d, src.shape)
+
+    coords_np = cp.asnumpy(coords[:, start:end])
+    data_np = cp.asnumpy(data[start:end])
+    if shuffle_seed is not None:
+        perm = np.random.default_rng(int(shuffle_seed)).permutation(data_np.size)
+        coords_np, data_np = coords_np[:, perm], data_np[perm]
+
+    with cp.cuda.Device(target_device):
+        return CoordCOO(cp.asarray(coords_np), cp.asarray(data_np), src.shape)
 
 
 def _build_shard(
@@ -196,12 +220,12 @@ def _build_shard(
 
 
 def _apply_subsample(
-    flat: cp.ndarray,
+    idxs: List[cp.ndarray],
     vals: cp.ndarray,
     subsample_frac: float,
     iteration: Optional[int],
     rescale: bool = True,
-) -> Tuple[cp.ndarray, cp.ndarray]:
+) -> Tuple[List[cp.ndarray], cp.ndarray]:
     """
     Take this iteration's contiguous NNZ window from pre-shuffled storage.
 
@@ -224,9 +248,11 @@ def _apply_subsample(
 
     Parameters
     ----------
-    flat, vals :
-        Flat indices and values from ``_blocked_coo_to_flat_indices`` on a
+    idxs, vals :
+        Per-mode coordinate arrays and values from ``coo_to_coords`` on a
         shard built with ``shuffle_seed`` set (i.e. already in shuffled order).
+        CHANGED: windows the N coordinate arrays rather than one flat index,
+        which coordinate-backed shards never form. Same window arithmetic.
     subsample_frac :
         Fraction of NNZ to retain.  Must be < 1.0 (caller is responsible
         for not calling this at 1.0).
@@ -246,22 +272,25 @@ def _apply_subsample(
 
     Returns
     -------
-    flat_s, vals_s : windowed arrays (values rescaled iff ``rescale``).
+    idxs_s, vals_s : windowed arrays (values rescaled iff ``rescale``).
     """
-    nnz = int(flat.size)
+    nnz = int(vals.size)
     n_sample = max(1, int(round(subsample_frac * nnz)))
     start = (int(iteration or 0) * n_sample) % nnz
     end = start + n_sample
-    if end <= nnz:
-        flat_s = flat[start:end]
-        vals_s = vals[start:end]
-    else:  # wrap around the end of the shuffled sequence
-        flat_s = cp.concatenate((flat[start:], flat[: end - nnz]))
-        vals_s = cp.concatenate((vals[start:], vals[: end - nnz]))
+
+    def _window(a):
+        if end <= nnz:
+            return a[start:end]
+        # wrap around the end of the shuffled sequence
+        return cp.concatenate((a[start:], a[: end - nnz]))
+
+    idxs_s = [_window(a) for a in idxs]
+    vals_s = _window(vals)
     if not rescale:
-        return flat_s, vals_s
+        return idxs_s, vals_s
     scale = vals.dtype.type(1.0 / subsample_frac)
-    return flat_s, vals_s * scale
+    return idxs_s, vals_s * scale
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +374,14 @@ def _partial_numerator_for_shard(
             zero = cp.asnumpy(cp.zeros_like(A_d))
             return zero, (zero.copy() if masked else None)
     else:
-        flat, vals = _blocked_coo_to_flat_indices(shard, shape)
+        idxs, vals = coo_to_coords(shard, shape)
 
-        if flat.size == 0:
+        if vals.size == 0:
             zero = cp.asnumpy(cp.zeros_like(A_d))
             return zero, (zero.copy() if masked else None)
 
         if subsample_frac < 1.0:
-            flat, vals = _apply_subsample(flat, vals, subsample_frac, iteration)
+            idxs, vals = _apply_subsample(idxs, vals, subsample_frac, iteration)
 
         # Under subsampling the numerator's `vals` are already rescaled by 1/frac
         # (see _apply_subsample). The masked denominator weights (unit / x̂) must be
@@ -360,7 +389,6 @@ def _partial_numerator_for_shard(
         # the ratio but only if both sides carry it.
         den_scale = (1.0 / subsample_frac) if subsample_frac < 1.0 else 1.0
 
-        idxs = _unravel_flat_indices_C(flat, shape)
         rows = idxs[mode]
 
         other_shape = tuple(shape[m] for m in other_modes)
@@ -745,22 +773,21 @@ def _partial_core_num_for_shard(
     factors_d = [cp.asarray(f) for f in factors_np]
     N = len(shape)
 
-    flat, xvals = _blocked_coo_to_flat_indices(shard, shape)
-    nnz = int(flat.size)
+    idxs, xvals = coo_to_coords(shard, shape)
+    nnz = int(xvals.size)
 
     if nnz == 0:
         zero = cp.asnumpy(cp.zeros_like(core_d))
         return zero, (zero.copy() if masked else None)
 
     if subsample_frac < 1.0:
-        flat, xvals = _apply_subsample(flat, xvals, subsample_frac, iteration)
-        nnz = int(flat.size)
+        idxs, xvals = _apply_subsample(idxs, xvals, subsample_frac, iteration)
+        nnz = int(xvals.size)
 
     # Rescale the masked denominator weights to match the 1/frac rescaling that
     # _apply_subsample applied to xvals (the numerator), so the MU ratio is unbiased.
     den_scale = (1.0 / subsample_frac) if subsample_frac < 1.0 else 1.0
 
-    idxs = _unravel_flat_indices_C(flat, shape)
     Num = cp.zeros_like(core_d)
     Den = cp.zeros_like(core_d) if masked else None
 
@@ -962,8 +989,8 @@ def _partial_kl_error_for_shard(
     if batch_rhat is None:
         batch_rhat = int(_estimate_batch_rhat_for_tensordot(core_d, factors_d))
 
-    flat, x_nz = _blocked_coo_to_flat_indices(shard, shape)
-    nnz_full = int(flat.size)
+    idxs, x_nz = coo_to_coords(shard, shape)
+    nnz_full = int(x_nz.size)
 
     if nnz_full == 0:
         return 0.0, 0.0, 0.0
@@ -973,12 +1000,11 @@ def _partial_kl_error_for_shard(
     # nonlinearity-safe). frac == 1 → no sampling, weight == 1.
     weight = 1.0
     if subsample_frac < 1.0:
-        flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, iteration, rescale=False)
-        weight = nnz_full / int(flat.size)
+        idxs, x_nz = _apply_subsample(idxs, x_nz, subsample_frac, iteration, rescale=False)
+        weight = nnz_full / int(x_nz.size)
 
-    nnz = int(flat.size)
+    nnz = int(x_nz.size)
     x_nz = cp.clip(x_nz.astype(core_d.dtype), a_min=epsilon, a_max=None)
-    idxs = _unravel_flat_indices_C(flat, shape)
 
     r_nz = cp.empty_like(x_nz)
     for start in range(0, nnz, batch_rhat):
@@ -1110,20 +1136,19 @@ def _partial_fr_error_for_shard(
     if batch_rhat is None:
         batch_rhat = int(_estimate_batch_rhat_for_tensordot(core_d, factors_d))
 
-    flat, x_nz = _blocked_coo_to_flat_indices(shard, shape)
-    nnz_full = int(flat.size)
+    idxs, x_nz = coo_to_coords(shard, shape)
+    nnz_full = int(x_nz.size)
 
     if nnz_full == 0:
         return 0.0, 0.0, 0.0
 
     weight = 1.0
     if subsample_frac < 1.0:
-        flat, x_nz = _apply_subsample(flat, x_nz, subsample_frac, iteration, rescale=False)
-        weight = nnz_full / int(flat.size)
+        idxs, x_nz = _apply_subsample(idxs, x_nz, subsample_frac, iteration, rescale=False)
+        weight = nnz_full / int(x_nz.size)
 
-    nnz = int(flat.size)
+    nnz = int(x_nz.size)
     x_nz = cp.clip(x_nz.astype(core_d.dtype), a_min=0.0, a_max=None)
-    idxs = _unravel_flat_indices_C(flat, shape)
 
     norm_X_sq = float(cp.sum(x_nz * x_nz).get()) * weight
 
@@ -1300,9 +1325,9 @@ class ShardedSparseTensor:
         if nnz is not None:
             self.nnz = int(nnz)
         elif full_tensor is not None:
-            self.nnz = int(full_tensor.row.size)
+            self.nnz = coords_nnz(full_tensor)
         else:
-            self.nnz = int(sum(int(s.row.size) for s in shards))
+            self.nnz = int(sum(coords_nnz(s) for s in shards))
         self.subsample_frac = float(subsample_frac)
         # Optimisation objective: when True, fit only observed entries
         # (weighted/completion objective), mirroring cfg.exp.objective="masked".
@@ -1500,14 +1525,18 @@ class ShardedSparseTensor:
                          ``subsample_frac == 1.0``.  Typically
                          ``cfg.exp.random_state``.
         """
-        coo_coo = coo.tocoo()
+        # Coordinate-backed tensors carry no linear index and need no .tocoo();
+        # everything below is shape-agnostic between the two storage forms.
+        is_coord = isinstance(coo, CoordCOO)
+        coo_coo = coo if is_coord else coo.tocoo()
 
         if device_ids is None or len(device_ids) <= 1:
-            primary = int(coo_coo.row.device) if hasattr(coo_coo.row, "device") else 0
+            anchor = coo_coo.coords if is_coord else coo_coo.row
+            primary = _array_device_id(anchor) or 0
             return cls(coo_coo, orig_shape, [primary], [coo_coo],
                        subsample_frac=subsample_frac, masked=masked)
 
-        nnz = int(coo_coo.row.size)
+        nnz = coords_nnz(coo_coo)
         n = len(device_ids)
         boundaries = [int(round(nnz * k / n)) for k in range(n + 1)]
 
@@ -1516,8 +1545,9 @@ class ShardedSparseTensor:
         # is a contiguous window instead of a fresh device-side permutation(nnz).
         # Exact runs (frac == 1.0) keep the original NNZ order.
         _shuffle = subsample_frac < 1.0
+        _build = _build_coord_shard if is_coord else _build_shard
         shards = [
-            _build_shard(
+            _build(
                 coo_coo, boundaries[k], boundaries[k + 1], device_ids[k],
                 shuffle_seed=(int(subsample_seed) + k) if _shuffle else None,
             )
