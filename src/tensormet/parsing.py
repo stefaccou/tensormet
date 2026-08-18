@@ -288,11 +288,11 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="CP only: CP-APR inner iterations per mode per sweep (default 1).")
     parser.add_argument("--cp-scooch-kappa", type=float, dest="cp_scooch_kappa", default=None,
                         help="CP only: CP-APR 'scooch' nudge for inadmissible zeros (default 0 = off).")
-    # EXPERIMENTAL (experimental/SGD/README.md): torch minibatch SGD solver.
+    # Torch minibatch SGD solver (sgd/README.md).
     parser.add_argument("--solver", type=str, default=None,
                         choices=["mu", "sgd"],
                         help="Optimizer family: 'mu' (default, multiplicative updates) or 'sgd' "
-                             "(EXPERIMENTAL torch minibatch Adam/SGD; Tucker only). One loop "
+                             "(torch minibatch Adam/SGD; Tucker only). One loop "
                              "iteration = --sgd-steps-per-iteration optimizer steps, so all "
                              "iteration-based knobs keep their meaning.")
     parser.add_argument("--sgd-lr", type=float, dest="sgd_lr", default=None,

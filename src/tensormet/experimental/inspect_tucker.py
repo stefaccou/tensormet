@@ -621,7 +621,7 @@ _MN_STEM_RE = re.compile(r"_(\d+)mn(?=_|$)")
 # Tucker stems carry the bare "..._3D_..." tag instead.
 _DECOMP_STEM_RE = re.compile(r"_CP\d+D(?=_|$)")
 
-# "..._SGD3D_..." marks the experimental SGD solver (naming._order_tag with
+# "..._SGD3D_..." marks the SGD solver (naming._order_tag with
 # solver="sgd"); MU stems carry no solver tag.
 _SOLVER_STEM_RE = re.compile(r"_SGD(?:CP)?\d+D(?=_|$)")
 

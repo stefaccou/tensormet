@@ -1,5 +1,5 @@
 """
-sgd_trainer.py — EXPERIMENTAL: stateful SGD trainer for the production loop.
+sgd_trainer.py — stateful SGD trainer for the production loop.
 
 ``SGDTrainer`` packages ``sgd_tucker``'s model/batcher/objective into the
 narrow surface ``non_negative_tucker_with_similarity`` consumes when

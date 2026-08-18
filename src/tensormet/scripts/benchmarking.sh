@@ -4,7 +4,7 @@
 # EITHER solver and appends one session entry to benchmark.json.
 #
 #   benchmarking.sh                 # MU (multiplicative updates), the default
-#   benchmarking.sh --solver sgd    # EXPERIMENTAL torch minibatch solver
+#   benchmarking.sh --solver sgd    # torch minibatch solver
 #   benchmarking.sh --name "tc off" # free-text session label, shown in the notebook
 #
 # This is the ONE implementation. Everything else (2_benchmarking/*.sh for the
@@ -28,7 +28,7 @@
 #
 # --- How the two solvers differ, and why --------------------------------------
 # The SGD path rejects several MU-only knobs (guard rails in
-# tucker_tensor.py:1366, see experimental/SGD/README.md), so relative to MU the
+# tucker_tensor.py:1366, see sgd/README.md), so relative to MU the
 # following flags are DROPPED, not merely changed:
 #   --subsample-frac <1  : SGD is already minibatch -> use --sgd-batch-size.
 #   --normalize-factors  : scaling lives in the softplus/clamp parametrization.

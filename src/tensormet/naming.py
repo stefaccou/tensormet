@@ -78,7 +78,7 @@ def _r0(rank: _Rank) -> int:
 def _order_tag(order: int, decomposition: str = "tucker", solver: str = "mu") -> str:
     """Order fragment of the model stem: '{order}D' for MU Tucker (unchanged,
     keeps every existing filename byte-identical), 'CP{order}D' for the
-    experimental CP family, 'SGD{order}D' for the experimental SGD solver, so
+    experimental CP family, 'SGD{order}D' for the SGD solver, so
     the artifact families never collide (an SGD run can therefore never scan up
     MU checkpoints on resume, and vice versa). 'SGDCP' is reserved but the
     combination is rejected at fit time."""

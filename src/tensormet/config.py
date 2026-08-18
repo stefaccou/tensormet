@@ -190,10 +190,10 @@ class ExperimentConfig:
     #                      off; the ε-clip already prevents exact zeros).
     cp_inner_iters: int = 1
     cp_scooch_kappa: float = 0.0
-    # EXPERIMENTAL (reviews/ + experimental/SGD/README.md): which optimizer
-    # family fits the model. "mu" (default) is the existing multiplicative-update
-    # pipeline, unchanged; "sgd" routes to the torch minibatch trainer in
-    # experimental/SGD/ (Tucker only for now). Orthogonal to `decomposition`.
+    # Which optimizer family fits the model (sgd/README.md). "mu" (default) is
+    # the existing multiplicative-update pipeline, unchanged; "sgd" routes to
+    # the torch minibatch trainer in sgd/ (Tucker only). Orthogonal to
+    # `decomposition`.
     # Validated at unpack time in the loop.
     solver: str = "mu"
     # SGD-only knobs (ignored for solver="mu"). One loop "iteration" is a block
@@ -228,8 +228,7 @@ class ExperimentConfig:
     #                       up to ~order 4 / rank 200; it binds at order 5+.
     #   sgd_cuda_graph    — capture the fixed-shape step body as a CUDA graph.
     #                       Opt-in; addresses the dispatch-bound regime.
-    #   sgd_comm_backend  — "auto" | "nccl" | "host" (experimental/SGD/
-    #                       collectives.py).
+    #   sgd_comm_backend  — "auto" | "nccl" | "host" (sgd/collectives.py).
     #   sgd_eval_sample   — nnz evaluated per logged error. None (default) is
     #                       the exact pass over every nnz, which costs the same
     #                       per entry as a training step: roughly

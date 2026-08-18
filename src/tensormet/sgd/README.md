@@ -1,4 +1,4 @@
-# Experimental SGD Tucker solver (`--solver sgd`)
+# SGD Tucker solver (`--solver sgd`)
 
 Torch-native minibatch SGD/Adam alternative to the multiplicative-update (MU)
 pipeline, selectable through the standard argument machinery:
@@ -20,8 +20,7 @@ python3 -m tensormet.scripts.nnt \
 ```
 
 With `--solver mu` (the default) every existing code path and filename is
-byte-identical. Template for this layout: `experimental/CP/` +
-`reviews/CP_IMPLEMENTATION_PLAN.md`.
+byte-identical. Template for this layout: the `masked` objective plumbing.
 
 ## What it is
 
@@ -46,7 +45,6 @@ steps (default 100). All iteration-based knobs (`n_iter_max`,
   exact error, the standalone `sgd_non_negative_tucker` for notebooks, and
   `GradStepper` — the per-device step body (flat gradient buffer,
   micro-batching, optional CUDA-graph capture) both trainers run.
-  (The old `experimental/sgd_tucker.py` is a re-export shim.)
 - `sgd_trainer.py` — `SGDTrainer`, the loop-facing surface:
   `run_block(iteration, log_step)`, `materialize()`, `checkpoint_payload()`,
   `load_payload()`, `sync()`. Owns Adam moments, raw params, and the step
@@ -183,7 +181,7 @@ SHARP / CUDA multicast) by default and Ampere has no such path, so
 blocks. The probe watchdog means this now costs 30s and a slower backend rather
 than the whole job.
 
-## Integration seams (guarded; revert = delete this dir + these hunks)
+## Integration points
 
 1. `config.py` — `ExperimentConfig.solver` + `sgd_lr`, `sgd_batch_size`,
    `sgd_optimizer`, `sgd_parametrization`, `sgd_steps_per_iteration`,
@@ -213,7 +211,7 @@ than the whole job.
    the tensorly backend on `"pytorch"` when `solver == "sgd"`; save path uses
    `_as_host`.
 
-Also: `experimental/__init__.py` re-exports; `experimental/submit.py` gained
+Also: `experimental/submit.py` gained
 `TIER2_H100_DUAL` (2 GPUs) and `TIER2_H100_QUAD` (whole node, 4 GPUs) — both
 still `tasks_per_node=1`, since the sharding happens inside one process.
 

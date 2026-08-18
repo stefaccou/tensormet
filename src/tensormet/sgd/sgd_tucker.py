@@ -1,5 +1,5 @@
 """
-sgd_tucker.py — EXPERIMENTAL: SGD/Adam-based non-negative Tucker decomposition.
+sgd_tucker.py — SGD/Adam-based non-negative Tucker decomposition.
 
 Stochastic-gradient alternative to the multiplicative-update (MU) loop in
 ``tucker_tensor.non_negative_tucker_with_similarity``. Pure PyTorch: no CuPy,
@@ -62,7 +62,7 @@ scatter-adds that are atomicAdd-nondeterministic on CUDA by default; pass
 Production integration lives one directory up the import path:
 ``--solver sgd`` routes ``non_negative_tucker_with_similarity`` through
 ``sgd_trainer.SGDTrainer`` (single GPU) / ``sharded_sgd.ShardedSGDTrainer``
-(``--n_gpus > 1``); see experimental/SGD/README.md for the seams. This module
+(``--n_gpus > 1``); see sgd/README.md for the seams. This module
 stays standalone for notebook use via ``sgd_non_negative_tucker``.
 
 Usage (standalone)

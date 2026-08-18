@@ -1491,7 +1491,7 @@ class SparseTupleTensor:
         elif not self.sparsity_type == "cupy":
             raise ValueError("sparse_tensor must have sparsity_type 'cupy'.")
 
-        # --- EXPERIMENTAL SGD guard rails: reject MU-only knobs whose semantics
+        # --- SGD guard rails: reject MU-only knobs whose semantics
         # don't carry over to a minibatch solver (reinterpretation is deferred).
         if _is_sgd:
             if getattr(cfg.exp, "subsample_frac", 1.0) < 1.0:
@@ -1631,7 +1631,7 @@ class SparseTupleTensor:
                 "Use subsample_frac=1.0 and max_nnz=0 on a single GPU."
             )
 
-        # --- EXPERIMENTAL SGD trainer construction ---
+        # --- SGD trainer construction ---
         _sgd_trainer = None
         if _is_sgd:
             _sgd_init = init
@@ -1901,7 +1901,7 @@ class SparseTupleTensor:
                 sync_devices(_n_gpus, _sync_backend)
             _iter_start = time.time()
             if _is_sgd:
-                # --- EXPERIMENTAL SGD solver (experimental/SGD/README.md) ---
+                # --- SGD solver (sgd/README.md) ---
                 # One iteration = a block of sgd_steps_per_iteration optimizer
                 # steps run inside the trainer (torch-native; Adam moments, raw
                 # softplus params and the global step counter live there — state

@@ -1,5 +1,5 @@
 """
-collectives.py — EXPERIMENTAL: cross-device sum-reductions for the
+collectives.py — cross-device sum-reductions for the
 single-process SGD trainers.
 
 ``ShardedSGDTrainer`` runs G model replicas inside ONE process (no
