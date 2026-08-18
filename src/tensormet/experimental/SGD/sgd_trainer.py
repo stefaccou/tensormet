@@ -44,6 +44,7 @@ from tensormet.experimental.SGD.sgd_tucker import (
     full_relative_error,
     make_eval_subset,
 )
+from tensormet.utils import SparseCOOTensor
 
 
 class SGDTrainer:
@@ -51,7 +52,7 @@ class SGDTrainer:
 
     def __init__(
         self,
-        sparse_coo: torch.Tensor,
+        sparse_coo: Union[torch.Tensor, SparseCOOTensor],
         *,
         rank: Union[int, Sequence[int]],
         divergence: str = "kl",
@@ -82,7 +83,11 @@ class SGDTrainer:
             raise ValueError("steps_per_iteration must be >= 1")
         self.eval_chunk = eval_chunk
 
-        if not (isinstance(sparse_coo, torch.Tensor) and sparse_coo.is_sparse):
+        # SparseCOOTensor is load_from_disk's stand-in wherever prod(shape)
+        # overflows torch's numel (order 5 at dim 10000). Only .coalesce() /
+        # .indices() / .values() / .shape are used below, which it provides.
+        if not (isinstance(sparse_coo, (torch.Tensor, SparseCOOTensor))
+                and sparse_coo.is_sparse):
             raise TypeError("SGDTrainer expects a torch sparse COO tensor.")
         t = sparse_coo.coalesce()
 

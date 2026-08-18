@@ -10,7 +10,7 @@ import numpy as np
 import tensorly as tl
 from tensorly.tucker_tensor import validate_tucker_rank, tucker_normalize, TuckerTensor
 from tensorly.tenalg import mode_dot
-from typing import List, Optional, Union, Tuple,  Literal
+from typing import ClassVar, List, Optional, Union, Tuple,  Literal
 from collections import defaultdict
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -331,6 +331,29 @@ class TuckerDecomposition:
         self.factors = np_dispatch(factors)
         self.decomp_path = resolved
 
+    # New: load_best method, which we update manually.
+    # This just uses load_from_disk to return the best model we currently have/think to have for quick testing.
+    # Comes with a bunch of reproducibility issues whenever this is changed, so use with caution.
+
+    # The single place to edit when a new decomposition becomes "the best one";
+    # anything not listed here keeps its load_from_disk default.
+    BEST_CONFIG: ClassVar[dict] = {
+        "dataset": "4-gram-raw-bos-eos-fineweb-en_1B",
+        "method": "scSoftPlus",
+        "divergence": "kl",
+        "dims": 10000,
+        "rank": 100,
+        "order": 4,
+        "shared_factors": "all",
+        "name": "h100_1B_mu",
+        "subsample_frac": 0.025,
+        "solver": "mu",
+    }
+
+    @classmethod
+    def load_best(cls, **overrides) -> "TuckerDecomposition":
+        """Loads the current best-known decomposition; keyword arguments override BEST_CONFIG."""
+        return cls.load_from_disk(**{**cls.BEST_CONFIG, **overrides})
 
     def check_vocab(self, triple: Tuple[str, ...], return_type=bool) -> bool|tuple:
         """Checks if the given (verb, subject, object) triple is in the vocabulary."""
@@ -370,8 +393,10 @@ class TuckerDecomposition:
             for i in range(len(self.roles))
         )
 
-    def fetch_single_latent(self, element, role) -> np.ndarray:
+    def fetch_single_latent(self, element, role=None) -> np.ndarray:
         """Fetches the latent representation for an element."""
+        if role == None:
+            role = self.roles[0] # default, useful for brevity in shared factor elements
         el_idx = self.vocab[voc_index(role)][element]
         factor_slice = self.factors[self.get_role_index(role)][el_idx]
         return _to_np(factor_slice)

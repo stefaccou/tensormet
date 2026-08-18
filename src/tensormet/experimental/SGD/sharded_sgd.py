@@ -90,6 +90,7 @@ from tensormet.experimental.SGD.sgd_tucker import (
     make_eval_subset,
     sampled_loss,
 )
+from tensormet.utils import SparseCOOTensor
 
 # Back-compat alias: the pre-Phase-1 module exposed the shard-local objective
 # under this name and the multi-GPU notebook imports it from here.
@@ -102,7 +103,7 @@ class ShardedSGDTrainer:
 
     def __init__(
         self,
-        sparse_coo: torch.Tensor,
+        sparse_coo: Union[torch.Tensor, SparseCOOTensor],
         *,
         device_ids: Sequence[int],
         rank: Union[int, Sequence[int]],
@@ -149,7 +150,11 @@ class ShardedSGDTrainer:
         if n_shards < 2:
             raise ValueError("ShardedSGDTrainer needs >= 2 devices; use SGDTrainer.")
 
-        if not (isinstance(sparse_coo, torch.Tensor) and sparse_coo.is_sparse):
+        # See SGDTrainer: SparseCOOTensor stands in for a torch sparse COO
+        # wherever prod(shape) overflows torch's numel, and covers the four
+        # methods used below.
+        if not (isinstance(sparse_coo, (torch.Tensor, SparseCOOTensor))
+                and sparse_coo.is_sparse):
             raise TypeError("ShardedSGDTrainer expects a torch sparse COO tensor.")
         t = sparse_coo.coalesce()
         indices_all = t.indices()

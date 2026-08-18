@@ -93,7 +93,7 @@ import torch.nn.functional as F
 from tensorly import backend_context
 from tensorly.tucker_tensor import TuckerTensor
 
-from tensormet.utils import einsum_letters
+from tensormet.utils import SparseCOOTensor, einsum_letters
 
 _EPS = 1e-12
 
@@ -1000,7 +1000,7 @@ def sgd_non_negative_tucker(
         torch.use_deterministic_algorithms(True)
     try:
         t = getattr(sparse_tensor, "tensor", sparse_tensor)
-        if not (isinstance(t, torch.Tensor) and t.is_sparse):
+        if not (isinstance(t, (torch.Tensor, SparseCOOTensor)) and t.is_sparse):
             raise TypeError(
                 "sgd_non_negative_tucker expects a torch sparse COO tensor "
                 "(or an object with .tensor holding one)."
