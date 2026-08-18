@@ -1,33 +1,12 @@
 """
-sharded_sgd.py — EXPERIMENTAL: single-process multi-GPU SGD Tucker trainer.
+sharded_sgd.py — single-process multi-GPU SGD Tucker trainer.
 
-Data-parallel counterpart of ``sgd_trainer.SGDTrainer``, selected by the loop
-when ``cfg.exp.solver == "sgd"`` and ``cfg.train.n_gpus > 1``. Philosophy
-matches ``sharded_sparse.ShardedSparseTensor``: ONE process, per-device
-shards, no torch.distributed / DDP / spawn, so the tee logger, SIGINT handler,
+Parallel counterpart of ``sgd_trainer.SGDTrainer``, selected by the loop
+when ``cfg.exp.solver == "sgd"`` and ``cfg.train.n_gpus > 1``.
+Same idea as the sharded_sparse.ShardedSparseTensor idea for Multi-GPU handling in Multiplicative Updates.
+no torch.distributed / DDP / spawn, so the tee logger, SIGINT handler,
 judge, and checkpoint writer stay unambiguous.
 
-Why the shape of this file changed
-----------------------------------
-The first version was slower on 2 GPUs than on 1 at every batch size measured.
-It was not a correctness problem — it was three structural ones:
-
-* **Serialized dispatch.** All G forward graphs were built in one Python loop,
-  then the autograd engine ran G times in another. At production mode
-  dimensions the order-3 step is ~50x off its arithmetic roofline (step time
-  was nearly batch-independent: 128x the batch for 2x the time), so the step is
-  dispatch, launch and autograd overhead. Doubling the devices doubled the
-  serialized overhead — exactly the observed x0.5. Fixed by the persistent
-  thread-per-GPU pool that MU has always used (``sharded_sparse:1284-1332``).
-* **Per-parameter, per-replica collectives** plus a full ``state_dict()``
-  rebuild and a parameter broadcast every step. Fixed by flattening: parameter
-  ``.grad``s are views into one contiguous buffer (``GradStepper``), so a step
-  costs *one* all-reduce. And because an all-reduce leaves the sum on every
-  device, the optimizer runs redundantly per device and the broadcast is gone.
-* **The batch was divided across devices**, so G GPUs did the single-GPU amount
-  of sampled work for G times the overhead — while the docs claimed a larger
-  effective batch. ``batch_scope="per_device"`` (the default) now means what
-  the docs said.
 
 Layout
 ------
@@ -80,8 +59,8 @@ from typing import Callable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
-from tensormet.experimental.SGD.collectives import make_collective
-from tensormet.experimental.SGD.sgd_tucker import (
+from tensormet.sgd.collectives import make_collective
+from tensormet.sgd.sgd_tucker import (
     _EPS,
     EntryBatcher,
     GradStepper,

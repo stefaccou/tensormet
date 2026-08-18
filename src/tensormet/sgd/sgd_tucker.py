@@ -67,7 +67,7 @@ stays standalone for notebook use via ``sgd_non_negative_tucker``.
 
 Usage (standalone)
 ------------------
-    from tensormet.experimental.SGD.sgd_tucker import sgd_non_negative_tucker
+    from tensormet.sgd.sgd_tucker import sgd_non_negative_tucker
 
     out = sgd_non_negative_tucker(
         sparse_tensor,            # torch sparse COO (or SparseTupleTensor with .tensor)

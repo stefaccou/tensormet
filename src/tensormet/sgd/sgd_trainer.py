@@ -36,7 +36,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
-from tensormet.experimental.SGD.sgd_tucker import (
+from tensormet.sgd.sgd_tucker import (
     _EPS,
     EntryBatcher,
     GradStepper,

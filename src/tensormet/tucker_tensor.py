@@ -1427,9 +1427,9 @@ class SparseTupleTensor:
             normalize_factors = cfg.exp.normalize_factors
             objective = getattr(cfg.exp, "objective", "full")
 
-            # EXPERIMENTAL SGD solver (experimental/SGD/README.md). getattr for
-            # the same deserialized-config back-compat reason as above; the
-            # default reproduces the MU pipeline exactly.
+            # SGD solver (sgd/README.md). getattr for the same deserialized-config
+            # back-compat reason as above: pre-SGD records carry none of these
+            # fields, and the defaults reproduce the MU pipeline exactly.
             solver = getattr(cfg.exp, "solver", "mu")
             sgd_lr = getattr(cfg.exp, "sgd_lr", 1e-2)
             sgd_batch_size = getattr(cfg.exp, "sgd_batch_size", 4096)
@@ -1665,7 +1665,7 @@ class SparseTupleTensor:
             print(f"[{time.strftime('%H:%M:%S')}] constructing SGD trainer "
                   f"(n_gpus={_n_gpus})...", flush=True)
             if _n_gpus > 1:
-                from tensormet.experimental.SGD.sharded_sgd import ShardedSGDTrainer
+                from tensormet.sgd.sharded_sgd import ShardedSGDTrainer
                 _sgd_trainer = ShardedSGDTrainer(
                     self.tensor, device_ids=list(range(_n_gpus)),
                     # Multi-GPU-only knobs; the single-GPU trainer has no
@@ -1674,7 +1674,7 @@ class SparseTupleTensor:
                     comm_backend=sgd_comm_backend, **_sgd_kwargs
                 )
             else:
-                from tensormet.experimental.SGD.sgd_trainer import SGDTrainer
+                from tensormet.sgd.sgd_trainer import SGDTrainer
                 _sgd_trainer = SGDTrainer(self.tensor, **_sgd_kwargs)
             print(f"[{time.strftime('%H:%M:%S')}] SGD trainer ready", flush=True)
 
