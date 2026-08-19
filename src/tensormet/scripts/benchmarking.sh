@@ -7,6 +7,7 @@
 #   benchmarking.sh --solver sgd    # torch minibatch solver
 #   benchmarking.sh --solver cp     # MU on the EXPERIMENTAL nonnegative CP family
 #   benchmarking.sh --name "tc off" # free-text session label, shown in the notebook
+#   benchmarking.sh --max-seconds N # per-run kill switch (default 3600, 0 = off)
 #
 # This is the ONE implementation. Everything else (2_benchmarking/*.sh for the
 # local box, scripts/9_hpc/tier{1,2}/*.sh for PBS/Slurm) is a thin wrapper that
@@ -22,6 +23,7 @@
 #   BENCH_DATASETS="a b"    BENCH_RANKS="10 50" BENCH_DIVERGENCES="kl fr"
 #   BENCH_DIM=10000         BENCH_ITERATIONS=4  BENCH_RUN_EXTRA=true
 #   BENCH_JSON=/path/benchmark.json             BENCH_DRY_RUN=true
+#   BENCH_MAX_SECONDS_PER_DECOMP=3600           # per-run watchdog, 0 disables
 #   (sgd only) BENCH_SGD_LR, BENCH_SGD_BATCH_SIZE, BENCH_SGD_STEPS_PER_ITER,
 #              BENCH_SGD_OPTIMIZER, BENCH_SGD_PARAMETRIZATION,
 #              BENCH_SGD_WARM_START, BENCH_SGD_COMM_BACKEND,
@@ -66,10 +68,17 @@
 # runtime and the rec/sem levels reached, not per-iteration cost. MU and CP both
 # run one full sweep per iteration, so their per-iteration times ARE comparable.
 #
+# --- Per-run watchdog ---------------------------------------------------------
+# MAX_SECONDS_PER_DECOMP (default 3600) caps ONE combo's decomposition process.
+# Without it a single hung or pathologically slow run stalls the whole matrix
+# indefinitely. On expiry the process is killed and the driver moves to the next
+# combo, recording a TIMEOUT row (a timeout is not a result -- it must never be
+# diffed against a completed run).
+#
 # Results are appended to the SAME benchmark.json for every solver, with the
 # session tagged "solver" -> benchmark_inspections.ipynb can tick an MU session
 # and an SGD/CP session and read the Δrec / Δsem column per combo.
-# One run per combo; CRASH recorded on any failure (e.g. OOM).
+# One run per combo; CRASH recorded on any failure (e.g. OOM), TIMEOUT on expiry.
 
 set -o pipefail
 
@@ -82,9 +91,10 @@ while [[ $# -gt 0 ]]; do
         --n-gpus)   BENCH_N_GPUS="$2"; shift 2 ;;
         --method)   BENCH_METHOD="$2"; shift 2 ;;
         --name)     BENCH_NAME="$2"; shift 2 ;;
+        --max-seconds) BENCH_MAX_SECONDS_PER_DECOMP="$2"; shift 2 ;;
         --dry-run)  DRY_RUN=true; shift ;;
         -h|--help)
-            sed -n '3,11p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+            sed -n '3,10p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
             exit 0 ;;
         *)
             echo "ERROR: unknown argument '$1' (see --help)" >&2
@@ -107,6 +117,18 @@ METHOD="${BENCH_METHOD:-counting}"
 # combo keys, so a labelled session still diffs against an unlabelled one.
 NAME="${BENCH_NAME:-}"
 RUN_EXTRA="${BENCH_RUN_EXTRA:-true}"
+# Per-run wall-clock ceiling in seconds; 0 disables the watchdog entirely.
+MAX_SECONDS_PER_DECOMP="${BENCH_MAX_SECONDS_PER_DECOMP:-3600}"
+
+if ! [[ "$MAX_SECONDS_PER_DECOMP" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: BENCH_MAX_SECONDS_PER_DECOMP must be a non-negative integer, got '$MAX_SECONDS_PER_DECOMP'" >&2
+    exit 2
+fi
+if (( MAX_SECONDS_PER_DECOMP > 0 )) && ! command -v timeout >/dev/null 2>&1; then
+    echo "ERROR: BENCH_MAX_SECONDS_PER_DECOMP=$MAX_SECONDS_PER_DECOMP but coreutils 'timeout' is not" >&2
+    echo "       on PATH; set BENCH_MAX_SECONDS_PER_DECOMP=0 to run without the watchdog." >&2
+    exit 2
+fi
 
 # --- SGD knobs for the core matrix (one config, so the matrix stays 1:1 with MU)
 SGD_LR="${BENCH_SGD_LR:-1e-2}"
@@ -185,6 +207,11 @@ fi
 
 [[ -n "$NAME" ]] && echo "benchmark name:   $NAME"
 echo "benchmark config: solver=$SOLVER method=$METHOD dim=$DIM n_gpus=$N_GPUS iterations=$ITERATIONS"
+if (( MAX_SECONDS_PER_DECOMP > 0 )); then
+    echo "                  per-run limit=${MAX_SECONDS_PER_DECOMP}s (killed and recorded TIMEOUT on expiry)"
+else
+    echo "                  per-run limit=off"
+fi
 echo "                  datasets=[${DATASETS[*]}] ranks=[${RANKS[*]}] divergences=[${DIVERGENCES[*]}]"
 if [[ "$SOLVER" == "sgd" ]]; then
     echo "                  sgd=$SGD_OPTIMIZER/$SGD_PARAMETRIZATION lr=$SGD_LR bs=$SGD_BATCH_SIZE steps/iter=$SGD_STEPS_PER_ITER"
@@ -311,13 +338,15 @@ else:
 PYEOF
 }
 
+# _record_crash <key> [status]   status: CRASH (default) | TIMEOUT
+# Both are bare sentinel strings; benchmark_inspections.ipynb knows both.
 _record_crash() {
     local key="$1"
     python3 -c "
 import json
 with open('$TMPJSON') as f:
     r = json.load(f)
-r['$key'] = 'CRASH'
+r['$key'] = '${2:-CRASH}'
 with open('$TMPJSON', 'w') as f:
     json.dump(r, f)
 "
@@ -429,13 +458,21 @@ _run_one() {
     local start end elapsed_ms exit_code
     start=$(date +%s%N)
 
-    python3 -m tensormet.scripts.nnt "${NNT_ARGS[@]}"
+    if (( MAX_SECONDS_PER_DECOMP > 0 )); then
+        timeout -s KILL "$MAX_SECONDS_PER_DECOMP" python3 -m tensormet.scripts.nnt "${NNT_ARGS[@]}"
+    else
+        python3 -m tensormet.scripts.nnt "${NNT_ARGS[@]}"
+    fi
     exit_code=$?
 
     end=$(date +%s%N)
     elapsed_ms=$(( (end - start) / 1000000 ))
 
-    if [[ $exit_code -ne 0 ]]; then
+    # 137 = 128 + SIGKILL, what `timeout -s KILL` exits with on expiry.
+    if [[ $exit_code -eq 137 ]] && (( MAX_SECONDS_PER_DECOMP > 0 )); then
+        echo "!!! [$key] TIMEOUT after ${MAX_SECONDS_PER_DECOMP}s; killed, moving to the next combo"
+        _record_crash "$key" TIMEOUT
+    elif [[ $exit_code -ne 0 ]]; then
         echo "!!! [$key] CRASHED (exit $exit_code)"
         _record_crash "$key"
     else
@@ -527,8 +564,8 @@ def fmt(v):
 #          loop   = decomp_seconds, decomp plus the in-loop semantic eval.
 missing_timing = []
 for key, val in results.items():
-    if val == 'CRASH':
-        print(f'  {key:<65} CRASH')
+    if val in ('CRASH', 'TIMEOUT'):
+        print(f'  {key:<65} {val}')
     else:
         final_rec = val['rec_errors'][-1] if val['rec_errors'] else float('nan')
         final_sem = val['fitness'][-1].get('simlex_all_rho', float('nan')) if val['fitness'] else float('nan')
