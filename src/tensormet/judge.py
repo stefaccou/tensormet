@@ -396,7 +396,9 @@ class DimConsistencyJudge:
 
         role = role if role is not None else tucker_decomp.roles[0]
         role_idx = tucker_decomp.get_role_index(role)
-        rank = int(tucker_decomp.core.shape[role_idx])
+        # Factor columns, not core.shape: identical for Tucker (factor n is
+        # (I_n, R_n)) but O(1) for CP, whose `core` is a materialized diag(λ).
+        rank = int(tucker_decomp.factors[role_idx].shape[1])
         vocab_list = tucker_decomp.vocab[f"vocab_{role}"]
         dims = tucker_decomp.get_dims()[role_idx]
 
