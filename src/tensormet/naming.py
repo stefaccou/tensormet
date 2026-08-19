@@ -75,14 +75,18 @@ def _r0(rank: _Rank) -> int:
     return rank[0] if rank else 0
 
 
+_DECOMPOSITION_TAG = {"cp": "CP", "tt": "TT"}
+
+
 def _order_tag(order: int, decomposition: str = "tucker", solver: str = "mu") -> str:
     """Order fragment of the model stem: '{order}D' for MU Tucker (unchanged,
     keeps every existing filename byte-identical), 'CP{order}D' for the
-    experimental CP family, 'SGD{order}D' for the SGD solver, so
-    the artifact families never collide (an SGD run can therefore never scan up
-    MU checkpoints on resume, and vice versa). 'SGDCP' is reserved but the
-    combination is rejected at fit time."""
-    base = f"CP{order}D" if decomposition == "cp" else f"{order}D"
+    experimental CP family, 'TT{order}D' for the experimental Tucker-TT hybrid,
+    'SGD{order}D' for the SGD solver, so the artifact families never collide (an
+    SGD run can therefore never scan up MU checkpoints on resume, and vice
+    versa). 'SGDCP'/'SGDTT' are reserved but the combinations are rejected at
+    fit time."""
+    base = f"{_DECOMPOSITION_TAG.get(decomposition, '')}{order}D"
     return f"SGD{base}" if solver == "sgd" else base
 
 
@@ -160,10 +164,11 @@ def candidate_stems(
       2. new naming without shared-factor suffix (fallback when sf was added later)
       3. legacy naming: no order prefix          (pre-{order}D era)
 
-    For decomposition="cp" the order fragment becomes 'CP{order}D' and there
-    is no legacy fallback (no CP artifacts predate this naming), so the list
-    is just [new] (+ [new_no_sf] when a shared-factor suffix applies). The same
-    applies to solver="sgd" ('SGD{order}D' fragment, no legacy fallback).
+    For the experimental families the order fragment becomes 'CP{order}D' /
+    'TT{order}D' and there is no legacy fallback (no such artifacts predate this
+    naming), so the list is just [new] (+ [new_no_sf] when a shared-factor
+    suffix applies). The same applies to solver="sgd" ('SGD{order}D' fragment,
+    no legacy fallback).
     """
     p   = _prefix(name)
     sf  = _sf(shared_factors, order)
@@ -181,7 +186,7 @@ def candidate_stems(
     stems = [new]
     if sf:
         stems.append(new_no_sf)
-    if decomposition != "cp" and solver != "sgd":
+    if decomposition not in _DECOMPOSITION_TAG and solver != "sgd":
         stems.append(legacy)
     return stems
 

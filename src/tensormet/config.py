@@ -190,6 +190,9 @@ class ExperimentConfig:
     #                      off; the ε-clip already prevents exact zeros).
     cp_inner_iters: int = 1
     cp_scooch_kappa: float = 0.0
+    # Tucker-TT hybrid only (experimental/TT_hybrid): uniform bond dimension of
+    # the tensor-train core. Capped per cut by the exact TT rank.
+    tt_rank: int = 100
     # Which optimizer family fits the model (sgd/README.md). "mu" (default) is
     # the existing multiplicative-update pipeline, unchanged; "sgd" routes to
     # the torch minibatch trainer in sgd/ (Tucker only). Orthogonal to
@@ -438,6 +441,10 @@ class RunConfig:
                     # are the same identity (ceiling disabled) by design.
                     int(old_exp.get("max_nnz") or 0) ==
                     int(getattr(self.exp, "max_nnz", None) or 0) and
+                    # Tucker-TT: the bond dimension fixes the TT core shapes, so
+                    # a checkpoint with a different one cannot be resumed.
+                    int(old_exp.get("tt_rank", 100)) ==
+                    int(getattr(self.exp, "tt_rank", 100)) and
                     # Correctness-critical, like decomposition: an SGD run must
                     # never resume an MU checkpoint (payloads differ) and vice
                     # versa. The sgd_* knobs are part of the identity because

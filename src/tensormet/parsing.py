@@ -281,9 +281,14 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                              "'masked' fits only observed entries (completion/rating data).")
     # EXPERIMENTAL (reviews/CP_IMPLEMENTATION_PLAN.md): CP decomposition family.
     parser.add_argument("--decomposition", type=str, default=None,
-                        choices=["tucker", "cp"],
-                        help="Decomposition family: 'tucker' (default, existing pipeline) or "
-                             "'cp' (EXPERIMENTAL nonnegative CP; single-GPU, objective=full only).")
+                        choices=["tucker", "cp", "tt"],
+                        help="Decomposition family: 'tucker' (default, existing pipeline), "
+                             "'cp' (EXPERIMENTAL nonnegative CP) or 'tt' (EXPERIMENTAL "
+                             "Tucker-TT hybrid: Tucker factors, tensor-train core). Both "
+                             "experimental families are single-GPU, objective=full only; "
+                             "'tt' is KL only.")
+    parser.add_argument("--tt-rank", type=int, dest="tt_rank", default=None,
+                        help="TT only: bond dimension of the tensor-train core (default 100).")
     parser.add_argument("--cp-inner-iters", type=int, dest="cp_inner_iters", default=None,
                         help="CP only: CP-APR inner iterations per mode per sweep (default 1).")
     parser.add_argument("--cp-scooch-kappa", type=float, dest="cp_scooch_kappa", default=None,
@@ -396,7 +401,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     for field in ("dataset", "method", "order", "divergence", "dim", "name",
                   "random_state", "epsilon", "init", "normalize_factors",
                   "shared_factors", "subsample_frac", "max_nnz", "objective",
-                  "decomposition", "cp_inner_iters", "cp_scooch_kappa",
+                  "decomposition", "cp_inner_iters", "cp_scooch_kappa", "tt_rank",
                   "solver", "sgd_lr", "sgd_batch_size", "sgd_optimizer",
                   "sgd_parametrization", "sgd_steps_per_iteration", "sgd_warm_start",
                   "sgd_batch_scope", "sgd_sync_every", "sgd_micro_batch",

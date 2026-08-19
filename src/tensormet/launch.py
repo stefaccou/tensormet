@@ -376,14 +376,19 @@ def launch_nnt_decomposition(cfg):
         errors = tucker_decomp_info["errors"]
         fitness_scores = tucker_decomp_info["fitness_scores"]
 
-        core_t = tl.tensor(_as_host(core))
         factors_t = [tl.tensor(_as_host(f)) for f in factors]
         _decomposition = getattr(cfg.exp, "decomposition", "tucker")
-        if _decomposition == "cp":
+        if _decomposition == "tt":
+            # EXPERIMENTAL Tucker-TT hybrid: `core` is the list of TT cores.
+            from tensormet.experimental.TT_hybrid.tt_decomposition import TuckerTTTensor
+            tucker_decomp_torch = TuckerTTTensor(
+                ([tl.tensor(_as_host(C)) for C in core], factors_t)
+            )
+        elif _decomposition == "cp":
             from tensorly.cp_tensor import CPTensor
-            tucker_decomp_torch = CPTensor((core_t, factors_t))
+            tucker_decomp_torch = CPTensor((tl.tensor(_as_host(core)), factors_t))
         else:
-            tucker_decomp_torch = TuckerTensor((core_t, factors_t))
+            tucker_decomp_torch = TuckerTensor((tl.tensor(_as_host(core)), factors_t))
 
         torch.save(tucker_decomp_torch, paths["model"])
         np.save(paths["errors"], np.array([e.get() if hasattr(e, "get") else float(e) for e in errors], dtype=float))
@@ -445,7 +450,8 @@ def launch_nnt_decomposition(cfg):
         )
         if not (cfg.exp.name and "bench" in cfg.exp.name):
             notify_discord(
-                f"Saved {_decomposition.capitalize()} decomposition {cfg.exp.method} - "
+                f"Saved {'Tucker-TT' if _decomposition == 'tt' else _decomposition.capitalize()} "
+                f"decomposition {cfg.exp.method} - "
                 f"{cfg.exp.dim}/{cfg.exp.rank[0]} to {final_paths['model']}"
                 f" in {end_time - start_time:.2f} seconds."
             )

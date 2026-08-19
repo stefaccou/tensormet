@@ -1025,7 +1025,7 @@ def _randomised_svd_worker(row_np, col_np, data_np, sp_shape, rank_i, random_sta
 
 
 def _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state, thread_budget=None,
-                               variant="svd"):
+                               variant="svd", with_core=True):
     """Tucker init via truncated SVD of each mode unfolding (CPU/scipy path).
 
     Extracts COO data for all mode unfoldings in the main process (sequential,
@@ -1130,8 +1130,10 @@ def _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state, 
     for b in bars:
         b.close()
 
-    core = _compute_tucker_core_batched(sparse_tensor, shape, factors, modes)
-    core = cp.clip(cp.abs(core), a_min=1e-30, a_max=None)
+    core = None
+    if with_core:
+        core = _compute_tucker_core_batched(sparse_tensor, shape, factors, modes)
+        core = cp.clip(cp.abs(core), a_min=1e-30, a_max=None)
     factors = [cp.clip(cp.abs(f), a_min=1e-30, a_max=None) for f in factors]
     return core, factors
 
@@ -1232,7 +1234,7 @@ def _gpu_top_k_eig(C, k, n_oversampling=10, n_power_iter=3, seed=None):
     return U, s
 
 
-def _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state):
+def _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state, with_core=True):
     """Tucker init via Gram-matrix eigendecomposition (GPU path).
 
     Computes A @ A.T for each mode unfolding A via cuSPARSE spgemm, then
@@ -1258,20 +1260,24 @@ def _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state):
 
         factors.append(_nndsvd_factors_gpu(U, s))
 
-    core = _compute_tucker_core_batched(sparse_tensor, shape, factors, modes)
-    core = cp.clip(cp.abs(core), a_min=1e-30, a_max=None)
+    core = None
+    if with_core:
+        core = _compute_tucker_core_batched(sparse_tensor, shape, factors, modes)
+        core = cp.clip(cp.abs(core), a_min=1e-30, a_max=None)
     factors = [cp.clip(cp.abs(f), a_min=1e-30, a_max=None) for f in factors]
     return core, factors
 
 
 def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, random_state,
-                                   thread_budget=None):
+                                   thread_budget=None, with_core=True):
+    """with_core=False returns (None, factors) and skips the core computation —
+    for decompositions that never form a dense R^N core (experimental/TT_hybrid)."""
     if init == "random":
         rng = tl.check_random_state(random_state)
         core = tl.tensor(
             rng.random_sample([rank[i] for i in range(len(modes))]) + 0.01,
             **tl.context(sparse_tensor),
-        )
+        ) if with_core else None
         factors = [
             tl.tensor(rng.random_sample((shape[mode], rank[i])), **tl.context(sparse_tensor))
             for i, mode in enumerate(modes)
@@ -1282,12 +1288,15 @@ def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, rando
             "randomised_svd": "randomised_svd", "randomized_svd": "randomised_svd",
         }[init]
         return _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state,
-                                          thread_budget=thread_budget, variant=variant)
+                                          thread_budget=thread_budget, variant=variant,
+                                          with_core=with_core)
     elif init == "svd_gpu":
-        return _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state)
+        return _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state,
+                                          with_core=with_core)
     else:
         core, factors = init
 
     factors = [tl.clip(tl.abs(f), a_min=1e-30, a_max=None) for f in factors]
-    core = tl.clip(tl.abs(core), a_min=1e-30, a_max=None)
+    if core is not None:
+        core = tl.clip(tl.abs(core), a_min=1e-30, a_max=None)
     return core, factors
