@@ -1724,10 +1724,10 @@ class SparseTupleTensor:
             )
 
         # --- Tucker-TT guard rails (experimental/TT_hybrid/README.md).
-        if _is_tt and (masked or _n_gpus > 1):
+        if _is_tt and masked:
             raise NotImplementedError(
-                "decomposition='tt' supports neither objective='masked' nor the "
-                "multi-GPU sharded path yet. Use objective='full' and n_gpus=1."
+                "decomposition='tt' does not support objective='masked' yet "
+                "(TT_hybrid/README.md, 'Not implemented'). Use objective='full'."
             )
 
         # --- SGD trainer construction ---

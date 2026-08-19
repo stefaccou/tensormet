@@ -279,20 +279,6 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         choices=["full", "masked"],
                         help="'full' fits the zero-filled tensor (count data); "
                              "'masked' fits only observed entries (completion/rating data).")
-    # EXPERIMENTAL (reviews/CP_IMPLEMENTATION_PLAN.md): CP decomposition family.
-    parser.add_argument("--decomposition", type=str, default=None,
-                        choices=["tucker", "cp", "tt"],
-                        help="Decomposition family: 'tucker' (default, existing pipeline), "
-                             "'cp' (EXPERIMENTAL nonnegative CP) or 'tt' (EXPERIMENTAL "
-                             "Tucker-TT hybrid: Tucker factors, tensor-train core). Both "
-                             "experimental families are single-GPU, objective=full only; "
-                             "'tt' is KL only.")
-    parser.add_argument("--tt-rank", type=int, dest="tt_rank", default=None,
-                        help="TT only: bond dimension of the tensor-train core (default 100).")
-    parser.add_argument("--cp-inner-iters", type=int, dest="cp_inner_iters", default=None,
-                        help="CP only: CP-APR inner iterations per mode per sweep (default 1).")
-    parser.add_argument("--cp-scooch-kappa", type=float, dest="cp_scooch_kappa", default=None,
-                        help="CP only: CP-APR 'scooch' nudge for inadmissible zeros (default 0 = off).")
     # Torch minibatch SGD solver (sgd/README.md).
     parser.add_argument("--solver", type=str, default=None,
                         choices=["mu", "sgd"],
@@ -352,6 +338,22 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                              "several times a whole block's compute. Setting it (e.g. 1000000) "
                              "evaluates a fixed random subset instead — unbiased, and the "
                              "final reported error is still exact.")
+
+    # EXPERIMENTAL (reviews/CP_IMPLEMENTATION_PLAN.md): CP decomposition family.
+    parser.add_argument("--decomposition", type=str, default=None,
+                        choices=["tucker", "cp", "tt"],
+                        help="Decomposition family: 'tucker' (default, existing pipeline), "
+                             "'cp' (EXPERIMENTAL nonnegative CP) or 'tt' (EXPERIMENTAL "
+                             "Tucker-TT hybrid: Tucker factors, tensor-train core). Both "
+                             "experimental families are single-GPU, objective=full only; "
+                             "'tt' is KL only.")
+    parser.add_argument("--tt-rank", type=int, dest="tt_rank", default=None,
+                        help="TT only: bond dimension of the tensor-train core (default 100).")
+    parser.add_argument("--cp-inner-iters", type=int, dest="cp_inner_iters", default=None,
+                        help="CP only: CP-APR inner iterations per mode per sweep (default 1).")
+    parser.add_argument("--cp-scooch-kappa", type=float, dest="cp_scooch_kappa", default=None,
+                        help="CP only: CP-APR 'scooch' nudge for inadmissible zeros (default 0 = off).")
+
 
     # Eval-level args
     parser.add_argument("--rec-check-every", type=int, dest="rec_check_every", default=None)

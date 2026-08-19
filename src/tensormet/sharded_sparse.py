@@ -1861,6 +1861,100 @@ class ShardedSparseTensor:
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
         )
 
+    # ------------------------------------------------------------------
+    # EXPERIMENTAL Tucker-TT hybrid (experimental/TT_hybrid/README.md)
+    # ------------------------------------------------------------------
+    # Same arrangement as the CP delegates above: the machinery lives under
+    # experimental/TT_hybrid/ and is imported lazily. ``core`` is the list of TT
+    # cores here, not an array. KL only, and no masked objective, so
+    # ``self.masked`` plays no part; the batch caches stay unused because the TT
+    # orchestrators estimate once per call and reuse it across shards.
+
+    def tt_factor_update(
+        self,
+        core: List[cp.ndarray],
+        factors: List[cp.ndarray],
+        mode: int,
+        shape: Tuple[int, ...],
+        thread_budget=None,
+        epsilon: float = 1e-12,
+        batch_nnz: Optional[int] = None,
+        verbose: bool = False,
+    ) -> cp.ndarray:
+        """TT-KL factor update; ``core[mode]`` is rescaled in place."""
+        from tensormet.experimental.TT_hybrid import tt_ops, tt_sharded
+
+        if self.n_shards == 1:
+            return tt_ops.tt_kl_factor_update(
+                vec_tensor=self.full_tensor, core=core, factors=factors,
+                mode=mode, shape=shape, thread_budget=thread_budget,
+                epsilon=epsilon, verbose=verbose, batch_nnz=batch_nnz,
+            )
+
+        return tt_sharded._sharded_tt_factor_update(
+            shards=self.shards, device_ids=self.device_ids,
+            tt_cores=core, factors=factors, mode=mode, shape=shape,
+            epsilon=epsilon, batch_nnz=batch_nnz, verbose=verbose,
+            subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
+            pool=self._pool,
+        )
+
+    def tt_core_update(
+        self,
+        shape: Tuple[int, ...],
+        core: List[cp.ndarray],
+        factors: List[cp.ndarray],
+        modes=None,
+        thread_budget=None,
+        epsilon: float = 1e-12,
+        batch_nnz: Optional[int] = None,
+        verbose: bool = False,
+    ) -> List[cp.ndarray]:
+        """TT-KL core sweep; one reduce per site (see tt_sharded's docstring)."""
+        from tensormet.experimental.TT_hybrid import tt_ops, tt_sharded
+
+        if self.n_shards == 1:
+            return tt_ops.tt_kl_core_update(
+                vec_tensor=self.full_tensor, shape=shape, core=core,
+                factors=factors, modes=modes, thread_budget=thread_budget,
+                epsilon=epsilon, verbose=verbose, batch_nnz=batch_nnz,
+            )
+
+        return tt_sharded._sharded_tt_core_update(
+            shards=self.shards, device_ids=self.device_ids,
+            tt_cores=core, factors=factors, shape=shape, modes=modes,
+            epsilon=epsilon, batch_nnz=batch_nnz, verbose=verbose,
+            subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
+            pool=self._pool,
+        )
+
+    def tt_compute_errors(
+        self,
+        shape: Tuple[int, ...],
+        core: List[cp.ndarray],
+        factors: List[cp.ndarray],
+        thread_budget=None,
+        epsilon: float = 1e-12,
+        batch_nnz: Optional[int] = None,
+        verbose: bool = False,
+    ) -> cp.ndarray:
+        """TT relative KL error; ``Σ_all x̂`` stays closed-form on the primary."""
+        from tensormet.experimental.TT_hybrid import tt_ops, tt_sharded
+
+        if self.n_shards == 1:
+            return tt_ops.tt_kl_compute_errors(
+                vec_tensor=self.full_tensor, shape=shape, core=core,
+                factors=factors, thread_budget=thread_budget, epsilon=epsilon,
+                verbose=verbose, batch_nnz=batch_nnz,
+            )
+
+        return tt_sharded._sharded_tt_kl_error(
+            shards=self.shards, device_ids=self.device_ids,
+            tt_cores=core, factors=factors, shape=shape,
+            epsilon=epsilon, batch_nnz=batch_nnz, pool=self._pool,
+            subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Callable wrappers for routing injection
