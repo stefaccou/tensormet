@@ -44,7 +44,8 @@
 #   --largedim           : CP has ONE kernel family; the flag has no meaning.
 #   --normalize-factors  : the CP factor updates already normalize and absorb
 #                          the column scales into λ every sweep.
-# It is single-GPU and full-objective only (both rejected at fit time).
+# It is full-objective only (masked is rejected at fit time). Multi-GPU works,
+# but note that CP shards on _sst alone, not on the largedim threshold.
 #
 # CONSEQUENCE FOR COMPARABILITY: MU's core matrix subsamples NNZ (0.25 / 0.025),
 # so it fits a *smaller tensor* than SGD does. Reconstruction errors across
@@ -188,12 +189,6 @@ fi
 
 BENCHMARK_JSON="${BENCH_JSON:-$DATA_DIR/benchmarking/benchmark.json}"
 mkdir -p "$(dirname "$BENCHMARK_JSON")"
-
-if [[ "$SOLVER" == "cp" ]] && (( N_GPUS > 1 )); then
-    echo "ERROR: --solver cp is single-GPU only (the sharded CP path is not implemented);" >&2
-    echo "       every run would raise. Set BENCH_N_GPUS=1." >&2
-    exit 2
-fi
 
 if (( N_GPUS > 1 )); then
     if [[ "$SOLVER" == "sgd" ]]; then

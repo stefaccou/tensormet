@@ -1778,6 +1778,89 @@ class ShardedSparseTensor:
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
         )
 
+    # ------------------------------------------------------------------
+    # EXPERIMENTAL CP family (experimental/CP/README.md)
+    # ------------------------------------------------------------------
+    # Thin delegates: the CP machinery lives under
+    # experimental/CP/ and are imported lazily, so a Tucker run never touches
+    # them. Everything else these need — shards, pool, warm-up, iter seed,
+    # subsample window — is the machinery above, unchanged. CP has no core
+    # update to shard (``cp_weight_update`` is a passthrough) and no masked
+    # objective, so ``self.masked`` plays no part here.
+
+    def cp_factor_update(
+        self,
+        core: cp.ndarray,
+        factors: List[cp.ndarray],
+        mode: int,
+        shape: Tuple[int, ...],
+        divergence: str,
+        thread_budget=None,
+        epsilon: float = 1e-12,
+        batch_nnz: Optional[int] = None,
+        verbose: bool = False,
+        inner_iters: int = 1,
+        scooch_kappa: float = 0.0,
+    ) -> cp.ndarray:
+        """CP factor update; ``core`` is the λ weight vector, updated in place."""
+        from tensormet.experimental.CP import cp_ops, cp_sharded
+
+        if self.n_shards == 1:
+            fn = (cp_ops.cp_fr_factor_update if divergence == "fr"
+                  else cp_ops.cp_kl_factor_update)
+            kwargs = dict(
+                vec_tensor=self.full_tensor, core=core, factors=factors,
+                mode=mode, shape=shape, thread_budget=thread_budget,
+                epsilon=epsilon, verbose=verbose, batch_nnz=batch_nnz,
+            )
+            if divergence == "kl":
+                kwargs.update(inner_iters=inner_iters, scooch_kappa=scooch_kappa)
+            return fn(**kwargs)
+
+        # No batch cache here: the orchestrator estimates once per call and
+        # reuses it across shards and inner iterations, which is what the
+        # Tucker cache exists to avoid.
+        return cp_sharded._sharded_cp_factor_update(
+            shards=self.shards, device_ids=self.device_ids,
+            weights=core, factors=factors, mode=mode, shape=shape,
+            divergence=divergence, epsilon=epsilon, batch_nnz=batch_nnz,
+            verbose=verbose, subsample_frac=self.subsample_frac,
+            iter_seed=self._iter_seed, pool=self._pool,
+            inner_iters=inner_iters, scooch_kappa=scooch_kappa,
+        )
+
+    def cp_compute_errors(
+        self,
+        shape: Tuple[int, ...],
+        core: cp.ndarray,
+        factors: List[cp.ndarray],
+        divergence: str,
+        thread_budget=None,
+        epsilon: float = 1e-12,
+        batch_nnz: Optional[int] = None,
+        verbose: bool = False,
+    ) -> cp.ndarray:
+        """CP relative error (KL or FR); ``core`` is the λ weight vector."""
+        from tensormet.experimental.CP import cp_ops, cp_sharded
+
+        if self.n_shards == 1:
+            fn = (cp_ops.cp_fr_compute_errors if divergence == "fr"
+                  else cp_ops.cp_kl_compute_errors)
+            return fn(
+                vec_tensor=self.full_tensor, shape=shape, core=core,
+                factors=factors, thread_budget=thread_budget, epsilon=epsilon,
+                verbose=verbose, batch_nnz=batch_nnz,
+            )
+
+        fn = (cp_sharded._sharded_cp_fr_error if divergence == "fr"
+              else cp_sharded._sharded_cp_kl_error)
+        return fn(
+            shards=self.shards, device_ids=self.device_ids,
+            weights=core, factors=factors, shape=shape,
+            epsilon=epsilon, batch_nnz=batch_nnz, pool=self._pool,
+            subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Callable wrappers for routing injection
