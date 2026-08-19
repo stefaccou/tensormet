@@ -1942,7 +1942,9 @@ class SparseTupleTensor:
                               + ")")
         elif _is_tt:
             _selected_path = (f"tucker-tt (nnz-streaming, bonds="
-                              f"{[int(C.shape[2]) for C in core[:-1]]})")
+                              f"{[int(C.shape[2]) for C in core[:-1]]}"
+                              + (f", sharded×{_n_gpus}" if _sst is not None else "")
+                              + ")")
         elif _is_sgd:
             _selected_path = (f"sgd (torch, sharded×{_n_gpus})" if _n_gpus > 1
                               else "sgd (torch)")
@@ -2030,7 +2032,8 @@ class SparseTupleTensor:
                 # predicate as routing (via _largedim_selected) instead of re-deriving
                 # divergence-specific 4000 literals. Sharding now engages iff the
                 # largedim path is selected and a shard set exists (n_gpus > 1).
-                # CP has one kernel family, so _largedim_selected does not apply.
+                # CP and TT each have one kernel family, so _largedim_selected
+                # does not apply to them.
                 if _is_cp and _sst is not None:
                     from tensormet.experimental.CP.cp_routing import (
                         get_sharded_cp_update_routing_step,
@@ -2038,6 +2041,13 @@ class SparseTupleTensor:
                     routing = get_sharded_cp_update_routing_step(
                         _sst, divergence=divergence, log_step=log_step,
                         inner_iters=cp_inner_iters, scooch_kappa=cp_scooch_kappa,
+                    )
+                elif _is_tt and _sst is not None:
+                    from tensormet.experimental.TT_hybrid.tt_routing import (
+                        get_sharded_tt_update_routing_step,
+                    )
+                    routing = get_sharded_tt_update_routing_step(
+                        _sst, divergence=divergence, log_step=log_step,
                     )
                 elif _sst is not None and _largedim_selected:
                     if divergence == "kl":
