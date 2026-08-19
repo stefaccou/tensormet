@@ -1,10 +1,11 @@
 #!/bin/bash
 
 # Canonical benchmark driver: runs the dataset × rank × divergence matrix for
-# EITHER solver and appends one session entry to benchmark.json.
+# ANY solver and appends one session entry to benchmark.json.
 #
 #   benchmarking.sh                 # MU (multiplicative updates), the default
 #   benchmarking.sh --solver sgd    # torch minibatch solver
+#   benchmarking.sh --solver cp     # MU on the EXPERIMENTAL nonnegative CP family
 #   benchmarking.sh --name "tc off" # free-text session label, shown in the notebook
 #
 # This is the ONE implementation. Everything else (2_benchmarking/*.sh for the
@@ -16,7 +17,7 @@
 # Every setting below is overridable from the environment (BENCH_*) so wrappers
 # never need to edit the body. List-valued knobs are space-separated strings:
 #
-#   BENCH_SOLVER=mu|sgd     BENCH_N_GPUS=4      BENCH_METHOD=scSoftPlus
+#   BENCH_SOLVER=mu|sgd|cp  BENCH_N_GPUS=4      BENCH_METHOD=scSoftPlus
 #   BENCH_NAME="tensor cores off"   # session label recorded in benchmark.json
 #   BENCH_DATASETS="a b"    BENCH_RANKS="10 50" BENCH_DIVERGENCES="kl fr"
 #   BENCH_DIM=10000         BENCH_ITERATIONS=4  BENCH_RUN_EXTRA=true
@@ -25,15 +26,23 @@
 #              BENCH_SGD_OPTIMIZER, BENCH_SGD_PARAMETRIZATION,
 #              BENCH_SGD_WARM_START, BENCH_SGD_COMM_BACKEND,
 #              BENCH_LOG_EVERY, BENCH_RUN_VARIANTS
+#   (cp only)  BENCH_CP_INNER_ITERS, BENCH_CP_SCOOCH_KAPPA
 #
-# --- How the two solvers differ, and why --------------------------------------
+# --- How the solvers differ, and why ------------------------------------------
 # The SGD path rejects several MU-only knobs (guard rails in
-# tucker_tensor.py:1366, see sgd/README.md), so relative to MU the
+# tucker_tensor.py, see sgd/README.md), so relative to MU the
 # following flags are DROPPED, not merely changed:
 #   --subsample-frac <1  : SGD is already minibatch -> use --sgd-batch-size.
 #   --normalize-factors  : scaling lives in the softplus/clamp parametrization.
 #   --largedim           : SGD does not use the largedim kernel family.
 #   --max-nnz / svd init : unsupported (warm start instead).
+#
+# CP is the MU solver on a different model family (experimental/CP/README.md),
+# so it keeps MU's cadence and subsampling and drops only:
+#   --largedim           : CP has ONE kernel family; the flag has no meaning.
+#   --normalize-factors  : the CP factor updates already normalize and absorb
+#                          the column scales into λ every sweep.
+# It is single-GPU and full-objective only (both rejected at fit time).
 #
 # CONSEQUENCE FOR COMPARABILITY: MU's core matrix subsamples NNZ (0.25 / 0.025),
 # so it fits a *smaller tensor* than SGD does. Reconstruction errors across
@@ -44,13 +53,22 @@
 # (fineweb-en, rank 10, kl+fr); to align more, add them to _extra_configs with
 # subsample 1.0 and suffix "nosub". Other rows show "n/a" in the notebook.
 #
+# CP needs no such realignment: it runs MU's subsample fractions and emits MU's
+# keys, and both families report the SAME relative metric (rel_KL = KL/Σx,
+# rel_FR = ||X-X̂||/||X||), so a CP session diffs against an MU session row for
+# row. What differs is the model, not the yardstick -- at equal rank CP is the
+# strictly weaker family (a Tucker core has R^N free parameters where CP's λ
+# has R), so expect worse rec at equal rank and read the Δ as the price of the
+# smaller model, not as a regression.
+#
 # Step mapping: one SGD loop "iteration" = SGD_STEPS_PER_ITER optimizer steps,
 # so BENCH_ITERATIONS is NOT wall-clock comparable across solvers; compare total
-# runtime and the rec/sem levels reached, not per-iteration cost.
+# runtime and the rec/sem levels reached, not per-iteration cost. MU and CP both
+# run one full sweep per iteration, so their per-iteration times ARE comparable.
 #
-# Results are appended to the SAME benchmark.json for both solvers, with the
+# Results are appended to the SAME benchmark.json for every solver, with the
 # session tagged "solver" -> benchmark_inspections.ipynb can tick an MU session
-# and an SGD session and read the Δrec / Δsem column per combo.
+# and an SGD/CP session and read the Δrec / Δsem column per combo.
 # One run per combo; CRASH recorded on any failure (e.g. OOM).
 
 set -o pipefail
@@ -74,8 +92,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$SOLVER" != "mu" && "$SOLVER" != "sgd" ]]; then
-    echo "ERROR: --solver must be 'mu' or 'sgd', got '$SOLVER'" >&2
+if [[ "$SOLVER" != "mu" && "$SOLVER" != "sgd" && "$SOLVER" != "cp" ]]; then
+    echo "ERROR: --solver must be 'mu', 'sgd' or 'cp', got '$SOLVER'" >&2
     exit 2
 fi
 
@@ -107,6 +125,10 @@ SGD_COMM_BACKEND="${BENCH_SGD_COMM_BACKEND:-auto}"
 # suffixed keys, so they appear as extra rows (n/a against MU sessions).
 RUN_VARIANTS="${BENCH_RUN_VARIANTS:-false}"
 
+# --- CP knobs (CP-APR); defaults match the kernel defaults, i.e. plain sweeps.
+CP_INNER_ITERS="${BENCH_CP_INNER_ITERS:-1}"
+CP_SCOOCH_KAPPA="${BENCH_CP_SCOOCH_KAPPA:-0.0}"
+
 if [[ "$SOLVER" == "sgd" ]]; then
     ITERATIONS="${BENCH_ITERATIONS:-20}"
     # Reconstruction-error cadence (--rec-log-every). Deliberately > 1, unlike
@@ -123,6 +145,12 @@ if [[ "$SOLVER" == "sgd" ]]; then
     LOG_EVERY="${BENCH_LOG_EVERY:-5}"
     SEM_CHECK_EVERY="$ITERATIONS"
     RUN_PREFIX="bench_sgd_"
+elif [[ "$SOLVER" == "cp" ]]; then
+    # Same cadence as MU: one sweep per iteration, so the rows line up 1:1.
+    ITERATIONS="${BENCH_ITERATIONS:-4}"
+    LOG_EVERY="${BENCH_LOG_EVERY:-1}"
+    SEM_CHECK_EVERY=4
+    RUN_PREFIX="bench_cp_"
 else
     ITERATIONS="${BENCH_ITERATIONS:-4}"
     LOG_EVERY="${BENCH_LOG_EVERY:-1}"
@@ -138,6 +166,12 @@ fi
 
 BENCHMARK_JSON="${BENCH_JSON:-$DATA_DIR/benchmarking/benchmark.json}"
 mkdir -p "$(dirname "$BENCHMARK_JSON")"
+
+if [[ "$SOLVER" == "cp" ]] && (( N_GPUS > 1 )); then
+    echo "ERROR: --solver cp is single-GPU only (the sharded CP path is not implemented);" >&2
+    echo "       every run would raise. Set BENCH_N_GPUS=1." >&2
+    exit 2
+fi
 
 if (( N_GPUS > 1 )); then
     if [[ "$SOLVER" == "sgd" ]]; then
@@ -157,6 +191,8 @@ if [[ "$SOLVER" == "sgd" ]]; then
     if (( N_GPUS > 1 )); then
         echo "                  comm_backend=$SGD_COMM_BACKEND (resolved backend is logged per run)"
     fi
+elif [[ "$SOLVER" == "cp" ]]; then
+    echo "                  cp=EXPERIMENTAL nonnegative CP, inner_iters=$CP_INNER_ITERS scooch_kappa=$CP_SCOOCH_KAPPA"
 fi
 echo "                  results -> $BENCHMARK_JSON"
 
@@ -183,8 +219,8 @@ import numpy as np
 
 key, runtime_ms, decomp_dir, run_name, tmpjson = sys.argv[1:]
 
-# SGD artifacts carry an 'SGD{order}D' stem fragment, but run_name is still the
-# leading prefix, so one set of globs covers both solvers.
+# SGD and CP artifacts carry their own stem fragment ('SGD{order}D' / 'CP{order}D'),
+# but run_name is still the leading prefix, so one set of globs covers all solvers.
 errors_files = glob.glob(f"{decomp_dir}/{run_name}_*_errors.npy")
 fitness_files = glob.glob(f"{decomp_dir}/{run_name}_*_fitness.json")
 timing_files = glob.glob(f"{decomp_dir}/{run_name}_*_timing.json")
@@ -287,8 +323,8 @@ with open('$TMPJSON', 'w') as f:
 "
 }
 
-# Per-dataset structural settings. SUBSAMPLE is MU-only (SGD always runs full
-# data — see the comparability note in the header).
+# Per-dataset structural settings. SUBSAMPLE applies to MU and CP (SGD always
+# runs full data — see the comparability note in the header).
 _dataset_shape() {
     case "$1" in
         fineweb-en)
@@ -342,6 +378,15 @@ _build_args() {
             --sgd-comm-backend "$SGD_COMM_BACKEND"
         )
         [[ -n "$SGD_WARM_START" ]] && NNT_ARGS+=(--sgd-warm-start "$SGD_WARM_START")
+    elif [[ "$SOLVER" == "cp" ]]; then
+        # No --largedim / --normalize-factors: see the header note.
+        NNT_ARGS+=(
+            --decomposition cp
+            --objective full
+            --subsample-frac "$subsample"
+            --cp-inner-iters "$CP_INNER_ITERS"
+            --cp-scooch-kappa "$CP_SCOOCH_KAPPA"
+        )
     else
         NNT_ARGS+=(
             --largedim true
@@ -370,6 +415,8 @@ _run_one() {
 
     if [[ "$SOLVER" == "sgd" ]]; then
         echo -e "\n\n\n>>> [$key] (solver=sgd opt=$optimizer param=$parametrization lr=$lr bs=$batch)"
+    elif [[ "$SOLVER" == "cp" ]]; then
+        echo -e "\n\n\n>>> [$key] (solver=cp subsample=$SUBSAMPLE inner_iters=$CP_INNER_ITERS)"
     else
         echo -e "\n\n\n>>> [$key] (solver=mu subsample=$SUBSAMPLE)"
     fi
@@ -414,14 +461,14 @@ for dataset in "${DATASETS[@]}"; do
 done
 
 
-# --- MU: extra no-subsampling runs (the rows SGD can be diffed against) -------
+# --- MU/CP: extra no-subsampling runs (the rows SGD can be diffed against) ----
 # dataset|rank|div|subsample|suffix
 _extra_configs=(
     "fineweb-en|10|kl|1.0|nosub"
     "fineweb-en|10|fr|1.0|nosub"
 )
 
-if [[ "$SOLVER" == "mu" && "$RUN_EXTRA" == "true" ]]; then
+if [[ "$SOLVER" != "sgd" && "$RUN_EXTRA" == "true" ]]; then
     for config in "${_extra_configs[@]}"; do
         IFS='|' read -r dataset rank div subsample suffix <<< "$config"
         _run_one "${dataset}__rank${rank}__${div}__${suffix}" \
@@ -504,11 +551,12 @@ PYEOF
 # Append results to benchmark.json (one file for both solvers, tagged by session)
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 SGD_META="$(printf '%s|%s|%s|%s|%s' "$SGD_OPTIMIZER" "$SGD_PARAMETRIZATION" "$SGD_LR" "$SGD_BATCH_SIZE" "$SGD_STEPS_PER_ITER")"
-python3 - "$TIMESTAMP" "$N_GPUS" "$TMPJSON" "$BENCHMARK_JSON" "$SOLVER" "$METHOD" "$SGD_META" "$NAME" <<'PYEOF'
+CP_META="$(printf '%s|%s' "$CP_INNER_ITERS" "$CP_SCOOCH_KAPPA")"
+python3 - "$TIMESTAMP" "$N_GPUS" "$TMPJSON" "$BENCHMARK_JSON" "$SOLVER" "$METHOD" "$SGD_META" "$NAME" "$CP_META" <<'PYEOF'
 import json, sys
 from pathlib import Path
 
-timestamp, n_gpus, tmpjson, benchmark_json, solver, method, sgd_meta, name = sys.argv[1:]
+timestamp, n_gpus, tmpjson, benchmark_json, solver, method, sgd_meta, name, cp_meta = sys.argv[1:]
 
 with open(tmpjson) as f:
     results = json.load(f)
@@ -526,6 +574,9 @@ if name:
 if solver == "sgd":
     optimizer, parametrization, lr, batch_size, steps = sgd_meta.split("|")
     entry["sgd_config"] = f"{optimizer}/{parametrization} lr={lr} bs={batch_size} steps/iter={steps}"
+elif solver == "cp":
+    inner_iters, scooch_kappa = cp_meta.split("|")
+    entry["cp_config"] = f"inner_iters={inner_iters} scooch_kappa={scooch_kappa}"
 entry.update(results)
 
 if Path(benchmark_json).exists():
