@@ -1097,7 +1097,7 @@ class SparseTupleTensor:
             dims: "int | tuple[int, ...]" = 1000,
             map_location: str = "cpu",
             tier1: bool = False,
-            shared_factors: Optional[Union[Tuple[Tuple[int, int], ...], str]] = None,
+            shared_factors: bool|set|str=False,
             add_vocab: bool = False,
     ) -> "SparseTupleTensor":
         """
@@ -1932,6 +1932,18 @@ class SparseTupleTensor:
                 cp.get_default_pinned_memory_pool().free_all_blocks()
             _dim_judge.ensure_loaded()
 
+        # TT streams NNZ with its own estimator, which depends only on the core/
+        # factor shapes and dtype — fixed for the run. Size it once here (after
+        # the judge is resident, so its footprint is accounted for) instead of
+        # once per factor update, core sweep and error pass.
+        _tt_batch_nnz = None
+        if _is_tt:
+            from tensormet.experimental.TT_hybrid.tt_ops import estimate_batch_nnz_tt
+            # _gpu_free_bytes() reads whichever device is current; pin to the one
+            # the cores live on so a sharded run never sizes against a shard's GPU.
+            with core[0].device:
+                _tt_batch_nnz = estimate_batch_nnz_tt(core, factors)
+
         print(divergence, rank, _subsample_frac)
         # CHANGED (2026-06-12 review, Task 6): announce the routing family chosen by
         # the unified needs_largedim() predicate. Sharding engages iff largedim does
@@ -2099,6 +2111,8 @@ class SparseTupleTensor:
                     # skips the per-update _estimate_batch_cols_for_Z + pool flush.
                     if _largedim_batches is not None:
                         _factor_kwargs["batch_cols"] = _largedim_batches["batch_cols"][mode]
+                    if _tt_batch_nnz is not None:
+                        _factor_kwargs["batch_nnz"] = _tt_batch_nnz
                     factors[mode] = routing.factor_update(**_factor_kwargs)
 
                     # new: factor linking
@@ -2141,6 +2155,8 @@ class SparseTupleTensor:
                     if _largedim_batches is not None:
                         _core_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
                         _core_kwargs["batch_num"] = _largedim_batches["batch_num"]
+                    if _tt_batch_nnz is not None:
+                        _core_kwargs["batch_nnz"] = _tt_batch_nnz
                     core = routing.core_update(**_core_kwargs)
 
                     # CHANGED (2026-06-12 review, Task 5 — I-1): the KL error runs on
@@ -2163,6 +2179,9 @@ class SparseTupleTensor:
                     # steps error_fn is null_compute_errors (no such kwarg).
                     if _largedim_batches is not None and log_step:
                         _err_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
+                    # null_compute_errors takes no batch kwarg on non-log steps.
+                    if _tt_batch_nnz is not None and log_step:
+                        _err_kwargs["batch_nnz"] = _tt_batch_nnz
                     rel_err = routing.error_fn(**_err_kwargs)
                 # CP and TT skip this: their factor updates already keep the
                 # columns normalized, with the scale absorbed into λ / the TT

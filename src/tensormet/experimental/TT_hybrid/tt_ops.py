@@ -214,7 +214,8 @@ def tt_kl_compute_errors(vec_tensor, shape, core, factors,
 
     sum_all = tt_sum_all_entries(tt_cores, factors, epsilon=epsilon)
     if nnz == 0:
-        return sum_all / cp.maximum(cp.asarray(0.0, dtype=sum_all.dtype), epsilon)
+        # rel = D / Σ_nnz x is undefined with no data; nan rather than D/ε.
+        return cp.asarray(float("nan"), dtype=sum_all.dtype)
 
     x_nz = cp.clip(cp.asarray(vals), a_min=epsilon, a_max=None)
     if batch_nnz is None:

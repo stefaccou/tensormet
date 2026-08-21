@@ -163,6 +163,7 @@ class TuckerTTDecomposition:
                        divergence: str = "kl",
                        dims: "int | tuple[int, ...]" = 4000,
                        rank: int = 100,
+                       tt_rank: int = 100,
                        order: int = 3,
                        iterations: int | None = None,
                        shared_factors: bool | set | str = False,
@@ -175,8 +176,9 @@ class TuckerTTDecomposition:
         """Load a precomputed Tucker-TT decomposition.
 
         Mirrors ``TuckerDecomposition.load_from_disk`` but scans the TT filename
-        family (``…_TT{order}D_…``, see naming.py) and unpacks
-        ``TuckerTTTensor`` payloads.
+        family (``…_TT{tt_rank}b{order}D_…``, see naming.py) and unpacks
+        ``TuckerTTTensor`` payloads. ``tt_rank`` is part of the stem, so it must
+        match the run's bond dimension.
         """
         if method not in ALL_METHODS:
             raise ValueError(f"method must be one of {set(ALL_METHODS)}")
@@ -211,7 +213,7 @@ class TuckerTTDecomposition:
         stems = candidate_stems(
             divergence, method, order, dims, rank,
             name=name, shared_factors=parsed_shared, subsample_frac=subsample_frac,
-            max_nnz=max_nnz, decomposition="tt",
+            max_nnz=max_nnz, decomposition="tt", tt_rank=tt_rank,
         )
 
         def _find_highest_iter(prefix: str) -> int:
@@ -336,7 +338,8 @@ class TuckerTTDecomposition:
                     for C in self.tt_cores]
         tt_cores = [C.to(device=device, dtype=self.factors[0].dtype) for C in tt_cores]
 
-        mats = [self.factors[i][valid_indices[:, i]] for i in range(len(self.roles))]
+        mats = [None if i == target else self.factors[i][valid_indices[:, i]]
+                for i in range(len(self.roles))]
         S = sites(tt_cores, mats, torch, skip=target)
         return site_grad(left_envs(S, torch)[target], tt_cores[target],
                          right_envs(S, torch)[target + 1], torch)

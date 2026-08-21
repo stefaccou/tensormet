@@ -6,6 +6,7 @@
 #   benchmarking.sh                 # MU (multiplicative updates), the default
 #   benchmarking.sh --solver sgd    # torch minibatch solver
 #   benchmarking.sh --solver cp     # MU on the EXPERIMENTAL nonnegative CP family
+#   benchmarking.sh --solver tt     # MU on the EXPERIMENTAL Tucker-TT hybrid
 #   benchmarking.sh --name "tc off" # free-text session label, shown in the notebook
 #   benchmarking.sh --max-seconds N # per-run kill switch (default 3600, 0 = off)
 #
@@ -18,7 +19,7 @@
 # Every setting below is overridable from the environment (BENCH_*) so wrappers
 # never need to edit the body. List-valued knobs are space-separated strings:
 #
-#   BENCH_SOLVER=mu|sgd|cp  BENCH_N_GPUS=4      BENCH_METHOD=scSoftPlus
+#   BENCH_SOLVER=mu|sgd|cp|tt  BENCH_N_GPUS=4   BENCH_METHOD=scSoftPlus
 #   BENCH_NAME="tensor cores off"   # session label recorded in benchmark.json
 #   BENCH_DATASETS="a b"    BENCH_RANKS="10 50" BENCH_DIVERGENCES="kl fr"
 #   BENCH_DIM=10000         BENCH_ITERATIONS=4  BENCH_RUN_EXTRA=true
@@ -29,6 +30,7 @@
 #              BENCH_SGD_WARM_START, BENCH_SGD_COMM_BACKEND,
 #              BENCH_LOG_EVERY, BENCH_RUN_VARIANTS
 #   (cp only)  BENCH_CP_INNER_ITERS, BENCH_CP_SCOOCH_KAPPA
+#   (tt only)  BENCH_TT_RANK                    # bond dimension, default 100
 #
 # --- How the solvers differ, and why ------------------------------------------
 # The SGD path rejects several MU-only knobs (guard rails in
@@ -47,6 +49,17 @@
 # It is full-objective only (masked is rejected at fit time). Multi-GPU works,
 # but note that CP shards on _sst alone, not on the largedim threshold.
 #
+# TT is likewise the MU solver on a different model family
+# (experimental/TT_hybrid/README.md): Tucker factors, tensor-train core. It drops
+# the same two flags as CP, for the same reasons (one kernel family; the factor
+# update already l1-normalizes and absorbs the scale into that mode's TT core),
+# and additionally:
+#   --divergence fr      : the TT kernels are KL only; DIVERGENCES is forced to
+#                          "kl" below and an fr request is reported, not run.
+# BENCH_TT_RANK is the bond dimension. It is part of the artifact stem
+# ('TT{tt_rank}b{order}D'), so sessions at different bonds never collide on disk
+# and can be run back to back.
+#
 # CONSEQUENCE FOR COMPARABILITY: MU's core matrix subsamples NNZ (0.25 / 0.025),
 # so it fits a *smaller tensor* than SGD does. Reconstruction errors across
 # different subsample fractions are not on the same tensor and must not be
@@ -56,18 +69,23 @@
 # (fineweb-en, rank 10, kl+fr); to align more, add them to _extra_configs with
 # subsample 1.0 and suffix "nosub". Other rows show "n/a" in the notebook.
 #
-# CP needs no such realignment: it runs MU's subsample fractions and emits MU's
-# keys, and both families report the SAME relative metric (rel_KL = KL/Σx,
-# rel_FR = ||X-X̂||/||X||), so a CP session diffs against an MU session row for
-# row. What differs is the model, not the yardstick -- at equal rank CP is the
-# strictly weaker family (a Tucker core has R^N free parameters where CP's λ
-# has R), so expect worse rec at equal rank and read the Δ as the price of the
-# smaller model, not as a regression.
+# CP and TT need no such realignment: they run MU's subsample fractions and emit
+# MU's keys, and all three families report the SAME relative metric (rel_KL =
+# KL/Σx, rel_FR = ||X-X̂||/||X||), so a CP or TT session diffs against an MU
+# session row for row. What differs is the model, not the yardstick -- at equal
+# rank CP is the strictly weaker family (a Tucker core has R^N free parameters
+# where CP's λ has R) and TT sits between them (Σ_k ρ_k R_k ρ_{k+1} parameters,
+# exact at large enough bond), so expect worse rec at equal rank and read the Δ
+# as the price of the smaller model, not as a regression. For TT the interesting
+# sweep is BENCH_TT_RANK at fixed --rank: it prices the core compression alone.
 #
 # Step mapping: one SGD loop "iteration" = SGD_STEPS_PER_ITER optimizer steps,
 # so BENCH_ITERATIONS is NOT wall-clock comparable across solvers; compare total
-# runtime and the rec/sem levels reached, not per-iteration cost. MU and CP both
-# run one full sweep per iteration, so their per-iteration times ARE comparable.
+# runtime and the rec/sem levels reached, not per-iteration cost. MU, CP and TT
+# all run one full sweep per iteration, so their per-iteration times ARE
+# comparable -- with the caveat that a TT core sweep is N sequential NNZ passes
+# (one per site) where Tucker's is one, so TT trades per-iteration cost for a
+# core that stays linear in the order.
 #
 # --- Per-run watchdog ---------------------------------------------------------
 # MAX_SECONDS_PER_DECOMP (default 3600) caps ONE combo's decomposition process.
@@ -103,14 +121,28 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$SOLVER" != "mu" && "$SOLVER" != "sgd" && "$SOLVER" != "cp" ]]; then
-    echo "ERROR: --solver must be 'mu', 'sgd' or 'cp', got '$SOLVER'" >&2
+if [[ "$SOLVER" != "mu" && "$SOLVER" != "sgd" && "$SOLVER" != "cp" && "$SOLVER" != "tt" ]]; then
+    echo "ERROR: --solver must be 'mu', 'sgd', 'cp' or 'tt', got '$SOLVER'" >&2
     exit 2
 fi
 
 read -r -a DATASETS    <<< "${BENCH_DATASETS:-fineweb-en fineweb_english_1B 4-gram-raw-fineweb-en_100000000}"
 read -r -a RANKS       <<< "${BENCH_RANKS:-10 50 100}"
 read -r -a DIVERGENCES <<< "${BENCH_DIVERGENCES:-kl fr}"
+
+# TT implements the KL/Poisson divergence only (the FR denominator needs a
+# doubled, Gram-weighted chain). Drop anything else rather than queueing runs
+# that are guaranteed to raise NotImplementedError at fit time.
+if [[ "$SOLVER" == "tt" ]]; then
+    _tt_dropped=()
+    for _d in "${DIVERGENCES[@]}"; do
+        [[ "$_d" != "kl" ]] && _tt_dropped+=("$_d")
+    done
+    if (( ${#_tt_dropped[@]} > 0 )); then
+        echo "NOTE: solver=tt is KL only; skipping divergence(s): ${_tt_dropped[*]}" >&2
+    fi
+    DIVERGENCES=(kl)
+fi
 DIM="${BENCH_DIM:-10000}"
 N_GPUS="${BENCH_N_GPUS:-2}"
 METHOD="${BENCH_METHOD:-counting}"
@@ -152,6 +184,13 @@ RUN_VARIANTS="${BENCH_RUN_VARIANTS:-false}"
 CP_INNER_ITERS="${BENCH_CP_INNER_ITERS:-1}"
 CP_SCOOCH_KAPPA="${BENCH_CP_SCOOCH_KAPPA:-0.0}"
 
+# --- TT knob: bond dimension of the tensor-train core (kernel default is 100).
+TT_RANK="${BENCH_TT_RANK:-100}"
+if ! [[ "$TT_RANK" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: BENCH_TT_RANK must be a positive integer, got '$TT_RANK'" >&2
+    exit 2
+fi
+
 if [[ "$SOLVER" == "sgd" ]]; then
     ITERATIONS="${BENCH_ITERATIONS:-20}"
     # Reconstruction-error cadence (--rec-log-every). Deliberately > 1, unlike
@@ -174,6 +213,12 @@ elif [[ "$SOLVER" == "cp" ]]; then
     LOG_EVERY="${BENCH_LOG_EVERY:-1}"
     SEM_CHECK_EVERY=4
     RUN_PREFIX="bench_cp_"
+elif [[ "$SOLVER" == "tt" ]]; then
+    # Same cadence as MU and CP: one sweep per iteration.
+    ITERATIONS="${BENCH_ITERATIONS:-4}"
+    LOG_EVERY="${BENCH_LOG_EVERY:-1}"
+    SEM_CHECK_EVERY=4
+    RUN_PREFIX="bench_tt_"
 else
     ITERATIONS="${BENCH_ITERATIONS:-4}"
     LOG_EVERY="${BENCH_LOG_EVERY:-1}"
@@ -215,6 +260,8 @@ if [[ "$SOLVER" == "sgd" ]]; then
     fi
 elif [[ "$SOLVER" == "cp" ]]; then
     echo "                  cp=EXPERIMENTAL nonnegative CP, inner_iters=$CP_INNER_ITERS scooch_kappa=$CP_SCOOCH_KAPPA"
+elif [[ "$SOLVER" == "tt" ]]; then
+    echo "                  tt=EXPERIMENTAL Tucker-TT hybrid, tt_rank=$TT_RANK (KL only)"
 fi
 echo "                  results -> $BENCHMARK_JSON"
 
@@ -241,8 +288,9 @@ import numpy as np
 
 key, runtime_ms, decomp_dir, run_name, tmpjson = sys.argv[1:]
 
-# SGD and CP artifacts carry their own stem fragment ('SGD{order}D' / 'CP{order}D'),
-# but run_name is still the leading prefix, so one set of globs covers all solvers.
+# SGD, CP and TT artifacts carry their own stem fragment ('SGD{order}D' /
+# 'CP{order}D' / 'TT{tt_rank}b{order}D'), but run_name is still the leading
+# prefix, so one set of globs covers all solvers.
 errors_files = glob.glob(f"{decomp_dir}/{run_name}_*_errors.npy")
 fitness_files = glob.glob(f"{decomp_dir}/{run_name}_*_fitness.json")
 timing_files = glob.glob(f"{decomp_dir}/{run_name}_*_timing.json")
@@ -411,6 +459,14 @@ _build_args() {
             --cp-inner-iters "$CP_INNER_ITERS"
             --cp-scooch-kappa "$CP_SCOOCH_KAPPA"
         )
+    elif [[ "$SOLVER" == "tt" ]]; then
+        # No --largedim / --normalize-factors, same reasons as CP.
+        NNT_ARGS+=(
+            --decomposition tt
+            --tt-rank "$TT_RANK"
+            --objective full
+            --subsample-frac "$subsample"
+        )
     else
         NNT_ARGS+=(
             --largedim true
@@ -441,6 +497,8 @@ _run_one() {
         echo -e "\n\n\n>>> [$key] (solver=sgd opt=$optimizer param=$parametrization lr=$lr bs=$batch)"
     elif [[ "$SOLVER" == "cp" ]]; then
         echo -e "\n\n\n>>> [$key] (solver=cp subsample=$SUBSAMPLE inner_iters=$CP_INNER_ITERS)"
+    elif [[ "$SOLVER" == "tt" ]]; then
+        echo -e "\n\n\n>>> [$key] (solver=tt subsample=$SUBSAMPLE tt_rank=$TT_RANK)"
     else
         echo -e "\n\n\n>>> [$key] (solver=mu subsample=$SUBSAMPLE)"
     fi
@@ -503,6 +561,8 @@ _extra_configs=(
 if [[ "$SOLVER" != "sgd" && "$RUN_EXTRA" == "true" ]]; then
     for config in "${_extra_configs[@]}"; do
         IFS='|' read -r dataset rank div subsample suffix <<< "$config"
+        # TT is KL only; skip the fr row rather than queueing a guaranteed crash.
+        [[ "$SOLVER" == "tt" && "$div" != "kl" ]] && continue
         _run_one "${dataset}__rank${rank}__${div}__${suffix}" \
             "$dataset" "$rank" "$div" "$subsample"
     done
@@ -584,11 +644,12 @@ PYEOF
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 SGD_META="$(printf '%s|%s|%s|%s|%s' "$SGD_OPTIMIZER" "$SGD_PARAMETRIZATION" "$SGD_LR" "$SGD_BATCH_SIZE" "$SGD_STEPS_PER_ITER")"
 CP_META="$(printf '%s|%s' "$CP_INNER_ITERS" "$CP_SCOOCH_KAPPA")"
-python3 - "$TIMESTAMP" "$N_GPUS" "$TMPJSON" "$BENCHMARK_JSON" "$SOLVER" "$METHOD" "$SGD_META" "$NAME" "$CP_META" <<'PYEOF'
+python3 - "$TIMESTAMP" "$N_GPUS" "$TMPJSON" "$BENCHMARK_JSON" "$SOLVER" "$METHOD" "$SGD_META" "$NAME" "$CP_META" "$TT_RANK" <<'PYEOF'
 import json, sys
 from pathlib import Path
 
-timestamp, n_gpus, tmpjson, benchmark_json, solver, method, sgd_meta, name, cp_meta = sys.argv[1:]
+(timestamp, n_gpus, tmpjson, benchmark_json, solver, method, sgd_meta, name,
+ cp_meta, tt_rank) = sys.argv[1:]
 
 with open(tmpjson) as f:
     results = json.load(f)
@@ -609,6 +670,8 @@ if solver == "sgd":
 elif solver == "cp":
     inner_iters, scooch_kappa = cp_meta.split("|")
     entry["cp_config"] = f"inner_iters={inner_iters} scooch_kappa={scooch_kappa}"
+elif solver == "tt":
+    entry["tt_config"] = f"tt_rank={tt_rank}"
 entry.update(results)
 
 if Path(benchmark_json).exists():

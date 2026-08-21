@@ -617,9 +617,11 @@ _SS_STEM_RE = re.compile(r"_(\d+(?:p\d+)?)ss(?=_|$)")
 # "..._500000mn_..." → max_nnz 500000 (see naming._mn; absent means off).
 _MN_STEM_RE = re.compile(r"_(\d+)mn(?=_|$)")
 
-# "..._CP3D_..." marks the experimental CP family (see naming._order_tag);
-# Tucker stems carry the bare "..._3D_..." tag instead.
+# "..._CP3D_..." marks the experimental CP family, "..._TT100b3D_..." the
+# Tucker-TT hybrid at bond 100 (see naming._order_tag); Tucker stems carry the
+# bare "..._3D_..." tag instead.
 _DECOMP_STEM_RE = re.compile(r"_CP\d+D(?=_|$)")
+_TT_STEM_RE = re.compile(r"_TT(\d+)b\d+D(?=_|$)")
 
 # "..._SGD3D_..." marks the SGD solver (naming._order_tag with
 # solver="sgd"); MU stems carry no solver tag.
@@ -639,13 +641,22 @@ def _mn_from_stem(stem):
 
 
 def _decomp_from_stem(stem):
-    """Recover the decomposition family ("cp" or "tucker") from a run's stem.
+    """Recover the decomposition family ("cp", "tt" or "tucker") from a run's stem.
 
     Config snapshots from before ``decomposition`` was recorded lack the field,
-    but the model stem always carries the ``CP{order}D`` tag for CP runs (see
-    naming._order_tag) — so the stem is the authoritative fallback.
+    but the model stem always carries the ``CP{order}D`` / ``TT{tt_rank}b{order}D``
+    tag for those runs (see naming._order_tag) — so the stem is the
+    authoritative fallback.
     """
-    return "cp" if _DECOMP_STEM_RE.search(stem) else "tucker"
+    if _DECOMP_STEM_RE.search(stem):
+        return "cp"
+    return "tt" if _TT_STEM_RE.search(stem) else "tucker"
+
+
+def _tt_rank_from_stem(stem):
+    """Recover the TT bond dimension from a run's stem, or None if not a TT run."""
+    m = _TT_STEM_RE.search(stem)
+    return int(m.group(1)) if m else None
 
 
 def _solver_from_stem(stem):
@@ -717,22 +728,21 @@ def _discover_one(dataset, data_dir):
         # max_nnz never lived under "train"; config exp → stem token → off.
         mn = int(exp.get("max_nnz") or _mn_from_stem(stem) or 0)
         # Snapshots predating the CP feature lack "decomposition"; fall back to
-        # the "CP{order}D" stem tag (naming._order_tag).
+        # the "CP{order}D" / "TT{tt_rank}b{order}D" stem tag (naming._order_tag).
         decomposition = exp.get("decomposition") or _decomp_from_stem(stem)
         solver = exp.get("solver") or _solver_from_stem(stem)
+        tt_rank = exp.get("tt_rank") or _tt_rank_from_stem(stem)
 
         insp = InspectionConfig(
             dim=dim, name=exp.get("name"), dataset=exp.get("dataset", dataset),
             method=exp.get("method", "siiSoftPlus"), divergence=exp.get("divergence", "kl"),
             order=exp.get("order", 3), iters=iters, rank=rank0,
             shared_factors=sf, subsample_frac=ss, max_nnz=(mn or None),
-            solver=solver,
+            solver=solver, decomposition=decomposition, tt_rank=tt_rank,
         )
-        # InspectionConfig has no declared "decomposition" field (it predates the
-        # CP feature); duck-type it on like RunRef does for legacy-named runs, so
-        # downstream label/facet code can read it uniformly off `insp`.
-        insp.decomposition = decomposition
         decomp_tag = "" if decomposition == "tucker" else f"[{decomposition.upper()}] "
+        if decomposition == "tt" and tt_rank:
+            decomp_tag = f"[TT b={tt_rank}] "
         if solver == "sgd":
             decomp_tag = f"[SGD] {decomp_tag}"
         log_path = decomp_dir / f"{stem}_log.txt"

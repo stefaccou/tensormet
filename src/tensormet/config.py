@@ -306,6 +306,7 @@ class RunConfig:
             max_nnz=getattr(self.exp, "max_nnz", None),
             decomposition=getattr(self.exp, "decomposition", "tucker"),
             solver=getattr(self.exp, "solver", "mu"),
+            tt_rank=getattr(self.exp, "tt_rank", None),
         )
 
     def model_path(self) -> Path:
@@ -381,6 +382,7 @@ class RunConfig:
             max_nnz=getattr(self.exp, "max_nnz", None),
             decomposition=getattr(self.exp, "decomposition", "tucker"),
             solver=getattr(self.exp, "solver", "mu"),
+            tt_rank=getattr(self.exp, "tt_rank", None),
         )
 
         # Find all JSON config files: new (with sf) → new (without sf) → legacy
@@ -608,16 +610,28 @@ class InspectionConfig:
     order: int = 3
     iters: int = 2000
     rank: int = 150
-    shared_factors: Set[Tuple[int, int]] = field(default_factory=lambda: {(1, 2)})
+    shared_factors: Union[bool, Set[Tuple[int, int]], str] = field(default_factory=lambda: {(1, 2)})
     subsample_frac: float = 0.25
     max_nnz: Optional[int] = None
     solver: str = "mu"
+    decomposition: str = "tucker"
+    tt_rank: Optional[int] = None
 
     def _norm_dim(self):
         return tuple(int(x) for x in self.dim.split("-")) if isinstance(self.dim, str) else self.dim
 
     def _norm_sf(self):
-        return tuple(tuple(p) for p in self.shared_factors) if self.shared_factors else None
+        """Resolve shared_factors the same way as TuckerDecomposition.load_from_disk."""
+        sf = self.shared_factors
+        if sf == "full":
+            sf = "all"
+        if sf == "all":
+            return tuple(sorted((i, j) for i in range(self.order) for j in range(i + 1, self.order)))
+        if sf is True:
+            return ((1, 2),)
+        if sf:
+            return tuple(tuple(p) for p in sf)
+        return None
 
     def _as_run_config(self) -> RunConfig:
         return RunConfig(
@@ -628,6 +642,8 @@ class InspectionConfig:
               subsample_frac=self.subsample_frac,
               max_nnz=self.max_nnz,
               solver=self.solver,
+              decomposition=self.decomposition,
+              tt_rank=self.tt_rank if self.tt_rank is not None else 100,
               shared_factors=self._norm_sf(),
             ),
             train=TrainingConfig(
@@ -654,23 +670,34 @@ class InspectionConfig:
                 "vocabularies" / _vocab_filename(self.order, self._norm_dim(), shared_factors=self._norm_sf()))
 
     def load_tucker(self, map_location="cpu", tier1=False):
-        from tensormet.tucker_tensor import TuckerDecomposition
-        return TuckerDecomposition.load_from_disk(
+        decomposition = (self.decomposition or "tucker").lower()
+        common_kwargs = dict(
             name=self.name,
             dataset=self.dataset,
             dims=self.dim,
             method=self.method,
             divergence=self.divergence,
             order=self.order,
-            shared_factors=self.shared_factors,
+            shared_factors="all" if self.shared_factors == "full" else self.shared_factors,
             subsample_frac=self.subsample_frac,
             max_nnz=self.max_nnz,
-            solver=self.solver,
             iterations=self.iters,
             rank=self.rank,
             map_location=map_location,
             tier1=tier1,
         )
+
+        if decomposition == "cp":
+            from tensormet.experimental.CP.cp_decomposition import CPDecomposition
+            return CPDecomposition.load_from_disk(**common_kwargs)
+        if decomposition == "tt":
+            from tensormet.experimental.TT_hybrid.tt_decomposition import TuckerTTDecomposition
+            return TuckerTTDecomposition.load_from_disk(
+                tt_rank=self.tt_rank if self.tt_rank is not None else 100, **common_kwargs
+            )
+
+        from tensormet.tucker_tensor import TuckerDecomposition
+        return TuckerDecomposition.load_from_disk(solver=self.solver, **common_kwargs)
 
 @dataclass(frozen=True)
 class VectorExperimentConfig:

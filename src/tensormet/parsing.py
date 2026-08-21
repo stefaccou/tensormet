@@ -345,10 +345,12 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="Decomposition family: 'tucker' (default, existing pipeline), "
                              "'cp' (EXPERIMENTAL nonnegative CP) or 'tt' (EXPERIMENTAL "
                              "Tucker-TT hybrid: Tucker factors, tensor-train core). Both "
-                             "experimental families are single-GPU, objective=full only; "
-                             "'tt' is KL only.")
+                             "experimental families support --n-gpus > 1 and are "
+                             "objective=full only; 'tt' is KL only.")
     parser.add_argument("--tt-rank", type=int, dest="tt_rank", default=None,
-                        help="TT only: bond dimension of the tensor-train core (default 100).")
+                        help="TT only: bond dimension of the tensor-train core (default 100). "
+                             "Part of the artifact name ('TT{tt_rank}b{order}D'), so runs at "
+                             "different bonds never share files.")
     parser.add_argument("--cp-inner-iters", type=int, dest="cp_inner_iters", default=None,
                         help="CP only: CP-APR inner iterations per mode per sweep (default 1).")
     parser.add_argument("--cp-scooch-kappa", type=float, dest="cp_scooch_kappa", default=None,

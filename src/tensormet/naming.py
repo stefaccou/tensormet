@@ -4,8 +4,10 @@ Single source of truth for artifact filename conventions.
 Naming contract
 ---------------
 Model file :  {prefix}{div}_{method}_{order}D_{dims}d{sf}_{rank0}r{ss}{mn}_{iters}i.pt
-              (experimental CP family: '{order}D' → 'CP{order}D'; Tucker
-               filenames are byte-identical to before the CP feature existed)
+              (experimental CP family: '{order}D' → 'CP{order}D'; experimental
+               Tucker-TT hybrid: '{order}D' → 'TT{tt_rank}b{order}D', where the
+               'b' fragment is the bond dimension. Tucker filenames are
+               byte-identical to before either feature existed)
 Vocab file :  {order}D_{dims}d{sf}.pkl          (legacy: {dims}{sf}.pkl)
 Populated  :  {method}_{order}D_{dims}d{sf}.pt  (legacy: {method}_{dims}{sf}.pt)
 
@@ -78,15 +80,25 @@ def _r0(rank: _Rank) -> int:
 _DECOMPOSITION_TAG = {"cp": "CP", "tt": "TT"}
 
 
-def _order_tag(order: int, decomposition: str = "tucker", solver: str = "mu") -> str:
+def _order_tag(order: int, decomposition: str = "tucker", solver: str = "mu",
+               tt_rank: Optional[int] = None) -> str:
     """Order fragment of the model stem: '{order}D' for MU Tucker (unchanged,
     keeps every existing filename byte-identical), 'CP{order}D' for the
-    experimental CP family, 'TT{order}D' for the experimental Tucker-TT hybrid,
-    'SGD{order}D' for the SGD solver, so the artifact families never collide (an
-    SGD run can therefore never scan up MU checkpoints on resume, and vice
-    versa). 'SGDCP'/'SGDTT' are reserved but the combinations are rejected at
-    fit time."""
-    base = f"{_DECOMPOSITION_TAG.get(decomposition, '')}{order}D"
+    experimental CP family, 'TT{tt_rank}b{order}D' for the experimental
+    Tucker-TT hybrid, 'SGD{order}D' for the SGD solver, so the artifact families
+    never collide (an SGD run can therefore never scan up MU checkpoints on
+    resume, and vice versa). 'SGDCP'/'SGDTT' are reserved but the combinations
+    are rejected at fit time.
+
+    ``tt_rank`` is required for decomposition='tt' and ignored otherwise: the
+    bond dimension fixes the TT core shapes, so runs differing only in it are
+    different models."""
+    if decomposition == "tt":
+        if tt_rank is None:
+            raise ValueError("decomposition='tt' needs tt_rank to build a filename")
+        base = f"TT{int(tt_rank)}b{order}D"
+    else:
+        base = f"{_DECOMPOSITION_TAG.get(decomposition, '')}{order}D"
     return f"SGD{base}" if solver == "sgd" else base
 
 
@@ -108,10 +120,12 @@ def model_stem(
     max_nnz: Optional[int] = None,
     decomposition: str = "tucker",
     solver: str = "mu",
+    tt_rank: Optional[int] = None,
 ) -> str:
     """Return the model filename stem (without .pt extension)."""
     return (
-        f"{_prefix(name)}{divergence}_{method}_{_order_tag(order, decomposition, solver)}_"
+        f"{_prefix(name)}{divergence}_{method}_"
+        f"{_order_tag(order, decomposition, solver, tt_rank)}_"
         f"{dim_spec_str(dim)}d{_sf(shared_factors, order)}_"
         f"{_r0(rank)}r{_ss(subsample_frac)}{_mn(max_nnz)}_{n_iter_max}i"
     )
@@ -131,12 +145,14 @@ def model_filename(
     max_nnz: Optional[int] = None,
     decomposition: str = "tucker",
     solver: str = "mu",
+    tt_rank: Optional[int] = None,
 ) -> str:
     """Return the full model filename (e.g. 'fr_siiSoftPlus_3D_1000d_100r_300i.pt')."""
     return model_stem(
         divergence, method, order, dim, rank, n_iter_max,
         name=name, shared_factors=shared_factors, subsample_frac=subsample_frac,
         max_nnz=max_nnz, decomposition=decomposition, solver=solver,
+        tt_rank=tt_rank,
     ) + ".pt"
 
 
@@ -153,6 +169,7 @@ def candidate_stems(
     max_nnz: Optional[int] = None,
     decomposition: str = "tucker",
     solver: str = "mu",
+    tt_rank: Optional[int] = None,
 ) -> list[str]:
     """
     Return filename prefixes in descending priority order for directory scans.
@@ -165,10 +182,10 @@ def candidate_stems(
       3. legacy naming: no order prefix          (pre-{order}D era)
 
     For the experimental families the order fragment becomes 'CP{order}D' /
-    'TT{order}D' and there is no legacy fallback (no such artifacts predate this
-    naming), so the list is just [new] (+ [new_no_sf] when a shared-factor
-    suffix applies). The same applies to solver="sgd" ('SGD{order}D' fragment,
-    no legacy fallback).
+    'TT{tt_rank}b{order}D' and there is no legacy fallback (no such artifacts
+    predate this naming), so the list is just [new] (+ [new_no_sf] when a
+    shared-factor suffix applies). The same applies to solver="sgd"
+    ('SGD{order}D' fragment, no legacy fallback).
     """
     p   = _prefix(name)
     sf  = _sf(shared_factors, order)
@@ -176,7 +193,7 @@ def candidate_stems(
     mn  = _mn(max_nnz)
     d   = dim_spec_str(dim)
     r0  = _r0(rank)
-    ot  = _order_tag(order, decomposition, solver)
+    ot  = _order_tag(order, decomposition, solver, tt_rank)
 
     new        = f"{p}{divergence}_{method}_{ot}_{d}d{sf}_{r0}r{ss}{mn}_"
     new_no_sf  = f"{p}{divergence}_{method}_{ot}_{d}d_{r0}r{ss}{mn}_"

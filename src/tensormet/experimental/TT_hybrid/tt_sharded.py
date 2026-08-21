@@ -435,8 +435,9 @@ def _sharded_tt_kl_error(
         # Σ over ALL entries of X̂ — closed form, exact, never sampled.
         sum_all = float(cp.asnumpy(tt_sum_all_entries(tt_cores, factors, epsilon=epsilon)))
 
-    kl_total = kl_pos + (sum_all - sum_xhat_nz)
-    result = kl_total / max(sum_X, float(epsilon))
+    # rel = D / Σ_nnz x is undefined with no data; nan rather than D/ε.
+    result = ((kl_pos + (sum_all - sum_xhat_nz)) / sum_X if sum_X > 0
+              else float("nan"))
 
     with cp.cuda.Device(primary):
         return cp.asarray(result, dtype=factors[0].dtype)

@@ -3,7 +3,8 @@
 Tucker factor matrices, tensor-train core. The point is the order-5 wall: a
 rank-100 order-5 Tucker core is `100^5` floats ≈ 40 GB, while its TT form at
 bond 100 is ~12 MB. Storage becomes linear in the order instead of exponential,
-and the per-NNZ cost of a sweep drops from `O(R^N)` to `O(N ρ² R)`.
+and the per-NNZ cost drops from `O(R^N)` to `O(N ρ² R)` per pass — a full core
+sweep is `N` such passes (one per site, see "Multi-GPU" below), so `O(N² ρ² R)`.
 
 ```
 G[r_0 … r_{N-1}] = C_0[:, r_0, :] · C_1[:, r_1, :] · … · C_{N-1}[:, r_{N-1}, :]
@@ -22,9 +23,11 @@ is monotone.
 ... --decomposition tt --tt-rank 100 --divergence kl --rank 100 ...
 ```
 
-Artifacts are named `..._TT{order}D_...` (vs `..._{order}D_...` for Tucker) and
-stored as `TuckerTTTensor` payloads `(tt_cores, factors)`. Load with
-`TuckerTTDecomposition.load_from_disk(...)`.
+Artifacts are named `..._TT{tt_rank}b{order}D_...` (vs `..._{order}D_...` for
+Tucker) and stored as `TuckerTTTensor` payloads `(tt_cores, factors)`. The `b`
+fragment is the bond dimension: it fixes the TT core shapes, so two `--tt-rank`
+values are two different models and get two different artifact families. Load
+with `TuckerTTDecomposition.load_from_disk(..., tt_rank=...)`.
 
 ## What changes for interpretation
 
@@ -137,8 +140,9 @@ artifact filenames are unchanged. To revert, delete this directory and undo:
 
 1. `config.py` — `ExperimentConfig.tt_rank`; `tt_rank` in `get_resume_state()`'s
    `is_compatible` (a different bond dimension means different core shapes)
-2. `naming.py` — `_DECOMPOSITION_TAG` (`'TT'`), used by `_order_tag` and by
-   `candidate_stems`' legacy-fallback condition
+2. `naming.py` — `_DECOMPOSITION_TAG` (`'TT'`) and the `tt_rank` kwarg on
+   `_order_tag` / `model_stem` / `model_filename` / `candidate_stems`;
+   `_DECOMPOSITION_TAG` also gates `candidate_stems`' legacy fallback
 3. `routing.py` — `get_update_routing_step` delegates to `tt_routing` for `"tt"`
 4. `parsing.py` — `"tt"` in `--decomposition`, new `--tt-rank`
 5. `sparse_ops.py` — `with_core=False` on `initialize_nonnegative_tucker` and
@@ -147,13 +151,15 @@ artifact filenames are unchanged. To revert, delete this directory and undo:
 6. `tucker_tensor.py` — `_as_host` handles list input; `_is_tt` swap points
    (config unpack, `TensorModel`, resume unpack + core-shape check, init
    dispatch, guard rails, `NNZGroupingCache` / `precompute_largedim_batches`
-   gating, `best_core` deep copy, banner, sharded-routing branch,
-   `tucker_normalize` skip, `TuckerTTDecomposition` at sem checks,
-   `_as_host(core)` at the two checkpoint sites)
+   gating, `_tt_batch_nnz` hoist, `best_core` deep copy, banner,
+   sharded-routing branch, `tucker_normalize` skip, `TuckerTTDecomposition` at
+   sem checks, `_as_host(core)` at the two checkpoint sites)
 7. `launch.py` — container-aware final save + notify text
 8. `sharded_sparse.py` — `ShardedSparseTensor.tt_factor_update` /
    `tt_core_update` / `tt_compute_errors`, three lazy delegates alongside the
    CP ones (nothing else in that module knows about TT)
+9. `inspect_tucker.py` — `_TT_STEM_RE`, `_tt_rank_from_stem`, and `"tt"` from
+   `_decomp_from_stem`, so the run browser labels TT runs with their bond
 
 ## Validation
 
@@ -170,14 +176,16 @@ End-to-end smoke, on the GPU box:
 ... --decomposition tt --tt-rank 50 --divergence kl --dim 1000 --rank 50 --iterations 200
 ```
 
-then verify: `TT3D` in artifact names, checkpoints resume (and a Tucker or CP
-checkpoint of the same dims/rank is *refused*), `runs.jsonl` records
-`"decomposition": "tt"` and `"tt_rank"`, and sem-eval / SimLex / judge scores
-populate.
+then verify: `TT50b3D` in artifact names, checkpoints resume (and a Tucker or CP
+checkpoint of the same dims/rank, or a TT one at a different `--tt-rank`, is
+*refused*), `runs.jsonl` records `"decomposition": "tt"` and `"tt_rank"`, and
+sem-eval / SimLex / judge scores populate.
 
-For the multi-GPU path, the oracle is the single-GPU one: with
-`subsample_frac=1.0` a sharded iteration is an exact NNZ partition of the same
-sums, so `n_gpus=2` must reproduce `n_gpus=1` to floating-point tolerance from
-the same seed — and the per-sweep KL monotonicity check still holds. Add
-`--n-gpus 2` to the smoke command above and confirm the banner reads
-`tucker-tt (nnz-streaming, bonds=[...], sharded×2)`.
+`0_tests/2026-08-20-test_tt_multigpu.ipynb` (needs >= 2 CUDA devices) covers the
+sharded path against the single-GPU kernels: with `subsample_frac=1.0` a sharded
+iteration is an exact NNZ partition of the same sums, so `n_gpus=2` must
+reproduce `n_gpus=1` to floating-point tolerance — per-site core numerators,
+factor numerators, the in-place ℓ1 rescale, the error, a 5-sweep trajectory
+through the real `UpdateRouting` seam, and the unbiasedness of the subsampled
+error. End to end, add `--n-gpus 2` to the smoke command above and confirm the
+banner reads `tucker-tt (nnz-streaming, bonds=[...], sharded×2)`.

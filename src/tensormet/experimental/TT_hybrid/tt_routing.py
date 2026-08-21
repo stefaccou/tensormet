@@ -58,24 +58,30 @@ def get_sharded_tt_update_routing_step(sst, divergence: Divergence,
         )
 
     def _factor_update(vec_tensor, core, factors, mode, shape,
-                       thread_budget=None, epsilon=1e-12, verbose=False):
+                       thread_budget=None, epsilon=1e-12, verbose=False,
+                       batch_nnz=None):
         return sst.tt_factor_update(
             core=core, factors=factors, mode=mode, shape=shape,
             thread_budget=thread_budget, epsilon=epsilon, verbose=verbose,
+            batch_nnz=batch_nnz,
         )
 
     def _core_update(vec_tensor, shape, core, factors, modes=None,
-                     thread_budget=None, epsilon=1e-12, verbose=False):
+                     thread_budget=None, epsilon=1e-12, verbose=False,
+                     batch_nnz=None):
         return sst.tt_core_update(
             shape=shape, core=core, factors=factors, modes=modes,
             thread_budget=thread_budget, epsilon=epsilon, verbose=verbose,
+            batch_nnz=batch_nnz,
         )
 
     def _error_fn(vec_tensor, shape, core, factors,
-                  thread_budget=None, epsilon=1e-12, verbose=False):
+                  thread_budget=None, epsilon=1e-12, verbose=False,
+                  batch_nnz=None):
         return sst.tt_compute_errors(
             shape=shape, core=core, factors=factors,
             thread_budget=thread_budget, epsilon=epsilon, verbose=verbose,
+            batch_nnz=batch_nnz,
         )
 
     return UpdateRouting(
