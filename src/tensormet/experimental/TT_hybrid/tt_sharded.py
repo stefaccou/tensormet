@@ -54,6 +54,7 @@ from tensormet.experimental.TT_hybrid.tt_chain import (
 )
 from tensormet.experimental.TT_hybrid.tt_ops import (
     _colsum_batch,
+    _run_nnz_batches,
     _scatter_add,
     estimate_batch_nnz_tt,
     tt_sum_all_entries,
@@ -106,14 +107,15 @@ def _tt_partial_factor_num_for_shard(
         batch_nnz = estimate_batch_nnz_tt(tt_cores_d, factors_d)
     n_modes = len(shape)
 
-    for start in range(0, nnz, int(batch_nnz)):
-        end = min(start + int(batch_nnz), nnz)
+    def _body(start, end):
         mats = [factors_d[n][idxs[n][start:end]] for n in range(n_modes)]
         S = sites(tt_cores_d, mats, cp)
         L, R = left_envs(S, cp), right_envs(S, cp)
         xhat = cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
         Z = site_grad(L[mode], tt_cores_d[mode], R[mode + 1], cp)
         _scatter_add(out, idxs[mode][start:end], vals[start:end] / xhat, Z)
+
+    _run_nnz_batches(nnz, batch_nnz, _body, desc=f"shard factor {mode}")
 
     result = cp.asnumpy(out)
     cp.cuda.Device(device_id).synchronize()
@@ -155,15 +157,16 @@ def _tt_partial_core_num_for_shard(
         batch_nnz = estimate_batch_nnz_tt(tt_cores_d, factors_d)
     n_modes = len(shape)
 
-    for start in range(0, nnz, int(batch_nnz)):
-        end = min(start + int(batch_nnz), nnz)
+    def _body(start, end):
         mats = [factors_d[n][idxs[n][start:end]] for n in range(n_modes)]
         S = sites(tt_cores_d, mats, cp)
         L, R = left_envs(S, cp), right_envs(S, cp)
         w = vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
         # Σ_p w_p · outer(L_k[p], A_k row, R_{k+1}[p]) as one GEMM.
         LW = (L[site] * w[:, None])[:, :, None] * mats[site][:, None, :]
-        num += (LW.reshape(end - start, -1).T @ R[site + 1]).reshape(num.shape)
+        num[...] += (LW.reshape(end - start, -1).T @ R[site + 1]).reshape(num.shape)
+
+    _run_nnz_batches(nnz, batch_nnz, _body, desc=f"shard core site {site}")
 
     result = cp.asnumpy(num)
     cp.cuda.Device(device_id).synchronize()
@@ -212,15 +215,20 @@ def _tt_partial_kl_error_for_shard(
     x_nz = cp.clip(cp.asarray(vals), a_min=epsilon, a_max=None)
     kl_pos = cp.asarray(0.0, dtype=factors_d[0].dtype)
     sum_xhat_nz = cp.asarray(0.0, dtype=factors_d[0].dtype)
-    for start in range(0, nnz, int(batch_nnz)):
-        end = min(start + int(batch_nnz), nnz)
+    def _body(start, end):
         mats = [factors_d[n][idxs[n][start:end]] for n in range(n_modes)]
         # Only the left sweep is needed for x̂.
         xhat = cp.clip(left_envs(sites(tt_cores_d, mats, cp), cp)[n_modes][:, 0],
                        a_min=epsilon, a_max=None)
         x_b = x_nz[start:end]
-        kl_pos += cp.sum(x_b * cp.log(x_b / xhat) - x_b + xhat)
-        sum_xhat_nz += cp.sum(xhat)
+        # Both reductions before either accumulation, so a retry cannot
+        # double-count the first.
+        pos = cp.sum(x_b * cp.log(x_b / xhat) - x_b + xhat)
+        tot = cp.sum(xhat)
+        kl_pos[...] += pos
+        sum_xhat_nz[...] += tot
+
+    _run_nnz_batches(nnz, batch_nnz, _body, desc="shard error x̂ pass")
 
     out = (float(kl_pos.get()) * weight,
            float(sum_xhat_nz.get()) * weight,

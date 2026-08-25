@@ -137,14 +137,19 @@ class TuckerDecomposition:
         self.factors = factors
         self.vocab = vocab
         self.shared_factors = shared_factors or set()
-        # Honor explicitly provided roles; otherwise parse them from the vocab keys.
+        # Respect explicitly provided roles; otherwise parse them from the vocab keys.
         self.roles = roles if roles is not None else extract_roles_from_vocab(self.vocab)
         self.decomp_path = None
 
     def get_role_index(self, role: str) -> int:
         """Helper method to wrap the module-level _role_index using instance roles."""
         return _role_index(role, self.roles)
-    
+    def get_rank(self, role=None):
+        if role is None:
+            role=self.roles[0]
+        return self.core.shape[_role_index(role, self.roles)]
+
+
     def _core_np(self):
         return _to_np(self.core)
 
@@ -347,9 +352,9 @@ class TuckerDecomposition:
         "rank": 100,
         "order": 4,
         "shared_factors": "all",
-        "name": "h100_1B_mu",
-        "subsample_frac": 0.025,
-        "solver": "mu",
+        "name": "h100_1B_sgd",
+        "subsample_frac": 1,
+        "solver": "sgd",
     }
 
     @classmethod
@@ -599,15 +604,28 @@ class TuckerDecomposition:
 
     def get_top_dimensions_for_word(self,
                                     word: str,
-                                    role: str,
-                                    top_k: int = 10):
+                                    role = None,
+                                    top_k: int = 10,
+                                    return_words=False):
+        if role is None:
+            role = self.roles[0]
         latent = self.fetch_single_latent(word, role)
         latent = torch.tensor(latent)
+        if top_k == "full":
+            top_k = len(latent)
         scores, dims = torch.topk(latent, top_k)
-        top_scores = [
-            (int(dim), float(score)) for dim, score in zip(dims, scores)
-        ]
+        if return_words:
+            # variant in which we return the representative word as well
+            top_scores = [
+                (int(dim), float(score), self.get_top_words_for_dimension(role, dim, 1)[0][0]) for dim, score in zip(dims, scores)
+            ]
+        else:
+            top_scores = [
+                (int(dim), float(score)) for dim, score in zip(dims, scores)
+            ]
         return top_scores
+
+
 
     def get_expected_element(self, target_tuple: Tuple[str, ...], role: str, verbose: bool = True,
                              method: str="excluded",
@@ -678,7 +696,7 @@ class TuckerDecomposition:
 
     def get_most_similar_elements(self,
                                   element,
-                                  role,
+                                  role=None,
                                   top_k=5
                                   ):
         """
@@ -695,6 +713,8 @@ class TuckerDecomposition:
         -------
 
         """
+        if role is None:
+            role = self.roles[0]
         if isinstance(element, tuple):
             latent = self.included_role_vector(element, role=role)
             # print("latent from context")
@@ -720,6 +740,8 @@ class TuckerDecomposition:
 
         # --- safe cosine similarities ---
         similarities = (F @ latent) / (F_norm * G_norm)
+        if top_k == "full":
+            top_k = len(F)
         top_idx = np.argsort(-similarities)[:top_k]
         r2i = voc_index(role)
 

@@ -18,6 +18,7 @@ kwargs, ε-clipping against zero-locking.
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 import tensorly as tl
@@ -36,11 +37,34 @@ cp, cpx_sparse = make_lazy_cupy_pair()
 # Helpers
 # ---------------------------------------------------------------------------
 
-def estimate_batch_nnz_tt(tt_cores, factors, safety=0.7, temp_mult=3.0, reserve_b=0):
+# Ceiling on the largest single allocation a batch may make.
+MAX_BATCH_ALLOC_BYTES = int(os.environ.get(
+    "TENSORMET_TT_MAX_BATCH_ALLOC_BYTES", 1 << 30))
+
+# Floor for the OOM back-off.
+MIN_BATCH_NNZ = 256
+
+
+def _quantize_batch(n):
+    """Round ``n`` down to ~1/32 resolution, so repeated estimates return the
+    same value and the pool reuses blocks."""
+    n = int(n)
+    if n < 32:
+        return max(1, n)
+    granule = 1 << (n.bit_length() - 5)
+    return max(1, (n // granule) * granule)
+
+
+def estimate_batch_nnz_tt(tt_cores, factors, safety=0.7, temp_mult=3.0,
+                          reserve_b=0, max_alloc_bytes=None):
     """Safe NNZ batch size for the streaming TT kernels.
 
     Per entry a batch holds the N site matrices (Σ ρ_k ρ_{k+1}), the gathered
     factor rows (Σ R_k) and the two environment stacks (2 Σ ρ_k).
+
+    The free-memory division sizes against aggregate headroom, so it is capped
+    by ``max_alloc_bytes`` on the batch's largest single temporary — a site
+    matrix (ρ_k·ρ_{k+1}) or the core kernel's (b, ρ_k, R_k) temp.
     """
     per_entry = (sum(int(C.shape[0]) * int(C.shape[2]) for C in tt_cores)
                  + sum(int(f.shape[1]) for f in factors)
@@ -48,7 +72,15 @@ def estimate_batch_nnz_tt(tt_cores, factors, safety=0.7, temp_mult=3.0, reserve_
     itemsize = int(np.dtype(factors[0].dtype).itemsize)
     bytes_per_entry = max(1, int(math.ceil(per_entry * itemsize * temp_mult)))
     free_b = max(1, int(_gpu_free_bytes()) - int(reserve_b))
-    return max(1, int(free_b * safety) // bytes_per_entry)
+    batch = int(free_b * safety) // bytes_per_entry
+
+    peak_per_entry = max(
+        max(int(C.shape[0]) * int(C.shape[2]) for C in tt_cores),   # site
+        max(int(C.shape[0]) * int(C.shape[1]) for C in tt_cores),   # LW temp
+    )
+    cap = (int(MAX_BATCH_ALLOC_BYTES if max_alloc_bytes is None else max_alloc_bytes)
+           // max(1, peak_per_entry * itemsize))
+    return _quantize_batch(max(1, min(batch, cap)))
 
 
 def _colsum_batch(factors, epsilon):
@@ -68,11 +100,43 @@ def _scatter_add(out, rows, weights, dense):
     out += S @ dense
 
 
-def _nnz_batches(nnz, batch_nnz, verbose, desc):
-    batches = range(0, nnz, int(batch_nnz))
-    if verbose:
-        batches = tqdm(batches, desc=desc, unit="batch", leave=False)
-    return batches
+def _run_nnz_batches(nnz, batch_nnz, body, verbose=False, desc=None):
+    """Run ``body(start, end)`` over [0, nnz), halving the batch on OOM.
+
+    ``body`` is a function so its locals — the site matrices and the per-batch
+    temporaries, the largest arrays either kernel touches — are released when it
+    returns, rather than staying bound until the next iteration overwrites them.
+
+    Every kernel here accumulates on ``body``'s last statement, so a batch that
+    raises has contributed nothing and can be redone at a smaller size.
+    """
+    b = max(1, int(batch_nnz))
+    start = 0
+    bar = tqdm(total=nnz, desc=desc, unit="nnz", leave=False) if verbose else None
+    try:
+        while start < nnz:
+            end = min(start + b, nnz)
+            failed = False
+            try:
+                body(start, end)
+            except cp.cuda.memory.OutOfMemoryError:
+                if b <= MIN_BATCH_NNZ:
+                    raise
+                failed = True
+            if failed:
+                # Outside the handler: the exception's traceback pins the failed
+                # frame's arrays, so the flush only reclaims once it is gone.
+                b = max(MIN_BATCH_NNZ, b // 2)
+                cp.get_default_memory_pool().free_all_blocks()
+                print(f"  [TT-KL] OOM in {desc or 'nnz pass'}; batch_nnz -> {b}")
+                continue
+            if bar is not None:
+                bar.update(end - start)
+            start = end
+    finally:
+        if bar is not None:
+            bar.close()
+    return b
 
 
 def tt_sum_all_entries(tt_cores, factors, epsilon=1e-12):
@@ -124,14 +188,16 @@ def tt_kl_factor_update(vec_tensor, core, factors, mode, shape,
     if nnz:
         if batch_nnz is None:
             batch_nnz = estimate_batch_nnz_tt(tt_cores, factors)
-        for start in _nnz_batches(nnz, batch_nnz, verbose, f"  [TT-KL] factor {mode}"):
-            end = min(start + int(batch_nnz), nnz)
+
+        def _body(start, end):
             mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
             S = sites(tt_cores, mats, cp)
             L, R = left_envs(S, cp), right_envs(S, cp)
             xhat = cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
             Z = site_grad(L[mode], tt_cores[mode], R[mode + 1], cp)
             _scatter_add(num, idxs[mode][start:end], vals[start:end] / xhat, Z)
+
+        _run_nnz_batches(nnz, batch_nnz, _body, verbose, f"  [TT-KL] factor {mode}")
 
     A_new = cp.clip(A * (num / den), a_min=epsilon, a_max=None)
     scale = cp.clip(cp.sum(A_new, axis=0), a_min=epsilon, a_max=None)
@@ -178,15 +244,18 @@ def tt_kl_core_update(vec_tensor, shape, core, factors, modes=None,
         )
 
         num = cp.zeros_like(tt_cores[k])
-        for start in _nnz_batches(nnz, batch_nnz, verbose, f"  [TT-KL] core site {k}"):
-            end = min(start + int(batch_nnz), nnz)
+
+        def _body(start, end, k=k):
             mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
             S = sites(tt_cores, mats, cp)
             L, R = left_envs(S, cp), right_envs(S, cp)
             w = vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
             # Σ_p w_p · outer(L_k[p], A_k row, R_{k+1}[p]) as one GEMM.
             LW = (L[k] * w[:, None])[:, :, None] * mats[k][:, None, :]   # (b, ρ_k, R_k)
-            num += (LW.reshape(end - start, -1).T @ R[k + 1]).reshape(tt_cores[k].shape)
+            # [...] so the accumulation stays in place and needs no nonlocal.
+            num[...] += (LW.reshape(end - start, -1).T @ R[k + 1]).reshape(num.shape)
+
+        _run_nnz_batches(nnz, batch_nnz, _body, verbose, f"  [TT-KL] core site {k}")
 
         tt_cores[k] = cp.clip(tt_cores[k] * (num / den), a_min=epsilon, a_max=None)
     return tt_cores
@@ -223,15 +292,21 @@ def tt_kl_compute_errors(vec_tensor, shape, core, factors,
 
     kl_pos = cp.asarray(0.0, dtype=factors[0].dtype)
     sum_xhat_nz = cp.asarray(0.0, dtype=factors[0].dtype)
-    for start in _nnz_batches(nnz, batch_nnz, verbose, "  [TT-KL] error x̂ pass"):
-        end = min(start + int(batch_nnz), nnz)
+
+    def _body(start, end):
         mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
         # Only the left sweep is needed for x̂.
         xhat = cp.clip(left_envs(sites(tt_cores, mats, cp), cp)[n_modes][:, 0],
                        a_min=epsilon, a_max=None)
         x_b = x_nz[start:end]
-        kl_pos += cp.sum(x_b * cp.log(x_b / xhat) - x_b + xhat)
-        sum_xhat_nz += cp.sum(xhat)
+        # Both reductions before either accumulation, so a retry cannot
+        # double-count the first.
+        pos = cp.sum(x_b * cp.log(x_b / xhat) - x_b + xhat)
+        tot = cp.sum(xhat)
+        kl_pos[...] += pos
+        sum_xhat_nz[...] += tot
+
+    _run_nnz_batches(nnz, batch_nnz, _body, verbose, "  [TT-KL] error x̂ pass")
 
     kl_total = kl_pos + (sum_all - sum_xhat_nz)
     return kl_total / cp.maximum(cp.sum(x_nz), epsilon)
