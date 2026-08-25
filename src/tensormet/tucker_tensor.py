@@ -12,6 +12,7 @@ from tensorly.tucker_tensor import validate_tucker_rank, tucker_normalize, Tucke
 from tensorly.tenalg import mode_dot
 from typing import ClassVar, List, Optional, Union, Tuple,  Literal
 from collections import defaultdict
+from functools import partial
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -60,6 +61,7 @@ from tensormet.distance import (
     NNZGroupingCache,
     precompute_largedim_batches,
     coords_nnz,
+    tucker_tied_factor_update,
 )
 from tensormet.stochastic_sparse import CooSubsampler
 from tensormet.sharded_sparse import (
@@ -1877,6 +1879,25 @@ class SparseTupleTensor:
         # four, not three pairs — linked_factors above only has the direct links.
         _tied_groups = nontrivial_linked_groups(self.shared_factors, num_factors=len(modes))
 
+        # Make shared modes actually share from step 0. Init draws one matrix per
+        # mode, and a resumed legacy checkpoint holds several (the old per-mode +
+        # copy path never left them equal), so without this the first pooled
+        # update would swap several different matrices for one in a single jump.
+        if _tied_groups and factors is not None:
+            for _grp in _tied_groups:
+                _head = factors[_grp[0]]
+                if any(factors[n].shape != _head.shape for n in _grp):
+                    raise ValueError(
+                        f"shared_factors ties modes {_grp} but their factors have "
+                        f"shapes {[tuple(factors[n].shape) for n in _grp]}; tied "
+                        f"modes must have the same dimension and rank."
+                    )
+                if any(not bool(cp.allclose(factors[n], _head)) for n in _grp[1:]):
+                    print(f"shared_factors: modes {_grp} held different factor "
+                          f"matrices; tying them to mode {_grp[0]}'s.")
+                for n in _grp[1:]:
+                    factors[n] = _head
+
         no_rec_improve_steps = 0
         # If we resumed, grab the last known error to calculate early stopping diff accurately
         last_err = rec_errors[-1] if rec_errors else None
@@ -2089,18 +2110,24 @@ class SparseTupleTensor:
                     )
                 elif _sst is not None and _largedim_selected:
                     if divergence == "kl":
+                        _sharded_factor_fn = make_sharded_kl_factor_update(_sst)
                         routing = UpdateRouting(
-                            factor_update=make_sharded_kl_factor_update(_sst),
+                            factor_update=_sharded_factor_fn,
                             core_update=make_sharded_kl_core_update(_sst),
                             error_fn=make_sharded_kl_compute_errors(_sst) if log_step else null_compute_errors,
                             core_returns_error=routing.core_returns_error,
+                            tied_factor_update=partial(tucker_tied_factor_update,
+                                                       factor_fn=_sharded_factor_fn),
                         )
                     elif divergence == "fr":
+                        _sharded_factor_fn = make_sharded_fr_factor_update(_sst)
                         routing = UpdateRouting(
-                            factor_update=make_sharded_fr_factor_update(_sst),
+                            factor_update=_sharded_factor_fn,
                             core_update=make_sharded_fr_core_update(_sst),
                             error_fn=make_sharded_fr_compute_errors(_sst) if log_step else null_compute_errors,
                             core_returns_error=False,  # sharded core update never returns (core, error)
+                            tied_factor_update=partial(tucker_tied_factor_update,
+                                                       factor_fn=_sharded_factor_fn),
                         )
                 # --- stochastic tensor selection ---
                 if _sst is not None:
@@ -2117,8 +2144,10 @@ class SparseTupleTensor:
                 # --- factors ---
                 # A shared factor sits at several legs at once, so updating it
                 # once per mode and copying applies the correction once per leg.
-                # Families that provide a pooled update (TT only) do the group in
-                # one step instead; the rest keep the per-mode update + copy.
+                # Families that provide a pooled update (Tucker and TT) do the
+                # group in one step; the rest keep the per-mode update + copy.
+                # The first pooled step writes one matrix to every mode in the
+                # group, so the legs are genuinely shared from then on.
                 _pooled_groups = (_tied_groups if routing.tied_factor_update is not None
                                   else [])
                 _pooled_modes = {m for grp in _pooled_groups for m in grp}
@@ -2136,6 +2165,14 @@ class SparseTupleTensor:
                     )
                     if _tt_batch_nnz is not None:
                         _tied_kwargs["batch_nnz"] = _tt_batch_nnz
+                    # Tucker's pooler calls the per-mode kernel once per tied mode,
+                    # so it takes the same batch/grouping hints that loop does.
+                    # Tied modes share a shape, so one batch_cols covers the group.
+                    if _largedim_batches is not None:
+                        _tied_kwargs["batch_cols"] = _largedim_batches["batch_cols"][grp[0]]
+                    if _grouping_cache is not None:
+                        _tied_kwargs["grouping_by_mode"] = {n: _grouping_cache.get(n)
+                                                            for n in grp}
                     _A_tied = routing.tied_factor_update(**_tied_kwargs)
                     for _n in grp:
                         factors[_n] = _A_tied

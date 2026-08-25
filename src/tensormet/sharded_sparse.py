@@ -622,6 +622,7 @@ def _sharded_factor_update(
     masked: bool = False,
     groupings: Optional[List[Optional[ModeGrouping]]] = None,
     batch_box: Optional[dict] = None,
+    return_parts: bool = False,
 ) -> cp.ndarray:
     """
     Orchestrate multi-GPU factor numerator computation and reduce on CPU.
@@ -719,6 +720,9 @@ def _sharded_factor_update(
         if masked:
             denominator_np = np.add.reduce([p[1] for p in partials])
             denominator = cp.clip(cp.asarray(denominator_np), a_min=epsilon, a_max=None)
+        # Tied factors pool both sides across the group before dividing.
+        if return_parts:
+            return numerator, denominator
         A_new = A_primary * (numerator / (denominator + epsilon))
         A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
 
@@ -1579,6 +1583,7 @@ class ShardedSparseTensor:
         epsilon: float = 1e-12,
         batch_cols: Optional[int] = None,
         verbose: bool = False,
+        return_parts: bool = False,
     ) -> cp.ndarray:
         """KL factor update; single-shard delegates to ``kl_factor_update_largedim``."""
         if self.n_shards == 1:
@@ -1587,6 +1592,7 @@ class ShardedSparseTensor:
                 core=core, factors=factors, mode=mode, shape=shape,
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_cols=batch_cols, verbose=verbose, masked=self.masked,
+                return_parts=return_parts,
             )
         # CHANGED (Task 4): reuse the cached batch width; capture the realized one.
         key = ("kl", mode)
@@ -1599,7 +1605,7 @@ class ShardedSparseTensor:
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
             pool=self._pool, masked=self.masked,
             groupings=self._mode_groupings(mode),
-            batch_box=box,
+            batch_box=box, return_parts=return_parts,
         )
         self._record_factor_batch(key, box.get("batch_cols"), box.get("shrink_cause"))
         return A_new
@@ -1614,6 +1620,7 @@ class ShardedSparseTensor:
         epsilon: float = 1e-12,
         batch_cols: Optional[int] = None,
         verbose: bool = False,
+        return_parts: bool = False,
     ) -> cp.ndarray:
         """FR factor update; single-shard delegates to ``fr_factor_update_largedim``."""
         if self.n_shards == 1:
@@ -1622,6 +1629,7 @@ class ShardedSparseTensor:
                 core=core, factors=factors, mode=mode, shape=shape,
                 thread_budget=thread_budget, epsilon=epsilon,
                 batch_cols=batch_cols, verbose=verbose, masked=self.masked,
+                return_parts=return_parts,
             )
         # CHANGED (Task 4): reuse the cached batch width; capture the realized one.
         key = ("fr", mode)
@@ -1634,7 +1642,7 @@ class ShardedSparseTensor:
             subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
             pool=self._pool, masked=self.masked,
             groupings=self._mode_groupings(mode),
-            batch_box=box,
+            batch_box=box, return_parts=return_parts,
         )
         self._record_factor_batch(key, box.get("batch_cols"), box.get("shrink_cause"))
         return A_new
@@ -1993,11 +2001,12 @@ class ShardedSparseTensor:
 def make_sharded_kl_factor_update(sst: ShardedSparseTensor):
     """Callable matching ``kl_factor_update_largedim`` signature; routes through *sst*."""
     def _fn(vec_tensor, core, factors, mode, shape,
-            thread_budget=None, epsilon=1e-12, batch_cols=None, verbose=False):
+            thread_budget=None, epsilon=1e-12, batch_cols=None, verbose=False,
+            return_parts=False, grouping=None):
         return sst.kl_factor_update(
             core=core, factors=factors, mode=mode, shape=shape,
             thread_budget=thread_budget, epsilon=epsilon,
-            batch_cols=batch_cols, verbose=verbose,
+            batch_cols=batch_cols, verbose=verbose, return_parts=return_parts,
         )
     return _fn
 
@@ -2005,11 +2014,12 @@ def make_sharded_kl_factor_update(sst: ShardedSparseTensor):
 def make_sharded_fr_factor_update(sst: ShardedSparseTensor):
     """Callable matching ``fr_factor_update_largedim`` signature; routes through *sst*."""
     def _fn(vec_tensor, core, factors, mode, shape,
-            thread_budget=None, epsilon=1e-12, batch_cols=None, verbose=False):
+            thread_budget=None, epsilon=1e-12, batch_cols=None, verbose=False,
+            return_parts=False, grouping=None):
         return sst.fr_factor_update(
             core=core, factors=factors, mode=mode, shape=shape,
             thread_budget=thread_budget, epsilon=epsilon,
-            batch_cols=batch_cols, verbose=verbose,
+            batch_cols=batch_cols, verbose=verbose, return_parts=return_parts,
         )
     return _fn
 

@@ -40,7 +40,8 @@ ptl = lazy_import("pytensorlab")
 
 # -- Kullback-Leibler Divergence --
 
-def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False):
+def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False,
+                     return_parts=False):
     """
     One multiplicative KL update for a single factor matrix A_n (for `mode`).
 
@@ -98,6 +99,10 @@ def kl_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None,
     den_row = tl.sum(Z, axis=1)  # (R,)
     denominator = den_row[np.newaxis, :]
     denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+
+    # Tied factors pool both sides across the group before dividing.
+    if return_parts:
+        return numerator, denominator
 
     # Multiplicative update
     A = A * (numerator / (denominator + 1e-12))
@@ -238,7 +243,8 @@ def kl_compute_errors(
 
 
 # -- Frobenius Norm --
-def fr_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False):
+def fr_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None, epsilon=1e-12, verbose=False,
+                     return_parts=False):
     if verbose:
         print(f"  Updating factor {mode}...")
 
@@ -252,6 +258,9 @@ def fr_factor_update(vec_tensor, core, factors, mode, shape, thread_budget=None,
     A = factors[mode]
     denominator = tl.dot(A, tl.dot(tl.transpose(Z), Z))
     denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+    # Tied factors pool both sides across the group before dividing.
+    if return_parts:
+        return numerator, denominator
     A *= numerator / denominator
     A = tl.clip(A, a_min=epsilon, a_max=None)
     return A
@@ -1098,6 +1107,7 @@ def kl_factor_update_largedim(
     verbose=False,
     masked=False,
     grouping=None,
+    return_parts=False,
 ):
     """
     KL multiplicative update for Tucker factor A^(mode) WITHOUT building dense Z,
@@ -1285,6 +1295,10 @@ def kl_factor_update_largedim(
 
     if masked:
         denominator = denominator_acc
+
+    # Tied factors pool both sides across the group before dividing.
+    if return_parts:
+        return numerator, denominator
 
     # Multiplicative KL update (matching your dense version structure)
     A_new = A * (numerator / (denominator + 1e-12))
@@ -1477,6 +1491,7 @@ def fr_factor_update_largedim(
     verbose=False,
     masked=False,
     grouping=None,
+    return_parts=False,
 ):
     """
     Frobenius (Euclidean) multiplicative update for Tucker factor A^(mode)
@@ -1641,10 +1656,72 @@ def fr_factor_update_largedim(
     if masked:
         denominator = cp.clip(denominator_acc, a_min=epsilon, a_max=None)
 
+    # Tied factors pool both sides across the group before dividing.
+    if return_parts:
+        return numerator, denominator
+
     # MU update
     A_new = A * (numerator / (denominator + 1e-12))
     A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
     return A_new
+
+
+def tucker_tied_factor_update(vec_tensor, core, factors, group, shape, factor_fn,
+                              thread_budget=None, epsilon=1e-12, verbose=False,
+                              batch_cols=None, grouping_by_mode=None, power=None):
+    """One MU step for a factor shared by every mode in ``group``.
+
+        A ← A ⊛ [(Σ_{n∈group} Num_n) ⊘ (Σ_{n∈group} Den_n)] ** power
+
+    A shared factor sits at |group| legs of the model, so ∂x̂/∂A is the SUM of
+    the per-leg derivatives and the correct MU pools both sides over the group.
+    Running the single-leg rule once per mode and copying the result applies a
+    one-leg correction once per leg; those corrections compound to roughly
+    ratio^|group|, which overshoots and does not converge to a stationary point
+    of the objective.
+
+    ``power`` damps the step, defaulting to ``1/|group|``. The pooled ratio has
+    the right fixed point (Num = Den ⟺ zero gradient) but NOT the Lee & Seung
+    monotonicity guarantee: that proof needs x̂ linear in the parameter, and a
+    factor at |group| legs makes it degree-|group|. Applying the full ratio to
+    every leg at once moves x̂ by ~ratio^|group|, which diverges under a noisy
+    numerator — the exponent is the usual remedy for degree-d multiplicative
+    models. ``power=1.0`` restores the undamped step; it converges faster where
+    it is stable (small rank, exact NNZ) and overflows where it is not
+    (production rank with subsample_frac ≪ 1, where Num is a rescaled sample and
+    Den is exact, so the ratio carries amplified noise).
+
+    ``factor_fn`` is whichever per-mode kernel the routing selected (dense or
+    largedim, KL or FR, single-GPU or sharded), called with ``return_parts=True``
+    so the pooled numerator and denominator are exactly the quantities the
+    untied path divides. Cost is |group| passes — the same as the |group|
+    per-mode updates it replaces.
+    """
+    group = list(group)
+    if verbose:
+        print(f"  Updating tied factor group {tuple(group)}...")
+
+    num = den = None
+    for n in group:
+        kwargs = {}
+        if batch_cols is not None:
+            kwargs["batch_cols"] = batch_cols
+        if grouping_by_mode is not None:
+            kwargs["grouping"] = grouping_by_mode.get(n)
+        num_n, den_n = factor_fn(
+            vec_tensor=vec_tensor, core=core, factors=factors, mode=n,
+            shape=shape, thread_budget=thread_budget, epsilon=epsilon,
+            verbose=False, return_parts=True, **kwargs
+        )
+        num = num_n if num is None else num + num_n
+        den = den_n if den is None else den + den_n
+
+    A = factors[group[0]]
+    ratio = cp.clip(num, a_min=0.0, a_max=None) / (den + 1e-12)
+    gamma = (1.0 / len(group)) if power is None else float(power)
+    if gamma != 1.0:
+        ratio = ratio ** gamma
+    return cp.clip(A * ratio, a_min=epsilon, a_max=None)
 
 
 def fr_core_update_largedim(

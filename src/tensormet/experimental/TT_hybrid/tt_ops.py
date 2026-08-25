@@ -207,7 +207,7 @@ def tt_kl_factor_update(vec_tensor, core, factors, mode, shape,
 
 def tt_kl_tied_factor_update(vec_tensor, core, factors, group, shape,
                              thread_budget=None, epsilon=1e-12, verbose=False,
-                             batch_nnz=None):
+                             batch_nnz=None, power=None):
     """KL multiplicative update for ONE factor tied across the modes in ``group``.
 
         A ← A ⊛ (Σ_{n∈group} Num_n) ⊘ (Σ_{n∈group} den_n)
@@ -263,7 +263,14 @@ def tt_kl_tied_factor_update(vec_tensor, core, factors, group, shape,
         _run_nnz_batches(nnz, batch_nnz, _body, verbose,
                          f"  [TT-KL] tied factors {tuple(group)}")
 
-    A_new = cp.clip(A * (num / den), a_min=epsilon, a_max=None)
+    # Damped by 1/|group| unless overridden: the pooled ratio has the right
+    # fixed point but not the MM guarantee, since x̂ is degree-|group| in a tied
+    # factor. See tucker_tied_factor_update for the full argument.
+    ratio = cp.clip(num, a_min=0.0, a_max=None) / den
+    gamma = (1.0 / len(group)) if power is None else float(power)
+    if gamma != 1.0:
+        ratio = ratio ** gamma
+    A_new = cp.clip(A * ratio, a_min=epsilon, a_max=None)
     scale = cp.clip(cp.sum(A_new, axis=0), a_min=epsilon, a_max=None)
     for n in group:
         tt_cores[n] *= scale[None, :, None]
