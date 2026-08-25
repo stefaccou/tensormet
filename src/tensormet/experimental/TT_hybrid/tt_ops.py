@@ -205,6 +205,71 @@ def tt_kl_factor_update(vec_tensor, core, factors, mode, shape,
     return cp.clip(A_new / scale[None, :], a_min=epsilon, a_max=None)
 
 
+def tt_kl_tied_factor_update(vec_tensor, core, factors, group, shape,
+                             thread_budget=None, epsilon=1e-12, verbose=False,
+                             batch_nnz=None):
+    """KL multiplicative update for ONE factor tied across the modes in ``group``.
+
+        A ← A ⊛ (Σ_{n∈group} Num_n) ⊘ (Σ_{n∈group} den_n)
+
+    A tied factor appears at |group| legs, so x̂ is degree-|group| in it and the
+    single-leg rule is simply the wrong update: applying it once per mode and
+    copying the result (the loop's ``factors[other] = factors[mode]``) compounds
+    the correction to roughly ratio^|group|. Pooling both sides is the correct
+    MU, and it restores the Poisson identity Σ_all x̂ = Σ x that the single-leg
+    rule satisfies per leg — which is the cheapest runtime check that this is
+    right (see 1_method_development/19_tt_hybrid/).
+
+    Cost is ONE NNZ pass, not |group|: the left/right sweeps are built once per
+    batch and reused for every site gradient. So this is ~|group|× cheaper than
+    the per-mode updates it replaces, not more expensive.
+
+    The ℓ1 rescale is applied to EVERY tied mode's core, so the reparametrization
+    stays exact — absorbing it into one core only (as the single-leg kernel must)
+    leaves the other legs uncompensated and multiplies x̂ by s^-(|group|-1).
+    """
+    if verbose:
+        print(f"  [TT-KL] Updating tied factor group {tuple(group)}...")
+    tt_cores = core
+    shape = tuple(int(s) for s in shape)
+    n_modes = len(shape)
+    group = list(group)
+    idxs, vals = coo_to_coords(vec_tensor, shape)
+    nnz = int(vals.size)
+    A = factors[group[0]]
+
+    sums = _colsum_batch(factors, epsilon)
+    den = cp.zeros((1, int(A.shape[1])), dtype=A.dtype)
+    for n in group:
+        S_sum = sites(tt_cores, sums, cp, skip=n)
+        den += site_grad(left_envs(S_sum, cp)[n], tt_cores[n],
+                         right_envs(S_sum, cp)[n + 1], cp)
+    den = cp.clip(den, a_min=epsilon, a_max=None)
+
+    num = cp.zeros_like(A)
+    if nnz:
+        if batch_nnz is None:
+            batch_nnz = estimate_batch_nnz_tt(tt_cores, factors)
+
+        def _body(start, end):
+            mats = [factors[k][idxs[k][start:end]] for k in range(n_modes)]
+            S = sites(tt_cores, mats, cp)
+            L, R = left_envs(S, cp), right_envs(S, cp)
+            w = vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
+            for n in group:
+                Z = site_grad(L[n], tt_cores[n], R[n + 1], cp)
+                _scatter_add(num, idxs[n][start:end], w, Z)
+
+        _run_nnz_batches(nnz, batch_nnz, _body, verbose,
+                         f"  [TT-KL] tied factors {tuple(group)}")
+
+    A_new = cp.clip(A * (num / den), a_min=epsilon, a_max=None)
+    scale = cp.clip(cp.sum(A_new, axis=0), a_min=epsilon, a_max=None)
+    for n in group:
+        tt_cores[n] *= scale[None, :, None]
+    return cp.clip(A_new / scale[None, :], a_min=epsilon, a_max=None)
+
+
 def tt_kl_core_update(vec_tensor, shape, core, factors, modes=None,
                       thread_budget=None, epsilon=1e-12, verbose=False,
                       batch_nnz=None):
@@ -372,5 +437,6 @@ __all__ = [
     "tt_kl_compute_errors",
     "tt_kl_core_update",
     "tt_kl_factor_update",
+    "tt_kl_tied_factor_update",
     "tt_sum_all_entries",
 ]

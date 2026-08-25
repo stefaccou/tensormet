@@ -19,6 +19,7 @@ from tensormet.distance import null_compute_errors
 from tensormet.routing import Divergence, UpdateRouting
 from tensormet.experimental.TT_hybrid.tt_ops import (
     tt_kl_compute_errors, tt_kl_core_update, tt_kl_factor_update,
+    tt_kl_tied_factor_update,
 )
 
 
@@ -35,6 +36,7 @@ def get_tt_update_routing_step(divergence: Divergence, log_step: bool) -> Update
         core_update=tt_kl_core_update,
         error_fn=tt_kl_compute_errors if log_step else null_compute_errors,
         core_returns_error=False,
+        tied_factor_update=tt_kl_tied_factor_update,
     )
 
 
@@ -66,6 +68,15 @@ def get_sharded_tt_update_routing_step(sst, divergence: Divergence,
             batch_nnz=batch_nnz,
         )
 
+    def _tied_factor_update(vec_tensor, core, factors, group, shape,
+                            thread_budget=None, epsilon=1e-12, verbose=False,
+                            batch_nnz=None):
+        return sst.tt_tied_factor_update(
+            core=core, factors=factors, group=group, shape=shape,
+            thread_budget=thread_budget, epsilon=epsilon, verbose=verbose,
+            batch_nnz=batch_nnz,
+        )
+
     def _core_update(vec_tensor, shape, core, factors, modes=None,
                      thread_budget=None, epsilon=1e-12, verbose=False,
                      batch_nnz=None):
@@ -89,6 +100,7 @@ def get_sharded_tt_update_routing_step(sst, divergence: Divergence,
         core_update=_core_update,
         error_fn=_error_fn if log_step else null_compute_errors,
         core_returns_error=False,
+        tied_factor_update=_tied_factor_update,
     )
 
 

@@ -1873,6 +1873,10 @@ class SparseTupleTensor:
                 linked_factors[a].add(b)
                 linked_factors[b].add(a)
 
+        # Sets of modes that share one matrix. {(0,1),(1,2),(2,3)} is one group of
+        # four, not three pairs — linked_factors above only has the direct links.
+        _tied_groups = nontrivial_linked_groups(self.shared_factors, num_factors=len(modes))
+
         no_rec_improve_steps = 0
         # If we resumed, grab the last known error to calculate early stopping diff accurately
         last_err = rec_errors[-1] if rec_errors else None
@@ -2111,7 +2115,34 @@ class SparseTupleTensor:
                     if _use_subsample else self.tensor
                 )
                 # --- factors ---
+                # A shared factor sits at several legs at once, so updating it
+                # once per mode and copying applies the correction once per leg.
+                # Families that provide a pooled update (TT only) do the group in
+                # one step instead; the rest keep the per-mode update + copy.
+                _pooled_groups = (_tied_groups if routing.tied_factor_update is not None
+                                  else [])
+                _pooled_modes = {m for grp in _pooled_groups for m in grp}
+
+                for grp in _pooled_groups:
+                    _tied_kwargs = dict(
+                        vec_tensor=_current_tensor,
+                        core=core,
+                        factors=factors,
+                        group=grp,
+                        shape=shape,
+                        thread_budget=thread_budget,
+                        epsilon=epsilon,
+                        verbose=verbose,
+                    )
+                    if _tt_batch_nnz is not None:
+                        _tied_kwargs["batch_nnz"] = _tt_batch_nnz
+                    _A_tied = routing.tied_factor_update(**_tied_kwargs)
+                    for _n in grp:
+                        factors[_n] = _A_tied
+
                 for mode in modes:
+                    if mode in _pooled_modes:
+                        continue
                     _factor_kwargs = dict(
                         vec_tensor=_current_tensor,
                         core=core,

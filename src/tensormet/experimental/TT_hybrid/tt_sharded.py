@@ -122,6 +122,60 @@ def _tt_partial_factor_num_for_shard(
     return result
 
 
+def _tt_partial_tied_factor_num_for_shard(
+    shard,
+    tt_cores_np: List[Union[np.ndarray, Any]],
+    factors_np: List[Union[np.ndarray, Any]],
+    group: List[int],
+    shape: Tuple[int, ...],
+    epsilon: float,
+    batch_nnz: Optional[int],
+    device_id: int,
+    subsample_frac: float = 1.0,
+    iteration: Optional[int] = None,
+) -> np.ndarray:
+    """Pooled numerator for a factor tied across ``group``, as (I, R).
+
+        Num[i, r] = Σ_{n∈group} Σ_{p : i_n(p) = i} (x_p / x̂_p) · Z⁽ⁿ⁾_p[r]
+
+    One NNZ pass for the whole group: the left/right sweeps are built once per
+    batch and reused for every site gradient. Linear in the values, so the same
+    1/frac rescale as the single-leg worker applies.
+    """
+    cp.cuda.Device(device_id).use()
+    tt_cores_d = [cp.asarray(C) for C in tt_cores_np]
+    factors_d = [cp.asarray(f) for f in factors_np]
+    group = list(group)
+    out = cp.zeros_like(factors_d[group[0]])
+
+    idxs, vals = coo_to_coords(shard, shape)
+    if vals.size == 0:
+        return cp.asnumpy(out)
+
+    if subsample_frac < 1.0:
+        idxs, vals = _apply_subsample(idxs, vals, subsample_frac, iteration)
+
+    nnz = int(vals.size)
+    if batch_nnz is None:
+        batch_nnz = estimate_batch_nnz_tt(tt_cores_d, factors_d)
+    n_modes = len(shape)
+
+    def _body(start, end):
+        mats = [factors_d[k][idxs[k][start:end]] for k in range(n_modes)]
+        S = sites(tt_cores_d, mats, cp)
+        L, R = left_envs(S, cp), right_envs(S, cp)
+        w = vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
+        for n in group:
+            Z = site_grad(L[n], tt_cores_d[n], R[n + 1], cp)
+            _scatter_add(out, idxs[n][start:end], w, Z)
+
+    _run_nnz_batches(nnz, batch_nnz, _body, desc=f"shard tied factors {tuple(group)}")
+
+    result = cp.asnumpy(out)
+    cp.cuda.Device(device_id).synchronize()
+    return result
+
+
 def _tt_partial_core_num_for_shard(
     shard,
     tt_cores_np: List[Union[np.ndarray, Any]],
@@ -328,6 +382,71 @@ def _sharded_tt_factor_update(
         return cp.clip(A_new / scale[None, :], a_min=epsilon, a_max=None)
 
 
+def _sharded_tt_tied_factor_update(
+    shards,
+    device_ids: List[int],
+    tt_cores: List[Any],
+    factors: List[Any],
+    group: List[int],
+    shape: Tuple[int, ...],
+    epsilon: float = 1e-12,
+    batch_nnz: Optional[int] = None,
+    verbose: bool = False,
+    subsample_frac: float = 1.0,
+    iter_seed: Optional[int] = None,
+    pool: Optional[ThreadPoolExecutor] = None,
+):
+    """Multi-GPU pooled KL update for a factor tied across ``group``.
+
+    One fan-out/fan-in cycle for the whole group (the pooled numerator is a
+    single (I, R) reduce), against |group| cycles for the per-mode updates it
+    replaces. Every tied mode's core is rescaled in place on the primary.
+    """
+    if verbose:
+        print(f"  [TT-KL/sharded] Updating tied factor group {tuple(group)}...")
+    primary = device_ids[0]
+    n_shards = len(device_ids)
+    shape = tuple(int(s) for s in shape)
+    group = list(group)
+
+    with cp.cuda.Device(primary):
+        A = factors[group[0]]
+        if batch_nnz is None:
+            batch_nnz = estimate_batch_nnz_tt(tt_cores, factors)
+        # Pooled denominator: Σ_n over the same closed-form column-sum chain the
+        # single-leg kernel uses. NNZ-free, so it never leaves the primary.
+        sums = _colsum_batch(factors, epsilon)
+        den = cp.zeros((1, int(A.shape[1])), dtype=A.dtype)
+        for n in group:
+            S_sum = sites(tt_cores, sums, cp, skip=n)
+            den += site_grad(left_envs(S_sum, cp)[n], tt_cores[n],
+                             right_envs(S_sum, cp)[n + 1], cp)
+        den = cp.clip(den, a_min=epsilon, a_max=None)
+
+    tt_cores_buf = [cp.asnumpy(C) for C in tt_cores]
+    factors_buf = [cp.asnumpy(f) for f in factors]
+
+    partials = _fan_out(
+        _tt_partial_tied_factor_num_for_shard, n_shards, pool,
+        lambda k: dict(
+            shard=shards[k],
+            tt_cores_np=tt_cores if k == 0 else tt_cores_buf,
+            factors_np=factors if k == 0 else factors_buf,
+            group=group, shape=shape, epsilon=epsilon, batch_nnz=batch_nnz,
+            device_id=device_ids[k], subsample_frac=subsample_frac,
+            iteration=iter_seed,
+        ),
+    )
+    num_np = np.add.reduce(partials)
+
+    with cp.cuda.Device(primary):
+        A_new = cp.clip(A * (cp.asarray(num_np) / den), a_min=epsilon, a_max=None)
+        scale = cp.clip(cp.sum(A_new, axis=0), a_min=epsilon, a_max=None)
+        for n in group:
+            tt_cores[n] *= scale[None, :, None]
+        return cp.clip(A_new / scale[None, :], a_min=epsilon, a_max=None)
+
+
 def _sharded_tt_core_update(
     shards,
     device_ids: List[int],
@@ -453,6 +572,7 @@ def _sharded_tt_kl_error(
 
 __all__ = [
     "_sharded_tt_factor_update",
+    "_sharded_tt_tied_factor_update",
     "_sharded_tt_core_update",
     "_sharded_tt_kl_error",
 ]

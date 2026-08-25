@@ -59,7 +59,7 @@ core keeps working at orders where it fits.
 | file                   | contents |
 |------------------------|----------|
 | `tt_chain.py`          | the chain algebra: site matrices, left/right environments, `site_grad`, `contract`, `to_dense_core`, `bond_dims`. Backend-generic (`xp` = cupy / numpy / torch) — only two-operand einsums, which all three spell alike |
-| `tt_ops.py`            | KL MU kernels: factor update, sequential core sweep, error, init |
+| `tt_ops.py`            | KL MU kernels: factor update, pooled tied-factor update, sequential core sweep, error, init |
 | `tt_sharded.py`        | multi-GPU (`n_gpus > 1`) counterparts of those kernels: per-shard NNZ workers + their orchestrators |
 | `tt_routing.py`        | `get_tt_update_routing_step` / `get_sharded_tt_update_routing_step` — builds the `UpdateRouting` the Tucker loop consumes |
 | `tt_decomposition.py`  | `TuckerTTDecomposition` (eval/inspection wrapper) and `TuckerTTTensor` (the payload container) |
@@ -126,11 +126,32 @@ Explicit `NotImplementedError` in every case:
 - **`objective="masked"`**, matching CP's current status.
 - **`solver="sgd"`.**
 
-Known rough edge: with linked (`shared_factors`) modes, the loop's
-`factors[other] = factors[mode]` copy does not rescale `tt_cores[other]`, so the
-scale absorbed at mode `mode` is only compensated when mode `other` is itself
-updated. Same INDSCAL-heuristic approximation the Tucker path already makes,
-one step coarser.
+## Tied factors (`shared_factors`)
+
+A tied factor sits at every leg of its group, so `x̂` is degree-|group| in it and
+the single-leg MU is the wrong update. `tt_kl_tied_factor_update` pools both
+sides over the group and applies one step:
+
+```
+Num[i,r] = Σ_{n∈group} Σ_{p : i_n(p)=i} (x_p / x̂_p) · Z⁽ⁿ⁾_p[r]
+Den[r]   = Σ_{n∈group} den_n[r]
+```
+
+It costs one NNZ pass for the whole group (the left/right sweeps are built once
+per batch and reused for every site gradient), so it is ~|group|× *cheaper* than
+the per-mode updates it replaces. The ℓ1 rescale goes into every tied mode's
+core, which keeps the reparametrization exact.
+
+The training loop picks this up via `UpdateRouting.tied_factor_update`; families
+that leave that `None` (Tucker, CP) keep the per-mode update + copy.
+
+Why it matters, from `1_method_development/19_tt_hybrid/`: on planted symmetric
+data with a known KL ceiling (the independence model) and floor (the generating
+model), the old per-mode + copy path fit *worse than the ceiling* — it collapsed
+`Σ_all x̂` by ~10⁶ on every factor update, and the core sweep spent each
+iteration dragging the mass back. Pooling restores the Poisson identity
+`Σ_all x̂ = Σ x` exactly, which is the cheapest runtime check that the update is
+the right one.
 
 ## Integration seams in the main package (and how to revert)
 
@@ -143,7 +164,8 @@ artifact filenames are unchanged. To revert, delete this directory and undo:
 2. `naming.py` — `_DECOMPOSITION_TAG` (`'TT'`) and the `tt_rank` kwarg on
    `_order_tag` / `model_stem` / `model_filename` / `candidate_stems`;
    `_DECOMPOSITION_TAG` also gates `candidate_stems`' legacy fallback
-3. `routing.py` — `get_update_routing_step` delegates to `tt_routing` for `"tt"`
+3. `routing.py` — `get_update_routing_step` delegates to `tt_routing` for `"tt"`;
+   `UpdateRouting.tied_factor_update` (optional, `None` for Tucker and CP)
 4. `parsing.py` — `"tt"` in `--decomposition`, new `--tt-rank`
 5. `sparse_ops.py` — `with_core=False` on `initialize_nonnegative_tucker` and
    the two SVD init helpers, so factor init can skip the dense-core step (that
@@ -153,11 +175,12 @@ artifact filenames are unchanged. To revert, delete this directory and undo:
    dispatch, guard rails, `NNZGroupingCache` / `precompute_largedim_batches`
    gating, `_tt_batch_nnz` hoist, `best_core` deep copy, banner,
    sharded-routing branch, `tucker_normalize` skip, `TuckerTTDecomposition` at
-   sem checks, `_as_host(core)` at the two checkpoint sites)
+   sem checks, `_as_host(core)` at the two checkpoint sites, `_tied_groups` +
+   the pooled-group branch in the factor section)
 7. `launch.py` — container-aware final save + notify text
 8. `sharded_sparse.py` — `ShardedSparseTensor.tt_factor_update` /
-   `tt_core_update` / `tt_compute_errors`, three lazy delegates alongside the
-   CP ones (nothing else in that module knows about TT)
+   `tt_tied_factor_update` / `tt_core_update` / `tt_compute_errors`, four lazy
+   delegates alongside the CP ones (nothing else in that module knows about TT)
 9. `inspect_tucker.py` — `_TT_STEM_RE`, `_tt_rank_from_stem`, and `"tt"` from
    `_decomp_from_stem`, so the run browser labels TT runs with their bond
 

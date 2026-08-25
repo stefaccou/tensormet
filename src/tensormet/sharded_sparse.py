@@ -1899,6 +1899,36 @@ class ShardedSparseTensor:
             pool=self._pool,
         )
 
+    def tt_tied_factor_update(
+        self,
+        core: List[cp.ndarray],
+        factors: List[cp.ndarray],
+        group: List[int],
+        shape: Tuple[int, ...],
+        thread_budget=None,
+        epsilon: float = 1e-12,
+        batch_nnz: Optional[int] = None,
+        verbose: bool = False,
+    ) -> cp.ndarray:
+        """Pooled TT-KL update for a factor tied across ``group``; every
+        ``core[n]``, n in group, is rescaled in place."""
+        from tensormet.experimental.TT_hybrid import tt_ops, tt_sharded
+
+        if self.n_shards == 1:
+            return tt_ops.tt_kl_tied_factor_update(
+                vec_tensor=self.full_tensor, core=core, factors=factors,
+                group=group, shape=shape, thread_budget=thread_budget,
+                epsilon=epsilon, verbose=verbose, batch_nnz=batch_nnz,
+            )
+
+        return tt_sharded._sharded_tt_tied_factor_update(
+            shards=self.shards, device_ids=self.device_ids,
+            tt_cores=core, factors=factors, group=group, shape=shape,
+            epsilon=epsilon, batch_nnz=batch_nnz, verbose=verbose,
+            subsample_frac=self.subsample_frac, iter_seed=self._iter_seed,
+            pool=self._pool,
+        )
+
     def tt_core_update(
         self,
         shape: Tuple[int, ...],

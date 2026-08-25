@@ -43,6 +43,10 @@ class UpdateRouting:
     core_update: Callable
     error_fn: Optional[Callable]
     core_returns_error: bool  # True for FR combined core+error
+    # Pooled update for a group of tied (shared_factors) modes, applied once per
+    # group instead of once per mode. Only the TT family supplies one; when it is
+    # None the loop keeps its per-mode update + copy.
+    tied_factor_update: Optional[Callable] = None
 
 
 
