@@ -6,7 +6,7 @@
 #   benchmarking.sh                 # MU (multiplicative updates), the default
 #   benchmarking.sh --solver sgd    # torch minibatch solver
 #   benchmarking.sh --solver cp     # MU on the EXPERIMENTAL nonnegative CP family
-#   benchmarking.sh --solver tt     # MU on the EXPERIMENTAL Tucker-TT hybrid
+#   benchmarking.sh --solver tt     # MU on the Tucker-TT hybrid
 #   benchmarking.sh --name "tc off" # free-text session label, shown in the notebook
 #   benchmarking.sh --max-seconds N # per-run kill switch (default 3600, 0 = off)
 #
@@ -50,7 +50,7 @@
 # but note that CP shards on _sst alone, not on the largedim threshold.
 #
 # TT is likewise the MU solver on a different model family
-# (experimental/TT_hybrid/README.md): Tucker factors, tensor-train core. It drops
+# (tt_hybrid/README.md): Tucker factors, tensor-train core. It drops
 # the same two flags as CP, for the same reasons (one kernel family; the factor
 # update already l1-normalizes and absorbs the scale into that mode's TT core),
 # and additionally:
@@ -261,7 +261,7 @@ if [[ "$SOLVER" == "sgd" ]]; then
 elif [[ "$SOLVER" == "cp" ]]; then
     echo "                  cp=EXPERIMENTAL nonnegative CP, inner_iters=$CP_INNER_ITERS scooch_kappa=$CP_SCOOCH_KAPPA"
 elif [[ "$SOLVER" == "tt" ]]; then
-    echo "                  tt=EXPERIMENTAL Tucker-TT hybrid, tt_rank=$TT_RANK (KL only)"
+    echo "                  tt=Tucker-TT hybrid, tt_rank=$TT_RANK (KL only)"
 fi
 echo "                  results -> $BENCHMARK_JSON"
 

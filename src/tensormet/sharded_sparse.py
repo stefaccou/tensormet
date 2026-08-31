@@ -111,6 +111,74 @@ cp, cpx_sparse = make_lazy_cupy_pair()
 # Internal utilities
 # ---------------------------------------------------------------------------
 
+def _shard_perm(shuffle_seed: int, m: int) -> np.ndarray:
+    """The shard's one-time shuffle permutation.
+
+    Always drawn host-side from ``shuffle_seed``, so a shard's contents don't
+    depend on which device gathers it. int32 where it fits: same values, half
+    the bus traffic and half the device-resident index.
+    """
+    perm = np.random.default_rng(int(shuffle_seed)).permutation(int(m))
+    return perm.astype(np.int32) if m <= np.iinfo(np.int32).max else perm
+
+
+def _gather_permuted(arrays_np, perm_np, target_device: int) -> list:
+    """Apply ``perm_np`` to host arrays, gathering on ``target_device``.
+
+    The gather, not the transfer, is the expensive half of building a shuffled
+    shard: host-side it is a random-access walk over one row per mode, which at
+    5-gram NNZ costs tens of seconds per shard with every GPU idle. On the
+    device it is bandwidth-bound.
+
+    Entries may be 1-D ``(m,)`` or 2-D ``(k, m)``; a 2-D block is filled a row
+    at a time, so its transient is two rows above the finished array (the
+    source row and its gathered copy) rather than a second full copy of it.
+    """
+    with cp.cuda.Device(target_device):
+        perm = cp.asarray(perm_np)
+        out = []
+        for a in arrays_np:
+            if a.ndim == 1:
+                src = cp.asarray(a)
+                out.append(src[perm])
+                del src
+            else:
+                dst = cp.empty(a.shape, dtype=a.dtype)
+                for n in range(a.shape[0]):
+                    row = cp.asarray(a[n])
+                    dst[n] = row[perm]
+                    del row
+                out.append(dst)
+        del perm
+        return out
+
+
+def _gather_permuted_with_fallback(arrays_np, perm_np, target_device: int) -> list:
+    """``_gather_permuted``, degrading to the host gather if the device is full.
+
+    The device gather needs the source and the permuted result live at once.
+    That transient lands on a shard device at its emptiest — before any kernel
+    temporaries exist, and against a primary device that holds the whole tensor
+    plus its own shard — so it should never bind first. If it does, the host
+    path still works; it is only slow.
+    """
+    failed = False
+    try:
+        return _gather_permuted(arrays_np, perm_np, target_device)
+    except cp.cuda.memory.OutOfMemoryError:
+        failed = True
+    if failed:
+        # Outside the handler: the exception's traceback pins the failed frame's
+        # arrays, so the flush only reclaims once it is gone (as in
+        # tt_ops._run_nnz_batches).
+        print(f"  [shard] device gather OOM on GPU {target_device}; "
+              f"falling back to the host gather (slow)")
+        with cp.cuda.Device(target_device):
+            cp.get_default_memory_pool().free_all_blocks()
+            return [cp.asarray(a[perm_np] if a.ndim == 1 else a[:, perm_np])
+                    for a in arrays_np]
+
+
 def _build_coord_shard(
     src: CoordCOO,
     start: int,
@@ -125,14 +193,13 @@ def _build_coord_shard(
     """
     coords, data = src.coords, src.data
     source_device = _array_device_id(coords)
+    perm_np = _shard_perm(shuffle_seed, end - start) if shuffle_seed is not None else None
 
     if source_device is not None and source_device == target_device:
         with cp.cuda.Device(target_device):
             c, d = coords[:, start:end], data[start:end]
-            if shuffle_seed is not None:
-                perm = cp.asarray(
-                    np.random.default_rng(int(shuffle_seed)).permutation(int(d.size))
-                )
+            if perm_np is not None:
+                perm = cp.asarray(perm_np)
                 c, d = c[:, perm], d[perm]
             else:
                 # Slices are views into the full COO; copy so the parent NNZ can
@@ -142,12 +209,13 @@ def _build_coord_shard(
 
     coords_np = cp.asnumpy(coords[:, start:end])
     data_np = cp.asnumpy(data[start:end])
-    if shuffle_seed is not None:
-        perm = np.random.default_rng(int(shuffle_seed)).permutation(data_np.size)
-        coords_np, data_np = coords_np[:, perm], data_np[perm]
 
-    with cp.cuda.Device(target_device):
-        return CoordCOO(cp.asarray(coords_np), cp.asarray(data_np), src.shape)
+    if perm_np is None:
+        with cp.cuda.Device(target_device):
+            return CoordCOO(cp.asarray(coords_np), cp.asarray(data_np), src.shape)
+
+    c, d = _gather_permuted_with_fallback([coords_np, data_np], perm_np, target_device)
+    return CoordCOO(c, d, src.shape)
 
 
 def _build_shard(
@@ -177,20 +245,20 @@ def _build_shard(
     shuffled before the shard is built, so that the contiguous windows taken by
     ``_apply_subsample`` are uniform samples without replacement.  COO entry order
     carries no meaning for any downstream accumulation (sums are order-invariant;
-    ``cp.unique`` re-sorts its input), so the shuffle is content-preserving. On the
-    device-local path the permutation is still drawn host-side (deterministic, and
-    identical in distribution to the cross-device shards), but only the index array
-    crosses the bus — the shard data never leaves its device.
+    ``cp.unique`` re-sorts its input), so the shuffle is content-preserving. The
+    permutation is drawn host-side on both paths (deterministic, and identical
+    whichever path a shard takes), but the gather itself always runs on the target
+    device — see ``_gather_permuted`` for why.
     """
     # Device-local short-circuit (shard 0, and any shard whose target matches source).
     source_device = _array_device_id(coo.row)
+    perm_np = _shard_perm(shuffle_seed, end - start) if shuffle_seed is not None else None
+
     if source_device is not None and source_device == target_device:
         with cp.cuda.Device(target_device):
             row, col, data = coo.row[start:end], coo.col[start:end], coo.data[start:end]
-            if shuffle_seed is not None:
-                perm = cp.asarray(
-                    np.random.default_rng(int(shuffle_seed)).permutation(int(row.size))
-                )
+            if perm_np is not None:
+                perm = cp.asarray(perm_np)
                 # Fancy indexing already returns fresh contiguous arrays.
                 row, col, data = row[perm], col[perm], data[perm]
             else:
@@ -203,13 +271,14 @@ def _build_shard(
     col_np = cp.asnumpy(coo.col[start:end])
     data_np = cp.asnumpy(coo.data[start:end])
 
-    # CHANGED (2026-06-12 review, Task 2): one-time host-side shuffle replaces the
-    # per-iteration cp.random.permutation in _apply_subsample. Done here because the
-    # NNZ slice already round-trips through the CPU, so the shuffle costs no GPU
-    # memory and no extra transfer.
-    if shuffle_seed is not None:
-        perm = np.random.default_rng(int(shuffle_seed)).permutation(row_np.size)
-        row_np, col_np, data_np = row_np[perm], col_np[perm], data_np[perm]
+    # The one-time shuffle replaces the per-iteration cp.random.permutation in
+    # _apply_subsample; the gather runs on the target device (_gather_permuted).
+    if perm_np is not None:
+        row_cp, col_cp, data_cp = _gather_permuted_with_fallback(
+            [row_np, col_np, data_np], perm_np, target_device
+        )
+        with cp.cuda.Device(target_device):
+            return cpx_sparse.coo_matrix((data_cp, (row_cp, col_cp)), shape=coo.shape)
 
     with cp.cuda.Device(target_device):
         shard = cpx_sparse.coo_matrix(
@@ -1870,10 +1939,10 @@ class ShardedSparseTensor:
         )
 
     # ------------------------------------------------------------------
-    # EXPERIMENTAL Tucker-TT hybrid (experimental/TT_hybrid/README.md)
+    # Tucker-TT hybrid (tt_hybrid/README.md)
     # ------------------------------------------------------------------
     # Same arrangement as the CP delegates above: the machinery lives under
-    # experimental/TT_hybrid/ and is imported lazily. ``core`` is the list of TT
+    # tt_hybrid/ and is imported lazily. ``core`` is the list of TT
     # cores here, not an array. KL only, and no masked objective, so
     # ``self.masked`` plays no part; the batch caches stay unused because the TT
     # orchestrators estimate once per call and reuse it across shards.
@@ -1890,7 +1959,7 @@ class ShardedSparseTensor:
         verbose: bool = False,
     ) -> cp.ndarray:
         """TT-KL factor update; ``core[mode]`` is rescaled in place."""
-        from tensormet.experimental.TT_hybrid import tt_ops, tt_sharded
+        from tensormet.tt_hybrid import tt_ops, tt_sharded
 
         if self.n_shards == 1:
             return tt_ops.tt_kl_factor_update(
@@ -1920,7 +1989,7 @@ class ShardedSparseTensor:
     ) -> cp.ndarray:
         """Pooled TT-KL update for a factor tied across ``group``; every
         ``core[n]``, n in group, is rescaled in place."""
-        from tensormet.experimental.TT_hybrid import tt_ops, tt_sharded
+        from tensormet.tt_hybrid import tt_ops, tt_sharded
 
         if self.n_shards == 1:
             return tt_ops.tt_kl_tied_factor_update(
@@ -1949,7 +2018,7 @@ class ShardedSparseTensor:
         verbose: bool = False,
     ) -> List[cp.ndarray]:
         """TT-KL core sweep; one reduce per site (see tt_sharded's docstring)."""
-        from tensormet.experimental.TT_hybrid import tt_ops, tt_sharded
+        from tensormet.tt_hybrid import tt_ops, tt_sharded
 
         if self.n_shards == 1:
             return tt_ops.tt_kl_core_update(
@@ -1977,7 +2046,7 @@ class ShardedSparseTensor:
         verbose: bool = False,
     ) -> cp.ndarray:
         """TT relative KL error; ``Σ_all x̂`` stays closed-form on the primary."""
-        from tensormet.experimental.TT_hybrid import tt_ops, tt_sharded
+        from tensormet.tt_hybrid import tt_ops, tt_sharded
 
         if self.n_shards == 1:
             return tt_ops.tt_kl_compute_errors(

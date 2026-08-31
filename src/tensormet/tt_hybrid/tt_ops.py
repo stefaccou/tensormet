@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from tensormet.distance import coo_to_coords, _gpu_free_bytes
 from tensormet.utils import make_lazy_cupy_pair
-from tensormet.experimental.TT_hybrid.tt_chain import (
+from tensormet.tt_hybrid.tt_chain import (
     bond_dims, core_shapes, left_envs, right_envs, site_grad, sites,
 )
 

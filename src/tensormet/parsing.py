@@ -339,14 +339,14 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                              "evaluates a fixed random subset instead — unbiased, and the "
                              "final reported error is still exact.")
 
-    # EXPERIMENTAL (reviews/CP_IMPLEMENTATION_PLAN.md): CP decomposition family.
+    # 'cp' is still EXPERIMENTAL (reviews/CP_IMPLEMENTATION_PLAN.md); 'tt' is not.
     parser.add_argument("--decomposition", type=str, default=None,
                         choices=["tucker", "cp", "tt"],
                         help="Decomposition family: 'tucker' (default, existing pipeline), "
-                             "'cp' (EXPERIMENTAL nonnegative CP) or 'tt' (EXPERIMENTAL "
-                             "Tucker-TT hybrid: Tucker factors, tensor-train core). Both "
-                             "experimental families support --n-gpus > 1 and are "
-                             "objective=full only; 'tt' is KL only.")
+                             "'tt' (Tucker-TT hybrid: Tucker factors, tensor-train core) "
+                             "or 'cp' (EXPERIMENTAL nonnegative CP). Both non-Tucker "
+                             "families support --n-gpus > 1 and are objective=full only; "
+                             "'tt' is KL only.")
     parser.add_argument("--tt-rank", type=int, dest="tt_rank", default=None,
                         help="TT only: bond dimension of the tensor-train core (default 100). "
                              "Part of the artifact name ('TT{tt_rank}b{order}D'), so runs at "

@@ -139,6 +139,11 @@ def _voc_list_key(role: str) -> str:
 class TuckerDecomposition:
     """Encapsulating the tucker decomposition (core and factors) and the vocabulary,
     providing methods for scoring, slicing, visualisation, etc."""
+
+    # Family this class loads by default; the TT subclass overrides it so
+    # load_from_disk works from either class without an explicit argument.
+    _DECOMPOSITION: ClassVar[str] = "tucker"
+
     def __init__(self, core, factors: List[torch.Tensor],
                  vocab: dict, shared_factors: set | None = None,
                  roles: Optional[List[str]] = None,
@@ -180,6 +185,8 @@ class TuckerDecomposition:
                        subsample_frac: float=1.0,
                        max_nnz: Optional[int]=None,
                        solver: str="mu",
+                       decomposition: Optional[str]=None,
+                       tt_rank: Optional[int]=None,
                           ) -> "TuckerDecomposition":
 
         """Loads a precomputed tucker decomposition from disk.
@@ -192,6 +199,13 @@ class TuckerDecomposition:
                 iterations (int): number of iterations used to compute the decomposition
                 map_location (str): device to map the loaded tensors to
                 name (str, optional): optional name prefix for the tensor file
+                decomposition (str, optional): family to load, "tucker" or "tt".
+                    Defaults to the class's own family, so
+                    TuckerTTDecomposition.load_from_disk() needs no argument.
+                    Selects the filename tag (see naming._order_tag) and, for
+                    "tt", returns a TuckerTTDecomposition.
+                tt_rank (int, optional): TT bond dimension; part of the TT stem,
+                    so it must match the run. Defaults to 100.
             Returns:
                 ((core, factors), vocab)
                     core: torch.Tensor
@@ -200,6 +214,17 @@ class TuckerDecomposition:
         """
         if method not in ALL_METHODS:
             raise ValueError(f"method must be one of {set(ALL_METHODS)}")
+
+        decomposition = (decomposition or cls._DECOMPOSITION).lower()
+        if decomposition == "cp":
+            raise ValueError(
+                "decomposition='cp' loads through "
+                "tensormet.experimental.CP.cp_decomposition.CPDecomposition.load_from_disk"
+            )
+        if decomposition not in ("tucker", "tt"):
+            raise ValueError(f"decomposition must be 'tucker' or 'tt'; got {decomposition!r}")
+        if decomposition == "tt" and tt_rank is None:
+            tt_rank = 100  # matches ExperimentConfig.tt_rank
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
 
@@ -237,15 +262,20 @@ class TuckerDecomposition:
             raise FileNotFoundError(f"Missing vocab file. Checked {vocab_path_new} and {vocab_path_old}")
 
         decomp_path = os.path.join(base, "decomposition")
-        # Construct candidate prefixes: new naming first, legacy fallback.
+        # Candidate prefixes in descending priority: canonical naming, then the
+        # no-shared-factor and legacy fallbacks where the family has them (the TT
+        # and SGD families have no legacy artifacts, see naming.candidate_stems).
         stems = candidate_stems(
             divergence, method, order, dims, rank,
             name=name, shared_factors=parsed_shared, subsample_frac=subsample_frac,
-            max_nnz=max_nnz, solver=solver,
+            max_nnz=max_nnz, solver=solver, decomposition=decomposition, tt_rank=tt_rank,
         )
-        new_file_prefix      = stems[0]
-        new_file_prefix_no_sf = stems[1] if len(stems) > 2 else stems[0]
-        legacy_file_prefix   = stems[-1]
+        # Notice printed when a fallback stem is the one that matches.
+        notices = [None] * len(stems)
+        if suffix and len(stems) > 1:
+            notices[1] = "No shared-factor decomposition found; falling back to non-shared naming."
+        if decomposition == "tucker" and solver != "sgd":
+            notices[-1] = f"No new-style ({order}D) decomposition found; falling back to legacy naming."
 
         def _find_highest_iter(decomp_dir: str, prefix: str) -> int:
             highest = -1
@@ -259,35 +289,27 @@ class TuckerDecomposition:
 
         # Look for the highest iteration option if not specified
         if not iterations:
-            highest_iter = _find_highest_iter(decomp_path, new_file_prefix)
-            if highest_iter != -1:
-                file_prefix = new_file_prefix
-            elif suffix:
-                highest_iter = _find_highest_iter(decomp_path, new_file_prefix_no_sf)
+            for stem, notice in zip(stems, notices):
+                highest_iter = _find_highest_iter(decomp_path, stem)
                 if highest_iter != -1:
-                    print(f"No shared-factor decomposition found; falling back to non-shared naming.")
-                    file_prefix = new_file_prefix_no_sf
-            if highest_iter == -1:
-                highest_iter = _find_highest_iter(decomp_path, legacy_file_prefix)
-                if highest_iter != -1:
-                    print(f"No new-style ({order}D) decomposition found; falling back to legacy naming.")
-                    file_prefix = legacy_file_prefix
-                else:
-                    raise FileNotFoundError(
-                        f"Could not find any decomposition files in {decomp_path} "
-                        f"matching '{new_file_prefix}' or '{legacy_file_prefix}'"
-                    )
-            iterations = highest_iter
+                    if notice:
+                        print(notice)
+                    file_prefix, iterations = stem, highest_iter
+                    break
+            else:
+                raise FileNotFoundError(
+                    f"Could not find any decomposition files in {decomp_path} "
+                    f"matching any of {stems}"
+                )
         else:
-            # When iterations is given explicitly, prefer new naming, fall back to legacy.
-            file_prefix = new_file_prefix
-            if not os.path.exists(os.path.join(decomp_path, f"{new_file_prefix}{iterations}i.pt")):
-                if suffix and os.path.exists(os.path.join(decomp_path, f"{new_file_prefix_no_sf}{iterations}i.pt")):
-                    print(f"No shared-factor decomposition found; falling back to non-shared naming.")
-                    file_prefix = new_file_prefix_no_sf
-                elif os.path.exists(os.path.join(decomp_path, f"{legacy_file_prefix}{iterations}i.pt")):
-                    print(f"No new-style ({order}D) decomposition found; falling back to legacy naming.")
-                    file_prefix = legacy_file_prefix
+            # When iterations is given explicitly, probe the same stems in order.
+            file_prefix = stems[0]
+            for stem, notice in zip(stems, notices):
+                if os.path.exists(os.path.join(decomp_path, f"{stem}{iterations}i.pt")):
+                    if notice:
+                        print(notice)
+                    file_prefix = stem
+                    break
 
         tensor_name = f"{file_prefix}{iterations}i.pt"
         decomp_path = os.path.join(decomp_path, tensor_name)
@@ -322,7 +344,8 @@ class TuckerDecomposition:
                 for line in f:
                     run_info = json.loads(line)
                     if run_info.get("results", {}).get("model_path") == decomp_path:
-                        print("Loaded Tucker decomposition with the following parameters:")
+                        _label = "Tucker-TT" if decomposition == "tt" else "Tucker"
+                        print(f"Loaded {_label} decomposition with the following parameters:")
                         for key, value in run_info.items():
                             print(f"  {key}: {value}")
                         break
@@ -344,7 +367,18 @@ class TuckerDecomposition:
                     "tied factors are not comparable with those of later runs."
                 )
 
-        instance = cls(core, factors, vocab, shared_factors=parsed_shared, roles=roles)
+        # For "tt" the payload's first element is the list of TT cores, which is
+        # TuckerTTDecomposition's first positional argument — so one call builds
+        # either family. Only substitute the class when the caller's own is not
+        # already a TT one: GenTuckerTT(TuckerTTDecomposition, TuckerGenMixin) and
+        # friends must come back as themselves, not stripped down to the base.
+        target = cls
+        if decomposition == "tt":
+            from tensormet.tt_hybrid.tt_decomposition import TuckerTTDecomposition
+            if not issubclass(cls, TuckerTTDecomposition):
+                target = TuckerTTDecomposition
+
+        instance = target(core, factors, vocab, shared_factors=parsed_shared, roles=roles)
         instance.decomp_path = Path(decomp_path)
         return instance
 
@@ -776,6 +810,15 @@ class TuckerDecomposition:
 
         return top_sims
 
+    def _fixed_role_matrix(self, fixed_idx, other_idxs, fixed_latent):
+        """The (R_a, R_b) matrix get_top_combinations ranks against: the core
+        with the fixed role contracted away. Overridden by the TT subclass,
+        which contracts the chain instead of forming the dense core."""
+        modes = einsum_letters(len(self.roles))
+        other_chars = "".join(modes[i] for i in other_idxs)
+        eq = f"{''.join(modes)},{modes[fixed_idx]}->{other_chars}"
+        return np.einsum(eq, self._core_np(), fixed_latent)
+
     def get_top_combinations(
             self,
             fixed_element: str,
@@ -796,13 +839,7 @@ class TuckerDecomposition:
             )
 
         v_latent = self.fetch_single_latent(fixed_element, fixed_role)
-
-        G = self._core_np()
-        modes = einsum_letters(len(self.roles))
-        fixed_char = modes[fixed_idx]
-        other_chars = [modes[i] for i in other_idxs]
-        eq_contract = f"{''.join(modes)},{fixed_char}->{''.join(other_chars)}"
-        G_fixed = np.einsum(eq_contract, G, v_latent)
+        G_fixed = self._fixed_role_matrix(fixed_idx, other_idxs, v_latent)
 
         role_names_free: list[str] = [self.roles[i] for i in other_idxs]
         factors_free: list[np.ndarray] = []
@@ -1480,7 +1517,7 @@ class SparseTupleTensor:
             decomposition = getattr(cfg.exp, "decomposition", "tucker")
             cp_inner_iters = getattr(cfg.exp, "cp_inner_iters", 1)
             cp_scooch_kappa = getattr(cfg.exp, "cp_scooch_kappa", 0.0)
-            # EXPERIMENTAL Tucker-TT hybrid (experimental/TT_hybrid/README.md).
+            # Tucker-TT hybrid (tt_hybrid/README.md).
             tt_rank = getattr(cfg.exp, "tt_rank", 100)
             if decomposition not in ("tucker", "cp", "tt"):
                 raise ValueError(
@@ -1585,21 +1622,21 @@ class SparseTupleTensor:
                     "drop --largedim."
                 )
 
-        # --- EXPERIMENTAL CP swap points -----------------------------------
+        # --- CP / Tucker-TT swap points -------------------------------------
         # For decomposition == "cp" the `core` variable holds the CP weight
         # vector λ (R,): the CP kernels take it through the same UpdateRouting
         # seam, so this loop is reused rather than forked. Containers become
         # tensorly CPTensor payloads.
         # For decomposition == "tt" it holds the list of TT cores instead (same
-        # seam, see experimental/TT_hybrid/README.md).
+        # seam, see tt_hybrid/README.md). TT persists a plain (tt_cores, factors)
+        # tuple rather than a container class, so no module path ends up inside
+        # the pickle and a saved model survives the code moving.
         _is_cp = decomposition == "cp"
         _is_tt = decomposition == "tt"
         if _is_cp:
             from tensorly.cp_tensor import CPTensor as TensorModel
         elif _is_tt:
-            from tensormet.experimental.TT_hybrid.tt_decomposition import (
-                TuckerTTTensor as TensorModel,
-            )
+            TensorModel = tuple
         else:
             TensorModel = TuckerTensor
 
@@ -1666,10 +1703,10 @@ class SparseTupleTensor:
             core = factors = None
         elif checkpoint_tensor is not None:
             if isinstance(checkpoint_tensor, tuple):
-                # if TensorLy TuckerTensor / plain (core|weights, factors) tuple
+                # TensorLy TuckerTensor / plain (core|tt_cores, factors) tuple
                 ckpt_core, ckpt_factors = checkpoint_tensor
-            elif _is_cp or _is_tt:
-                # CPTensor / TuckerTTTensor payload: iterable as (core, factors)
+            elif _is_cp:
+                # CPTensor payload: iterable as (weights, factors)
                 ckpt_core, ckpt_factors = checkpoint_tensor
             else:
                 # if our TuckerDecomposition class
@@ -1678,7 +1715,7 @@ class SparseTupleTensor:
             core = [cp.asarray(C) for C in ckpt_core] if _is_tt else cp.asarray(ckpt_core)
             factors = [cp.asarray(factor) for factor in ckpt_factors]
             if _is_tt:
-                from tensormet.experimental.TT_hybrid.tt_chain import core_shapes
+                from tensormet.tt_hybrid.tt_chain import core_shapes
                 expected = core_shapes(rank, tt_rank)
                 if [tuple(int(d) for d in C.shape) for C in core] != expected:
                     raise ValueError(
@@ -1702,7 +1739,7 @@ class SparseTupleTensor:
                 thread_budget=thread_budget, divergence=divergence, epsilon=epsilon,
             )
         elif _is_tt:
-            from tensormet.experimental.TT_hybrid.tt_ops import initialize_tucker_tt
+            from tensormet.tt_hybrid.tt_ops import initialize_tucker_tt
             # `core` = list of TT cores; see the swap-points note above.
             core, factors = initialize_tucker_tt(
                 self.tensor, shape, rank, modes, init, random_state,
@@ -1769,11 +1806,11 @@ class SparseTupleTensor:
                 "(CP_IMPLEMENTATION_PLAN.md §1.8 / Phase 5). Use objective='full'."
             )
 
-        # --- Tucker-TT guard rails (experimental/TT_hybrid/README.md).
+        # --- Tucker-TT guard rails (tt_hybrid/README.md).
         if _is_tt and masked:
             raise NotImplementedError(
                 "decomposition='tt' does not support objective='masked' yet "
-                "(TT_hybrid/README.md, 'Not implemented'). Use objective='full'."
+                "(tt_hybrid/README.md, 'Not implemented'). Use objective='full'."
             )
 
         # --- SGD trainer construction ---
@@ -2007,7 +2044,7 @@ class SparseTupleTensor:
         # once per factor update, core sweep and error pass.
         _tt_batch_nnz = None
         if _is_tt:
-            from tensormet.experimental.TT_hybrid.tt_ops import estimate_batch_nnz_tt
+            from tensormet.tt_hybrid.tt_ops import estimate_batch_nnz_tt
             # _gpu_free_bytes() reads whichever device is current; pin to the one
             # the cores live on so a sharded run never sizes against a shard's GPU.
             with core[0].device:
@@ -2124,7 +2161,7 @@ class SparseTupleTensor:
                         inner_iters=cp_inner_iters, scooch_kappa=cp_scooch_kappa,
                     )
                 elif _is_tt and _sst is not None:
-                    from tensormet.experimental.TT_hybrid.tt_routing import (
+                    from tensormet.tt_hybrid.tt_routing import (
                         get_sharded_tt_update_routing_step,
                     )
                     routing = get_sharded_tt_update_routing_step(
@@ -2380,7 +2417,7 @@ class SparseTupleTensor:
                     tucker_decomp = CPDecomposition(weights=core_cpu, factors=factors_cpu,
                                                     vocab=vocab, roles=roles)
                 elif _is_tt:
-                    from tensormet.experimental.TT_hybrid.tt_decomposition import TuckerTTDecomposition
+                    from tensormet.tt_hybrid.tt_decomposition import TuckerTTDecomposition
                     tucker_decomp = TuckerTTDecomposition(tt_cores=core_cpu, factors=factors_cpu,
                                                           vocab=vocab, roles=roles)
                 else:

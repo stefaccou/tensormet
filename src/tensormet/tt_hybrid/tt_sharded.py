@@ -49,10 +49,10 @@ import numpy as np
 from tensormet.distance import coo_to_coords
 from tensormet.sharded_sparse import _apply_subsample
 from tensormet.utils import make_lazy_cupy_pair
-from tensormet.experimental.TT_hybrid.tt_chain import (
+from tensormet.tt_hybrid.tt_chain import (
     left_envs, right_envs, site_grad, sites,
 )
-from tensormet.experimental.TT_hybrid.tt_ops import (
+from tensormet.tt_hybrid.tt_ops import (
     _colsum_batch,
     _run_nnz_batches,
     _scatter_add,

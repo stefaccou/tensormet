@@ -379,11 +379,9 @@ def launch_nnt_decomposition(cfg):
         factors_t = [tl.tensor(_as_host(f)) for f in factors]
         _decomposition = getattr(cfg.exp, "decomposition", "tucker")
         if _decomposition == "tt":
-            # EXPERIMENTAL Tucker-TT hybrid: `core` is the list of TT cores.
-            from tensormet.experimental.TT_hybrid.tt_decomposition import TuckerTTTensor
-            tucker_decomp_torch = TuckerTTTensor(
-                ([tl.tensor(_as_host(C)) for C in core], factors_t)
-            )
+            # Tucker-TT hybrid: `core` is the list of TT cores, and the payload is
+            # a plain tuple so the pickle carries no module path.
+            tucker_decomp_torch = ([tl.tensor(_as_host(C)) for C in core], factors_t)
         elif _decomposition == "cp":
             from tensorly.cp_tensor import CPTensor
             tucker_decomp_torch = CPTensor((tl.tensor(_as_host(core)), factors_t))

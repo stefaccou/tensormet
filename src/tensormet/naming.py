@@ -4,9 +4,9 @@ Single source of truth for artifact filename conventions.
 Naming contract
 ---------------
 Model file :  {prefix}{div}_{method}_{order}D_{dims}d{sf}_{rank0}r{ss}{mn}_{iters}i.pt
-              (experimental CP family: '{order}D' → 'CP{order}D'; experimental
-               Tucker-TT hybrid: '{order}D' → 'TT{tt_rank}b{order}D', where the
-               'b' fragment is the bond dimension. Tucker filenames are
+              (experimental CP family: '{order}D' → 'CP{order}D'; Tucker-TT
+               hybrid: '{order}D' → 'TT{tt_rank}b{order}D', where the 'b'
+               fragment is the bond dimension. Tucker filenames are
                byte-identical to before either feature existed)
 Vocab file :  {order}D_{dims}d{sf}.pkl          (legacy: {dims}{sf}.pkl)
 Populated  :  {method}_{order}D_{dims}d{sf}.pt  (legacy: {method}_{dims}{sf}.pt)
@@ -84,8 +84,8 @@ def _order_tag(order: int, decomposition: str = "tucker", solver: str = "mu",
                tt_rank: Optional[int] = None) -> str:
     """Order fragment of the model stem: '{order}D' for MU Tucker (unchanged,
     keeps every existing filename byte-identical), 'CP{order}D' for the
-    experimental CP family, 'TT{tt_rank}b{order}D' for the experimental
-    Tucker-TT hybrid, 'SGD{order}D' for the SGD solver, so the artifact families
+    experimental CP family, 'TT{tt_rank}b{order}D' for the Tucker-TT hybrid,
+    'SGD{order}D' for the SGD solver, so the artifact families
     never collide (an SGD run can therefore never scan up MU checkpoints on
     resume, and vice versa). 'SGDCP'/'SGDTT' are reserved but the combinations
     are rejected at fit time.
@@ -181,7 +181,7 @@ def candidate_stems(
       2. new naming without shared-factor suffix (fallback when sf was added later)
       3. legacy naming: no order prefix          (pre-{order}D era)
 
-    For the experimental families the order fragment becomes 'CP{order}D' /
+    For the CP and Tucker-TT families the order fragment becomes 'CP{order}D' /
     'TT{tt_rank}b{order}D' and there is no legacy fallback (no such artifacts
     predate this naming), so the list is just [new] (+ [new_no_sf] when a
     shared-factor suffix applies). The same applies to solver="sgd"

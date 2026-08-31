@@ -1,4 +1,4 @@
-# Tucker-TT hybrid (EXPERIMENTAL)
+# Tucker-TT hybrid
 
 Tucker factor matrices, tensor-train core. The point is the order-5 wall: a
 rank-100 order-5 Tucker core is `100^5` floats ≈ 40 GB, while its TT form at
@@ -24,10 +24,20 @@ is monotone.
 ```
 
 Artifacts are named `..._TT{tt_rank}b{order}D_...` (vs `..._{order}D_...` for
-Tucker) and stored as `TuckerTTTensor` payloads `(tt_cores, factors)`. The `b`
-fragment is the bond dimension: it fixes the TT core shapes, so two `--tt-rank`
-values are two different models and get two different artifact families. Load
-with `TuckerTTDecomposition.load_from_disk(..., tt_rank=...)`.
+Tucker). The `b` fragment is the bond dimension: it fixes the TT core shapes, so
+two `--tt-rank` values are two different models and get two different artifact
+families. Load with either of:
+
+```python
+TuckerTTDecomposition.load_from_disk(..., tt_rank=100)
+TuckerDecomposition.load_from_disk(..., decomposition="tt", tt_rank=100)
+```
+
+Models and checkpoints are saved as a plain `(tt_cores, factors)` tuple, so no
+module path ends up inside the pickle and a saved model survives the code
+moving. Files written before that change (when the payload was a
+`TuckerTTTensor` instance) are converted by
+`python -m tensormet.scripts.migrate_tt_artifacts --apply`.
 
 ## What changes for interpretation
 
@@ -62,7 +72,7 @@ core keeps working at orders where it fits.
 | `tt_ops.py`            | KL MU kernels: factor update, pooled tied-factor update, sequential core sweep, error, init |
 | `tt_sharded.py`        | multi-GPU (`n_gpus > 1`) counterparts of those kernels: per-shard NNZ workers + their orchestrators |
 | `tt_routing.py`        | `get_tt_update_routing_step` / `get_sharded_tt_update_routing_step` — builds the `UpdateRouting` the Tucker loop consumes |
-| `tt_decomposition.py`  | `TuckerTTDecomposition` (eval/inspection wrapper) and `TuckerTTTensor` (the payload container) |
+| `tt_decomposition.py`  | `TuckerTTDecomposition`, the eval/inspection wrapper — a `TuckerDecomposition` subclass that overrides only the core contractions |
 
 Design invariants:
 
@@ -153,11 +163,11 @@ iteration dragging the mass back. Pooling restores the Poisson identity
 `Σ_all x̂ = Σ x` exactly, which is the cheapest runtime check that the update is
 the right one.
 
-## Integration seams in the main package (and how to revert)
+## Integration points in the main package
 
 Every change outside this directory is additive and gated on
 `decomposition == "tt"`; with the default (`"tucker"`) all code paths and all
-artifact filenames are unchanged. To revert, delete this directory and undo:
+artifact filenames are unchanged. Where this family touches the package:
 
 1. `config.py` — `ExperimentConfig.tt_rank`; `tt_rank` in `get_resume_state()`'s
    `is_compatible` (a different bond dimension means different core shapes)
@@ -176,7 +186,10 @@ artifact filenames are unchanged. To revert, delete this directory and undo:
    gating, `_tt_batch_nnz` hoist, `best_core` deep copy, banner,
    sharded-routing branch, `tucker_normalize` skip, `TuckerTTDecomposition` at
    sem checks, `_as_host(core)` at the two checkpoint sites, `_tied_groups` +
-   the pooled-group branch in the factor section)
+   the pooled-group branch in the factor section); `TuckerDecomposition`'s
+   `load_from_disk` takes `decomposition` / `tt_rank` and returns a
+   `TuckerTTDecomposition` for `"tt"`, and `_fixed_role_matrix` is the hook
+   `get_top_combinations` overrides
 7. `launch.py` — container-aware final save + notify text
 8. `sharded_sparse.py` — `ShardedSparseTensor.tt_factor_update` /
    `tt_tied_factor_update` / `tt_core_update` / `tt_compute_errors`, four lazy

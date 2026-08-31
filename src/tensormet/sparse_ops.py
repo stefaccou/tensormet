@@ -1271,7 +1271,7 @@ def _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state, 
 def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, random_state,
                                    thread_budget=None, with_core=True):
     """with_core=False returns (None, factors) and skips the core computation —
-    for decompositions that never form a dense R^N core (experimental/TT_hybrid)."""
+    for decompositions that never form a dense R^N core (tt_hybrid)."""
     if init == "random":
         rng = tl.check_random_state(random_state)
         core = tl.tensor(

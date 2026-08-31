@@ -1,14 +1,12 @@
 """
-Tucker-TT hybrid decomposition — EXPERIMENTAL.
+Tucker-TT hybrid decomposition.
 
-Tucker factor matrices, tensor-train core. See README.md for the model, the
-integration seams in the main package, and how to revert them.
+Tucker factor matrices, tensor-train core. See README.md for the model and the
+integration points in the main package.
 
-Lazy by convention (as in tensormet.experimental.CP): importing this package
-must not drag in torch/tensorly/cupy until a symbol is actually used.
-
-Note: the directory is ``TT_hybrid`` rather than ``TT-hybrid`` because a
-hyphen is not a valid Python identifier.
+Lazy by convention (as in tensormet.sgd): importing this package must not drag
+in torch/tensorly/cupy until a symbol is actually used, so ``import tensormet``
+stays usable from a login node.
 """
 
 _SUBMODULE_BY_NAME = {
@@ -20,12 +18,12 @@ _SUBMODULE_BY_NAME = {
     "estimate_batch_nnz_tt": "tt_ops",
     "tt_sum_all_entries": "tt_ops",
     "tt_kl_factor_update": "tt_ops",
+    "tt_kl_tied_factor_update": "tt_ops",
     "tt_kl_core_update": "tt_ops",
     "tt_kl_compute_errors": "tt_ops",
     "get_tt_update_routing_step": "tt_routing",
     "get_sharded_tt_update_routing_step": "tt_routing",
     "TuckerTTDecomposition": "tt_decomposition",
-    "TuckerTTTensor": "tt_decomposition",
 }
 
 __all__ = list(_SUBMODULE_BY_NAME)
@@ -35,6 +33,6 @@ def __getattr__(name):
     submodule = _SUBMODULE_BY_NAME.get(name)
     if submodule is not None:
         import importlib
-        mod = importlib.import_module(f"tensormet.experimental.TT_hybrid.{submodule}")
+        mod = importlib.import_module(f"tensormet.tt_hybrid.{submodule}")
         return getattr(mod, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

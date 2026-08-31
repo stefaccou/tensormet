@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from tensormet.distance import null_compute_errors
 from tensormet.routing import Divergence, UpdateRouting
-from tensormet.experimental.TT_hybrid.tt_ops import (
+from tensormet.tt_hybrid.tt_ops import (
     tt_kl_compute_errors, tt_kl_core_update, tt_kl_factor_update,
     tt_kl_tied_factor_update,
 )

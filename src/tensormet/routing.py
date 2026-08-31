@@ -62,16 +62,16 @@ def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedi
         largedim NNZ-streaming kernels (they work for any dimensionality), so we
         always route to those and bind ``masked=True`` via functools.partial.
     decomposition : str
-        EXPERIMENTAL: "cp" routes to the nonnegative CP kernel family in
-        tensormet.experimental.CP, "tt" to the Tucker-TT hybrid in
-        tensormet.experimental.TT_hybrid (both imported lazily so Tucker runs
-        never touch them). Both have a single NNZ-streaming family, so
+        "tt" routes to the Tucker-TT hybrid in tensormet.tt_hybrid, "cp" to the
+        EXPERIMENTAL nonnegative CP kernel family in tensormet.experimental.CP
+        (both imported lazily so Tucker runs never touch them). Both have a
+        single NNZ-streaming family, so
         dim/largedim/masked do not apply there (masked is rejected upstream by
         the training loop). cp_inner_iters / cp_scooch_kappa are CP-APR knobs,
         ignored for the other families.
     """
     if decomposition == "tt":
-        from tensormet.experimental.TT_hybrid.tt_routing import get_tt_update_routing_step
+        from tensormet.tt_hybrid.tt_routing import get_tt_update_routing_step
         return get_tt_update_routing_step(divergence=divergence, log_step=log_step)
 
     if decomposition == "cp":

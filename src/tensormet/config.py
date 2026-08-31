@@ -190,7 +190,7 @@ class ExperimentConfig:
     #                      off; the ε-clip already prevents exact zeros).
     cp_inner_iters: int = 1
     cp_scooch_kappa: float = 0.0
-    # Tucker-TT hybrid only (experimental/TT_hybrid): uniform bond dimension of
+    # Tucker-TT hybrid only (tt_hybrid): uniform bond dimension of
     # the tensor-train core. Capped per cut by the exact TT rank.
     tt_rank: int = 100
     # Which optimizer family fits the model (sgd/README.md). "mu" (default) is
@@ -690,14 +690,13 @@ class InspectionConfig:
         if decomposition == "cp":
             from tensormet.experimental.CP.cp_decomposition import CPDecomposition
             return CPDecomposition.load_from_disk(**common_kwargs)
-        if decomposition == "tt":
-            from tensormet.experimental.TT_hybrid.tt_decomposition import TuckerTTDecomposition
-            return TuckerTTDecomposition.load_from_disk(
-                tt_rank=self.tt_rank if self.tt_rank is not None else 100, **common_kwargs
-            )
 
+        # Tucker and TT share one loader; it returns a TuckerTTDecomposition for "tt".
         from tensormet.tucker_tensor import TuckerDecomposition
-        return TuckerDecomposition.load_from_disk(solver=self.solver, **common_kwargs)
+        return TuckerDecomposition.load_from_disk(
+            solver=self.solver, decomposition=decomposition, tt_rank=self.tt_rank,
+            **common_kwargs,
+        )
 
 @dataclass(frozen=True)
 class VectorExperimentConfig:
