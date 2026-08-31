@@ -506,6 +506,45 @@ def utc_now_iso() -> str:
     """Returns the current UTC time in ISO 8601 format."""
     return datetime.now(UTC).isoformat()
 
+def date_run(model_path) -> Optional[datetime]:
+    """When the run that wrote ``model_path`` started, or None if undatable.
+
+    Reads the ``{stem}_config.json`` snapshot, which launch_nnt_decomposition
+    writes before the loop starts, so it dates the code that ran. Falls back to
+    the run's runs.jsonl line (written on completion, matched on filename so a
+    moved DATA_DIR still resolves), then to the file's mtime.
+    """
+    model_path = Path(model_path)
+
+    def _utc(stamp):
+        """ISO stamp -> aware datetime; naive stamps (none written so far) as UTC."""
+        parsed = datetime.fromisoformat(stamp)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+    config_path = model_path.with_name(model_path.stem + "_config.json")
+    if config_path.exists():
+        try:
+            return _utc(json.loads(config_path.read_text())["timestamp"])
+        except (OSError, ValueError, KeyError):
+            pass
+
+    runs_path = model_path.parent / "runs.jsonl"
+    if runs_path.exists():
+        try:
+            with runs_path.open("r") as f:
+                for line in f:
+                    record = json.loads(line)
+                    logged = str(record.get("results", {}).get("model_path", ""))
+                    if logged and Path(logged).name == model_path.name:
+                        return _utc(record["timestamp"])
+        except (OSError, ValueError, KeyError):
+            pass
+
+    try:
+        return datetime.fromtimestamp(model_path.stat().st_mtime, UTC)
+    except OSError:
+        return None
+
 
 class _TeeStream:
     """

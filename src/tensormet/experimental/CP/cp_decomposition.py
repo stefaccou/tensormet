@@ -120,6 +120,12 @@ class CPDecomposition:
         """Mode dimensions of the reconstructed tensor, i.e. (N_0, ..., N_{k-1})."""
         return tuple(int(f.shape[0]) for f in self.factors)
 
+    def get_rank(self, role=None):
+        """CP rank — shared by every factor; the role argument is for API parity."""
+        if role is None:
+            role = self.roles[0]
+        return int(self.factors[_role_index(role, self.roles)].shape[1])
+
     # --- Construction and loading ---------------------------------------
     @classmethod
     def load_from_disk(cls,
@@ -334,14 +340,27 @@ class CPDecomposition:
             for idx, score in zip(indices, scores)
         ]
 
-    def get_top_dimensions_for_word(self, word: str, role: str, top_k: int = 10):
+    def get_top_dimensions_for_word(self, word: str, role=None, top_k: int = 10,
+                                    return_words=False):
+        if role is None:
+            role = self.roles[0]
         latent = torch.tensor(self.fetch_single_latent(word, role))
+        if top_k == "full":
+            top_k = len(latent)
         scores, dims = torch.topk(latent, top_k)
+        if return_words:
+            # variant in which we return the representative word as well
+            return [
+                (int(dim), float(score), self.get_top_words_for_dimension(role, dim, 1)[0][0])
+                for dim, score in zip(dims, scores)
+            ]
         return [(int(dim), float(score)) for dim, score in zip(dims, scores)]
 
-    def get_most_similar_elements(self, element, role, top_k=5):
+    def get_most_similar_elements(self, element, role=None, top_k=5):
         """Most similar elements by cosine over factor rows; a tuple input uses
         the contextualised (included) CP vector, a string the factor row."""
+        if role is None:
+            role = self.roles[0]
         if isinstance(element, tuple):
             latent = self.included_role_vector(element, role=role)
         elif isinstance(element, str):
@@ -358,6 +377,8 @@ class CPDecomposition:
         F_norm = np.maximum(np.linalg.norm(F, axis=1), eps)
         G_norm = max(np.linalg.norm(latent), eps)
         similarities = (F @ latent) / (F_norm * G_norm)
+        if top_k == "full":
+            top_k = len(F)
         top_idx = np.argsort(-similarities)[:top_k]
         r2i = voc_index(role)
         return [next(k for k, v in self.vocab[r2i].items() if v == idx) for idx in top_idx]

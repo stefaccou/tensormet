@@ -12,6 +12,7 @@ from tensorly.tucker_tensor import validate_tucker_rank, tucker_normalize, Tucke
 from tensorly.tenalg import mode_dot
 from typing import ClassVar, List, Optional, Union, Tuple,  Literal
 from collections import defaultdict
+from datetime import datetime, UTC
 from functools import partial
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +21,7 @@ from contextlib import contextmanager
 from tensormet.config import RunConfig
 from pathlib import Path
 from tensormet.utils import (DATA_DIR,
+                            date_run,
                             torch_or_pickle_load,
                             readonly_dispatch,
                             tree_to_device,
@@ -95,6 +97,12 @@ _SIMLEX_POS_MAP = {
     "nsubj": "N", "obj": "N", "subject": "N", "object": "N",
 }
 _SIMLEX_PATH = DATA_DIR / "corpora" / "SimLex-999.txt"
+
+# Commit 1252fa3: tied factors moved from a per-mode update + copy (which applies
+# the correction once per leg) to the pooled tucker_tied_factor_update. Runs
+# started before this are usable, but their shared factors are not comparable to
+# later ones, so load_from_disk flags them.
+SHARED_FACTOR_REWORK = datetime(2026, 8, 25, 15, 38, 55, tzinfo=UTC)
 
 
 # Old role index when all we had was VSO
@@ -321,6 +329,20 @@ class TuckerDecomposition:
 
         else:
             print("Warning: file creation predates logging of runs; no run info available.")
+
+        # "shared" is in the filename only when the loaded file really ties modes,
+        # so a fallback to non-shared naming above never trips this.
+        if "shared" in os.path.basename(decomp_path):
+            started = date_run(decomp_path)
+            if started is None or started < SHARED_FACTOR_REWORK:
+                when = ("could not be dated, so it may predate" if started is None
+                        else f"started {started:%Y-%m-%d}, before")
+                print(
+                    f"WARNING: {os.path.basename(decomp_path)} {when} the "
+                    f"{SHARED_FACTOR_REWORK:%Y-%m-%d} tied-factor rework: its shared factors were "
+                    "updated per mode and copied instead of pooled. The run is usable, but its "
+                    "tied factors are not comparable with those of later runs."
+                )
 
         instance = cls(core, factors, vocab, shared_factors=parsed_shared, roles=roles)
         instance.decomp_path = Path(decomp_path)
