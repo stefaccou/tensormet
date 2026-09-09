@@ -11,11 +11,16 @@ Three layers, smallest to largest:
   to when a curve looks wrong.
 * **plotting** -- :func:`plot_metrics` (one run) and :func:`compare_metrics`
   (any number of runs overlaid) turn those into matplotlib figures.
+* **ranking**  -- :func:`evaluate_runs` scores every discovered run on its
+  best-ever value of each metric; :func:`find_best` narrows that by facet and
+  metric-threshold criteria and ranks it best-first.
 * **UI**       -- :func:`make_run_browser` scans the ``decomposition/`` directory
   of one or more datasets (:func:`discover_datasets` finds them) for
   ``*_config.json`` snapshots and offers dataset checkboxes plus faceted
   drop-downs to pick and compare any two runs — even across datasets —
-  interactively (requires ``ipywidgets``).
+  interactively (requires ``ipywidgets``). :func:`make_run_ranker` is the same
+  faceted picker wired to :func:`find_best`: choose criteria, get the top runs
+  on a metric as a table plus an optional overlay plot.
 
 The plotting/comparison functions duck-type on their config argument: they only
 touch ``.log_path`` / ``.stem`` / ``.vocab_path``, so both :class:`InspectionConfig`
@@ -27,6 +32,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import operator
 import pickle
 import re
 from dataclasses import dataclass, replace
@@ -226,6 +232,24 @@ def average_runs(configs, n_grid=500, stitch=True):
 # once one axis is out there. Both are in axes coordinates.
 _AXIS_OFFSET = 0.11
 _LEGEND_X = 1.12
+
+
+def _place_legend(ax, lines, loc, n_right):
+    """Park the legend clear of the axes.
+
+    ``loc="right"`` (default) keeps it beside the plot, stepped out past any
+    stacked right-hand axes — good for a two-run compare. ``loc="below"`` drops
+    it under the axes in up-to-3 columns — better when there are many long
+    labels, as in the :func:`find_best` ranking overlay.
+    """
+    labels = [l.get_label() for l in lines]
+    if loc == "below":
+        ax.legend(lines, labels, loc="upper center", bbox_to_anchor=(0.5, -0.12),
+                  frameon=False, ncol=min(3, max(1, len(lines))))
+    else:
+        ax.legend(lines, labels, loc="center left",
+                  bbox_to_anchor=(_LEGEND_X + _AXIS_OFFSET * max(0, n_right - 1), 0.5),
+                  frameon=False)
 
 
 def _time_axis(ax1, n_right):
@@ -439,7 +463,8 @@ def _is_preloaded(run):
 def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
                     plot_rec_error=True, plot_iter_time=False,
                     title="Training Metrics Comparison",
-                    ax=None, clip_common=False, color_by=None, stitch=True):
+                    ax=None, clip_common=False, color_by=None, stitch=True,
+                    legend_loc="right"):
     """Overlay any number of runs on a shared figure.
 
     ``configs`` is the list of runs to plot and ``labels`` a parallel list of
@@ -481,6 +506,9 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
     began instead of at 0, and runs resumed different numbers of times don't
     share an x-range. Runs passed as an explicit list of segments are left alone.
     Pass ``stitch=False`` to plot exactly what was given.
+
+    ``legend_loc`` is ``"right"`` (beside the plot) or ``"below"`` (under the
+    axes, up to 3 columns) — the latter reads better with many long run labels.
     """
     if isinstance(configs, dict):
         if labels is None:
@@ -579,9 +607,7 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
         if finals:
             ax1.set_xlim(right=min(finals))
 
-    ax1.legend(all_lines, [l.get_label() for l in all_lines], loc="center left",
-               bbox_to_anchor=(_LEGEND_X + _AXIS_OFFSET * max(0, n_right - 1), 0.5),
-               frameon=False)
+    _place_legend(ax1, all_lines, legend_loc, n_right)
     ax1.set_title(title)
     return fig
 
@@ -839,7 +865,7 @@ def _chain_key(rec):
 
 
 def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
-                     default_sem_keys=("average_rank_score", "simlex_all_rho")):
+                     default_sem_keys=("dim_consistency", "simlex_all_rho")):
     """Interactive faceted browser for picking and comparing two runs.
 
     Requires ``ipywidgets`` and an interactive matplotlib backend.
@@ -1199,6 +1225,582 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     # Expose the live state so callers can grab the current Figure out of the UI,
     # e.g. `fig = browser.get_figure(); fig.savefig(...)` or display it elsewhere.
     ui.get_figure = lambda: state["fig"]
+    display(ui)
+    return ui
+
+
+# === best-run ranking =================================================
+#
+# Two layers, mirroring the rest of the module: pure functions
+# (:func:`evaluate_runs` / :func:`find_best`) that any caller drives with
+# arguments, and :func:`make_run_ranker`, a widget front-end wired to the exact
+# same helpers. "Best" means the best value the metric ever reached over the
+# run's logged iterations — a min for error-like keys, a max otherwise — which
+# is fair across runs of different lengths and matches how ``get_resume_state``
+# tracks ``best_sem_score``.
+
+# A metric whose name looks like an error/loss/distance ranks ascending (lower
+# is better); everything else ranks descending. Override per call with
+# ``lower_is_better``.
+_ERROR_LIKE_RE = re.compile(r"(?:^|_)(rec_error|error|loss|rmse|mae|nll|perplexity|ppl)(?:_|$)")
+
+_NUM_RE = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+_THRESH_RE = re.compile(rf"([A-Za-z0-9_]+)\s*(<=|>=|<|>|==|=)\s*({_NUM_RE})")
+
+_OPS = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
+        ">=": operator.ge, "==": operator.eq, "=": operator.eq}
+
+# Facet fields carried on every discovery record that a filter may key on.
+_FILTER_FACETS = {"name", "decomposition", "divergence", "method", "dim", "rank",
+                  "subsample_frac", "max_nnz", "iters", "order", "dataset"}
+
+
+def _lower_is_better_fn(override):
+    """Build ``key -> bool`` ("does a smaller value rank higher for this metric").
+
+    ``override`` may be a bool (applies to every metric), an iterable of keys
+    that are lower-better, or ``None`` to infer it from the key name.
+    """
+    if override is None:
+        return lambda k: bool(_ERROR_LIKE_RE.search(str(k).lower()))
+    if isinstance(override, bool):
+        return lambda k: override
+    keys = set(override)
+    return lambda k: k in keys
+
+
+def _parse_thresholds(thresholds):
+    """Normalise threshold criteria to a list of ``(key, op, value)`` triples.
+
+    Accepts a string (``"rec_error < 0.5, simlex_all_rho > 0.3"`` — comma,
+    semicolon or ``and`` separated), a ``{key: (op, value)}`` / ``{key: value}``
+    dict, or an iterable of ``(key, op, value)``. ``op`` may be ``None``, meaning
+    "resolve by direction" (``>=`` for higher-better metrics, ``<=`` for
+    error-like ones) — deferred to :func:`_apply_thresholds`.
+    """
+    if not thresholds:
+        return []
+    out = []
+    if isinstance(thresholds, str):
+        for part in re.split(r"[,;]|\band\b", thresholds, flags=re.IGNORECASE):
+            part = part.strip()
+            if not part:
+                continue
+            m = _THRESH_RE.fullmatch(part)
+            if not m:
+                raise ValueError(
+                    f"Can't parse threshold {part!r} (expected e.g. 'rec_error < 0.5')")
+            out.append((m.group(1), m.group(2), float(m.group(3))))
+        return out
+    if isinstance(thresholds, dict):
+        for key, spec in thresholds.items():
+            if isinstance(spec, (tuple, list)) and len(spec) == 2:
+                out.append((key, str(spec[0]), float(spec[1])))
+            else:
+                out.append((key, None, float(spec)))
+        return out
+    for key, op, val in thresholds:
+        out.append((key, op if op is None else str(op), float(val)))
+    return out
+
+
+def _apply_thresholds(df, thresholds, lower_is_better=None):
+    """Drop rows of a scored frame that fail any threshold (NaN never passes)."""
+    lib = _lower_is_better_fn(lower_is_better)
+    for key, op, val in _parse_thresholds(thresholds):
+        if key not in df.columns:
+            raise KeyError(f"No metric column {key!r} to threshold on "
+                           f"(scored: {sorted(df.attrs.get('metrics', []))})")
+        if op is None:
+            op = "<=" if lib(key) else ">="
+        df = df[_OPS[op](df[key], val)]
+    return df
+
+
+def _apply_facet_filters(records, filters):
+    """Keep only records matching every ``{facet: value | [values]}`` entry.
+
+    A ``list``/``set`` value allows any of several; anything else (including a
+    ``tuple``, so ``dim=(1000, 1000, 1000)`` stays one value) is an exact match.
+    """
+    if not filters:
+        return records
+    for key, want in filters.items():
+        if key not in _FILTER_FACETS:
+            raise KeyError(f"Unknown filter facet {key!r}; "
+                           f"choose from {sorted(_FILTER_FACETS)}")
+        allowed = list(want) if isinstance(want, (list, set)) else [want]
+        records = [r for r in records if r.get(key) in allowed]
+    return records
+
+
+def _facet_filter_df(df, filters):
+    """DataFrame counterpart of :func:`_apply_facet_filters` (used by the UI)."""
+    for key, want in (filters or {}).items():
+        allowed = list(want) if isinstance(want, (list, set)) else [want]
+        df = df[df[key].apply(lambda v: v in allowed)]
+    return df
+
+
+def _metric_series(loaded, key):
+    """``(iters, values)`` for one metric from a :func:`load_metrics` triple.
+
+    ``key`` is ``"rec_error"`` for the reconstruction-error curve, or any key
+    present in the ``Sem_all`` dicts.
+    """
+    its, rec, sem = loaded
+    if key in ("rec_error", "reconstruction_error"):
+        return list(its), list(rec)
+    return _values_for_key(key, its, sem)
+
+
+def _collapse_chains(records, stitch=True):
+    """Group resume segments; return ``[(representative_record, refs_tuple), ...]``.
+
+    With ``stitch`` the representative is the furthest-reaching segment and
+    ``refs`` are every segment of the chain (ascending), ready for
+    :func:`load_metrics`. Without it each record is its own singleton.
+    """
+    if not stitch:
+        return [(r, (r["ref"],)) for r in records]
+    idx = {}
+    for r in records:
+        idx.setdefault(_chain_key(r), []).append(r)
+    out = []
+    for members in idx.values():
+        members.sort(key=lambda m: m["iters"])
+        out.append((members[-1], tuple(m["ref"] for m in members)))
+    return out
+
+
+def _score_loaded(loaded, metrics, lower_is_better_fn):
+    """Best-ever value / iteration / final value for each metric of one run."""
+    if loaded is None or not loaded[0]:
+        return None
+    its_all = loaded[0]
+    out = {"last_iter": int(its_all[-1])}
+    for key in metrics:
+        its, vals = _metric_series(loaded, key)
+        if not vals:
+            continue
+        bi = int(np.argmin(vals) if lower_is_better_fn(key) else np.argmax(vals))
+        out[key] = float(vals[bi])
+        out[f"{key}_iter"] = int(its[bi])
+        out[f"{key}_final"] = float(vals[-1])
+    return out
+
+
+# Identity columns, in display order. The ranking metric's own columns are
+# spliced in right after `stem` (see _order_columns) so the number you sorted on
+# is the first thing next to the run name.
+_RANK_FRONT = ("rank_pos", "stem", "dataset", "name", "decomposition",
+               "divergence", "method", "dim", "rank", "subsample_frac",
+               "max_nnz", "iters", "n_segments", "when")
+
+
+def _order_columns(df, metric):
+    """rank_pos, stem, the ranking metric's columns, then the rest; refs last."""
+    lead = [c for c in ("rank_pos", "stem") if c in df.columns]
+    metric_cols = [c for c in (metric, f"{metric}_iter", f"{metric}_final")
+                   if c in df.columns]
+    ident = [c for c in _RANK_FRONT if c in df.columns and c not in lead]
+    drop = set(lead) | set(metric_cols) | set(ident) | {"refs", "mtime"}
+    mid = [c for c in df.columns if c not in drop]
+    tail = ["refs"] if "refs" in df.columns else []
+    return df[lead + metric_cols + ident + mid + tail]
+
+
+def _rank_df(df, metric, thresholds=None, lower_is_better=None, top=None):
+    """Threshold, sort best-first on ``metric`` and (re)number a scored frame.
+
+    Shared by :func:`find_best` and :func:`make_run_ranker`.
+    """
+    lib = _lower_is_better_fn(lower_is_better)
+    df = df[df[metric].notna()].copy()
+    df = _apply_thresholds(df, thresholds, lower_is_better=lower_is_better)
+    df = df.sort_values(metric, ascending=lib(metric), kind="mergesort")
+    df = df.reset_index(drop=True)
+    df.insert(0, "rank_pos", df.index + 1)
+    if top:
+        df = df.head(int(top)).copy()
+    return df
+
+
+def evaluate_runs(datasets="fineweb-en", data_dir=DATA_DIR,
+                  metrics=("average_rank_score",), filters=None, after=None,
+                  lower_is_better=None, stitch=True):
+    """Score every discovered run and return one row per run as a DataFrame.
+
+    Scans ``datasets`` with :func:`discover_runs`, collapses resume chains to
+    their furthest-reaching segment (loaded whole) when ``stitch``, and reads
+    each log once. For every metric ``k`` the row carries ``k`` (its best-ever
+    value — min for error-like keys, max otherwise), ``k_iter`` (the iteration
+    it occurred at) and ``k_final`` (its last logged value); a run whose log is
+    missing or has no line for ``k`` gets NaN there.
+
+    ``metrics`` may be ``"auto"`` (``None``) to score ``rec_error`` plus every
+    semantic key found in the scanned logs. ``filters`` is a
+    ``{facet: value | [values]}`` dict over the discovery facets; ``after`` is a
+    date string dropping older config snapshots. The metric names actually
+    scored are also on ``df.attrs["metrics"]``. The ``refs`` column holds each
+    row's chain segments, ready for :func:`compare_metrics`.
+    """
+    auto = metrics is None or (isinstance(metrics, str) and metrics == "auto")
+    if not auto:
+        metrics = [metrics] if isinstance(metrics, str) else list(metrics)
+    lib = _lower_is_better_fn(lower_is_better)
+
+    records = _apply_facet_filters(discover_runs(datasets, data_dir), filters)
+    if after is not None:
+        cutoff = pd.to_datetime(after).timestamp()
+        records = [r for r in records if r["mtime"] >= cutoff]
+
+    loaded_chains = []
+    for rep, refs in _collapse_chains(records, stitch=stitch):
+        try:
+            loaded = load_metrics(*refs)
+        except FileNotFoundError:
+            loaded = None
+        loaded_chains.append((rep, refs, loaded))
+
+    if auto:
+        keyset = set()
+        for _rep, _refs, loaded in loaded_chains:
+            if loaded:
+                for d in loaded[2]:
+                    keyset.update(d)
+        metrics = ["rec_error"] + sorted(keyset)
+
+    rows = []
+    for rep, refs, loaded in loaded_chains:
+        scored = _score_loaded(loaded, metrics, lib) or {}
+        row = {
+            "stem": rep["stem"], "dataset": rep["dataset"], "name": rep["name"],
+            "decomposition": rep["decomposition"], "divergence": rep["divergence"],
+            "method": rep["method"], "order": rep["order"], "dim": rep["dim"],
+            "rank": rep["rank"], "subsample_frac": rep["subsample_frac"],
+            "max_nnz": rep["max_nnz"], "iters": rep["iters"],
+            "n_segments": len(refs),
+            "mtime": rep["mtime"],
+            "when": _dt.datetime.fromtimestamp(rep["mtime"]).strftime("%Y-%m-%d"),
+            "has_log": bool(loaded and loaded[0]),
+            "last_iter": scored.get("last_iter", np.nan),
+        }
+        for key in metrics:
+            row[key] = scored.get(key, np.nan)
+            row[f"{key}_iter"] = scored.get(f"{key}_iter", np.nan)
+            row[f"{key}_final"] = scored.get(f"{key}_final", np.nan)
+        row["refs"] = list(refs)
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df.attrs["metrics"] = list(metrics)
+    return df
+
+
+def find_best(metric="average_rank_score", datasets="fineweb-en", data_dir=DATA_DIR,
+              filters=None, thresholds=None, after=None, top=None,
+              extra_metrics=(), lower_is_better=None, stitch=True):
+    """Rank decomposition runs by their best-ever value of ``metric``.
+
+    Scores every run in ``datasets`` (see :func:`evaluate_runs`) and returns a
+    DataFrame sorted best-first — ascending for error-like metrics, descending
+    otherwise (override with ``lower_is_better``: a bool, or an iterable of
+    lower-better keys). ``rank_pos`` is the 1-based position.
+
+    Criteria narrow the field before ranking:
+
+    * ``filters`` — ``{facet: value | [values]}`` equality filters over the
+      discovery facets (``name``, ``method``, ``decomposition``, ``divergence``,
+      ``dim``, ``rank``, ``subsample_frac``, ``max_nnz``, ``iters``, ``order``,
+      ``dataset``). A list/set allows several values.
+    * ``thresholds`` — numeric cutoffs on any metric: a string
+      (``"rec_error < 0.5, simlex_all_rho > 0.3"``), a ``{key: (op, value)}``
+      dict, or a list of ``(key, op, value)``. A bare number means "at least"
+      for higher-better metrics, "at most" for error-like ones.
+    * ``after`` — drop runs whose config snapshot predates this date.
+
+    Every metric named in ``thresholds`` and ``extra_metrics`` is scored and
+    kept as a column alongside ``metric``. ``top`` truncates to the N best. The
+    ``refs`` column feeds :func:`compare_metrics` / :func:`plot_top` directly.
+    """
+    parsed = _parse_thresholds(thresholds)
+    score_metrics = list(dict.fromkeys(
+        [metric, *(k for k, _, _ in parsed), *extra_metrics]))
+    df = evaluate_runs(datasets, data_dir, metrics=score_metrics, filters=filters,
+                       after=after, lower_is_better=lower_is_better, stitch=stitch)
+    if df.empty or metric not in df.columns:
+        return df
+    ranked = _rank_df(df, metric, thresholds=parsed,
+                      lower_is_better=lower_is_better, top=top)
+    ranked = _order_columns(ranked, metric)
+    ranked.attrs["metrics"] = df.attrs.get("metrics", score_metrics)
+    return ranked
+
+
+def plot_top(ranked, metric="average_rank_score", n=5, ax=None, **compare_kw):
+    """Overlay the top ``n`` runs of a :func:`find_best` result on one figure.
+
+    Uses the ``refs`` column (already-resolved resume chains, so ``stitch`` is
+    off) and ``compare_metrics``: the ranking metric is drawn as the semantic
+    curve, or as the rec-error curve when it *is* ``rec_error``. The run names
+    go under the plot (``legend_loc="below"``, override via ``compare_kw``).
+    Extra keyword args pass through to :func:`compare_metrics`.
+    """
+    top = ranked.head(int(n))
+    configs = [list(r) for r in top["refs"]]
+    labels = list(top["stem"])
+    is_rec = metric in ("rec_error", "reconstruction_error")
+    compare_kw.setdefault("legend_loc", "below")
+    return compare_metrics(
+        configs, labels,
+        sem_keys=() if is_rec else (metric,),
+        plot_rec_error=is_rec,
+        title=f"Top {len(top)} by {metric}",
+        ax=ax, stitch=False, **compare_kw,
+    )
+
+
+# === interactive ranker ===============================================
+
+def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
+                    default_metric="dim_consistency"):
+    """Faceted widget front-end for :func:`find_best`.
+
+    Requires ``ipywidgets`` and an IPython kernel. Shares its whole scoring and
+    ranking core with :func:`find_best` — the same facet filters, metric
+    thresholds and best-ever ranking, driven from widgets rather than arguments.
+
+    Dataset checkboxes and facet drop-downs behave as in
+    :func:`make_run_browser`. Beyond them:
+
+    * **metric** — the column to rank on, populated from every metric found in
+      the logs of the checked datasets; error-like keys rank ascending.
+    * **thresholds** — free-text criteria, e.g.
+      ``rec_error < 0.5, simlex_all_rho > 0.3`` (comma/``and`` separated).
+    * **after** — drop runs whose snapshot predates the date.
+    * **top N** — keep only the N best (0 = all).
+
+    Changing the datasets or the stitch toggle rescans and re-scores; every
+    other control just re-filters and re-ranks the frame already in hand. The
+    ranked table renders below the controls; *Plot top* overlays its first few
+    rows via :func:`plot_top`, and the figure can be saved or fetched with
+    ``ranker.get_figure()`` / ``ranker.get_ranking()``.
+    """
+    try:
+        import ipywidgets as widgets
+        from IPython.display import clear_output, display
+    except ImportError as e:  # pragma: no cover - UI-only dependency
+        raise ImportError(
+            "make_run_ranker needs ipywidgets (and an IPython/Jupyter kernel). "
+            "Install with `pip install ipywidgets`."
+        ) from e
+
+    all_datasets = discover_datasets(data_dir)
+    if dataset is None:
+        initial = set(all_datasets)
+    else:
+        initial = {dataset} if isinstance(dataset, str) else set(dataset)
+    for ds in initial:
+        if ds not in all_datasets:
+            all_datasets.append(ds)
+    if not all_datasets:
+        raise FileNotFoundError(
+            f"No datasets with decomposition snapshots found under "
+            f"{Path(data_dir) / 'tensors'}."
+        )
+
+    plt.close("all")
+    state = {"full": None, "ranked": None, "fig": None, "mute": False}
+
+    dataset_chk = {
+        ds: widgets.Checkbox(value=(ds in initial), description=ds, indent=False,
+                             layout=widgets.Layout(width="auto", margin="0 12px 0 0"))
+        for ds in all_datasets
+    }
+    facet_dd = {
+        key: widgets.Dropdown(options=["(any)"], value="(any)", description=label,
+                              style={"description_width": "75px"},
+                              layout=widgets.Layout(width="235px"))
+        for label, key in _FACETS
+    }
+    metric_dd = widgets.Dropdown(options=[default_metric], value=default_metric,
+                                 description="metric",
+                                 style={"description_width": "55px"},
+                                 layout=widgets.Layout(width="260px"))
+    thresh_box = widgets.Text(value="", description="thresholds",
+                              placeholder="rec_error < 0.5, simlex_all_rho > 0.3",
+                              style={"description_width": "75px"},
+                              layout=widgets.Layout(width="60%"))
+    after_box = widgets.Text(value="", description="after", placeholder="YYYY-MM-DD",
+                             style={"description_width": "45px"},
+                             layout=widgets.Layout(width="190px"))
+    top_box = widgets.BoundedIntText(value=10, min=0, max=9999, description="top N",
+                                     style={"description_width": "45px"},
+                                     layout=widgets.Layout(width="130px"))
+    stitch_chk = widgets.Checkbox(value=True, description="stitch resume chains",
+                                  indent=False)
+    refresh_btn = widgets.Button(description="↻ Refresh", button_style="info",
+                                 layout=widgets.Layout(width="110px"))
+    nplot_box = widgets.BoundedIntText(value=5, min=1, max=20, description="plot top",
+                                       style={"description_width": "60px"},
+                                       layout=widgets.Layout(width="150px"))
+    plot_btn = widgets.Button(description="📈 Plot top",
+                              layout=widgets.Layout(width="120px"))
+    save_name = widgets.Text(value="ranker_top.png", description="save as",
+                             style={"description_width": "55px"},
+                             layout=widgets.Layout(width="240px"))
+    save_btn = widgets.Button(description="💾 Save", button_style="success",
+                              layout=widgets.Layout(width="90px"))
+    status = widgets.HTML()
+    table_out = widgets.Output()
+    plot_out = widgets.Output()
+
+    def _selected_datasets():
+        return {ds for ds, c in dataset_chk.items() if c.value}
+
+    def _facet_filters():
+        return {key: dd.value for key, dd in facet_dd.items() if dd.value != "(any)"}
+
+    def _populate_facets():
+        df = state["full"]
+        for key, dd in facet_dd.items():
+            vals = ([] if df is None or key not in df.columns
+                    else sorted(set(df[key].tolist()), key=_sortkey))
+            cur = dd.value
+            dd.options = ["(any)"] + vals
+            dd.value = cur if cur in dd.options else "(any)"
+
+    def _recompute(_evt=None):
+        sel = sorted(_selected_datasets())
+        if not sel:
+            state["full"] = None
+            status.value = "<b>No dataset selected.</b>"
+            _rerank()
+            return
+        state["mute"] = True
+        try:
+            df = evaluate_runs(sel, data_dir, metrics="auto",
+                               stitch=stitch_chk.value)
+            state["full"] = df
+            metrics = df.attrs.get("metrics", [default_metric]) or [default_metric]
+            cur = metric_dd.value
+            metric_dd.options = metrics
+            metric_dd.value = (cur if cur in metrics
+                               else default_metric if default_metric in metrics
+                               else metrics[0])
+            _populate_facets()
+        finally:
+            state["mute"] = False
+        _rerank()
+
+    def _rerank(_evt=None):
+        if state["mute"]:
+            return
+        df = state["full"]
+        if df is None or df.empty:
+            state["ranked"] = None
+            _render_table("No runs scored.")
+            return
+        metric = metric_dd.value
+        view = _facet_filter_df(df, _facet_filters())
+        note = ""
+        after = after_box.value.strip()
+        if after:
+            try:
+                view = view[view["mtime"] >= pd.to_datetime(after).timestamp()]
+            except Exception:
+                note = " &nbsp;|&nbsp; <span style='color:#c00'>unparsable 'after' date</span>"
+        try:
+            ranked = _rank_df(view, metric, thresholds=thresh_box.value,
+                              top=(top_box.value or None))
+        except (ValueError, KeyError) as e:
+            state["ranked"] = None
+            status.value = f"<b style='color:#c00'>{e}</b>"
+            _render_table("Fix the criteria above.")
+            return
+        state["ranked"] = _order_columns(ranked, metric)
+        asc = _lower_is_better_fn(None)(metric)
+        status.value = (
+            f"<b>{len(ranked)}</b> run(s) ranked by <code>{metric}</code> "
+            f"({'ascending' if asc else 'descending'}) &nbsp;|&nbsp; "
+            f"{len(view)} pass the filters &nbsp;|&nbsp; {len(df)} scored{note}")
+        _render_table()
+
+    def _render_table(empty_msg="No runs to show."):
+        with table_out:
+            clear_output(wait=True)
+            r = state["ranked"]
+            if r is None or len(r) == 0:
+                print(empty_msg)
+                return
+            show = r.drop(columns=[c for c in ("refs",) if c in r.columns])
+            with pd.option_context("display.max_columns", None, "display.width", 200,
+                                   "display.max_colwidth", 40):
+                display(show)
+
+    def _plot(_btn=None):
+        with plot_out:
+            clear_output(wait=True)
+            r = state["ranked"]
+            if r is None or len(r) == 0:
+                print("Nothing ranked to plot.")
+                return
+            fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
+            try:
+                plot_top(r, metric_dd.value, nplot_box.value, ax=ax)
+            except FileNotFoundError as e:
+                plt.close(fig)
+                state["fig"] = None
+                print(f"Log file missing:\n{e}")
+                return
+            state["fig"] = fig
+            plt.show()
+
+    def _save(_btn=None):
+        fig = state["fig"]
+        if fig is None:
+            status.value = "<b>Nothing to save</b> — plot the top runs first."
+            return
+        out = Path(save_name.value).expanduser()
+        if not out.suffix:
+            out = out.with_suffix(".png")
+        try:
+            fig.savefig(out, dpi=150, bbox_inches="tight")
+        except Exception as e:  # pragma: no cover - filesystem/IO errors
+            status.value = f"<b>Save failed:</b> {e}"
+            return
+        status.value = f"Saved to <code>{out.resolve()}</code>"
+
+    for c in dataset_chk.values():
+        c.observe(_recompute, "value")
+    stitch_chk.observe(_recompute, "value")
+    for dd in facet_dd.values():
+        dd.observe(_rerank, "value")
+    metric_dd.observe(_rerank, "value")
+    thresh_box.observe(_rerank, "value")
+    after_box.observe(_rerank, "value")
+    top_box.observe(_rerank, "value")
+    refresh_btn.on_click(_recompute)
+    plot_btn.on_click(_plot)
+    save_btn.on_click(_save)
+
+    _recompute()
+
+    datasets_box = widgets.VBox([
+        widgets.HTML("<b>Datasets</b> &nbsp;<small>(tick to include / rank across dirs)</small>"),
+        widgets.HBox(list(dataset_chk.values()), layout=widgets.Layout(flex_flow="row wrap")),
+    ])
+    filters_box = widgets.HBox(list(facet_dd.values()),
+                               layout=widgets.Layout(flex_flow="row wrap"))
+    controls = widgets.HBox([metric_dd, top_box, stitch_chk, after_box, refresh_btn],
+                            layout=widgets.Layout(flex_flow="row wrap"))
+    plot_row = widgets.HBox([nplot_box, plot_btn, save_name, save_btn],
+                            layout=widgets.Layout(flex_flow="row wrap"))
+    ui = widgets.VBox([datasets_box, filters_box, controls, thresh_box, status,
+                       table_out, plot_row, plot_out])
+    ui.get_figure = lambda: state["fig"]
+    ui.get_ranking = lambda: state["ranked"]
     display(ui)
     return ui
 

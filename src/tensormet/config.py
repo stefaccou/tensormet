@@ -93,6 +93,23 @@ def parse_raw_ngram_orders(type_str: str) -> Optional[list]:
         orders.append(n)
     return sorted(set(orders)) if orders else None
 
+
+def infer_ngram_order(*labels: Optional[str]) -> Optional[int]:
+    """Infer the tensor order from an n-gram label such as
+    '5-gram-fineweb-en_10000000' or '4-gram-raw-fineweb-en_100000000'.
+
+    Scans each label for a leading '<n>gram' / '<n>-gram' token (optionally
+    'raw-' prefixed). Returns the first match as an int, or None if no label
+    carries one (e.g. plain 'fineweb-en').
+    """
+    for label in labels:
+        if not label:
+            continue
+        m = re.match(r"(?:raw-?)?(\d+)-?gram\b", str(label).strip().lower())
+        if m:
+            return int(m.group(1))
+    return None
+
 @dataclass(frozen=True)
 class TrainingConfig:
     n_iter_max: int = 1000

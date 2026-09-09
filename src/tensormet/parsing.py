@@ -33,6 +33,7 @@ from tensormet.config import (
     PopulationRunConfig,
     parse_ngram_order,
     parse_raw_ngram_order,
+    infer_ngram_order,
 )
 
 
@@ -394,6 +395,14 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parsed = parser.parse_args(args=argv)
     parsed_dict = vars(parsed)
 
+    # Infer --order from an n-gram dataset/name label (e.g. --dataset
+    # "5-gram-fineweb-en_10000000") when it was not passed explicitly. Falls
+    # through to the ExperimentConfig default if nothing matches.
+    if parsed_dict.get("order") is None:
+        inferred_order = infer_ngram_order(parsed_dict.get("dataset"), parsed_dict.get("name"))
+        if inferred_order is not None:
+            print(f"[parsing] --order not given; inferred order={inferred_order} from n-gram label")
+            parsed_dict["order"] = inferred_order
 
     # Resolve "all" sentinel for shared_factors now that order is known
     if parsed_dict.get("shared_factors") == "all":

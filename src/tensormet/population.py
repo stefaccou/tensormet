@@ -2,6 +2,7 @@ from math import log, prod
 from collections import Counter, defaultdict
 from pathlib import Path
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import multiprocessing
 import torch
@@ -727,15 +728,16 @@ def _update_counter_from_grouped(counter: Counter, grouped: pa.Table, key_cols: 
     cols = [grouped[c].to_pylist() for c in key_cols]
     counts = grouped[count_col].to_pylist()
 
+    # intern: dedupe repeated token strings across batches
     if len(key_cols) == 1:
         keys = cols[0]
         for k, c in zip(keys, counts):
-            counter[k] += int(c)
+            counter[sys.intern(k)] += int(c)
     else:
         # Dynamically handle 2, 3, 4, ... N columns
         for row in zip(*cols, counts):
             *keys, c = row
-            counter[tuple(keys)] += int(c)
+            counter[tuple(sys.intern(k) for k in keys)] += int(c)
 
 def _hapax_report_and_filter(subset_counters: dict) -> dict:
     """
