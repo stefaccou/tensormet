@@ -53,9 +53,11 @@ from tensormet.tt_hybrid.tt_chain import (
     left_envs, right_envs, site_grad, sites,
 )
 from tensormet.tt_hybrid.tt_ops import (
+    MU_RATIO_MAX,
     _colsum_batch,
     _run_nnz_batches,
     _scatter_add,
+    _xhat_floor,
     estimate_batch_nnz_tt,
     tt_sum_all_entries,
 )
@@ -91,6 +93,7 @@ def _tt_partial_factor_num_for_shard(
     cp.cuda.Device(device_id).use()
     tt_cores_d = [cp.asarray(C) for C in tt_cores_np]
     factors_d = [cp.asarray(f) for f in factors_np]
+    xf = _xhat_floor(tt_cores_d, factors_d, shape, epsilon)
     out = cp.zeros_like(factors_d[mode])
 
     idxs, vals = coo_to_coords(shard, shape)
@@ -111,9 +114,10 @@ def _tt_partial_factor_num_for_shard(
         mats = [factors_d[n][idxs[n][start:end]] for n in range(n_modes)]
         S = sites(tt_cores_d, mats, cp)
         L, R = left_envs(S, cp), right_envs(S, cp)
-        xhat = cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
+        xhat = cp.clip(L[n_modes][:, 0], a_min=xf, a_max=None)
         Z = site_grad(L[mode], tt_cores_d[mode], R[mode + 1], cp)
-        _scatter_add(out, idxs[mode][start:end], vals[start:end] / xhat, Z)
+        w = cp.minimum(vals[start:end] / xhat, MU_RATIO_MAX)
+        _scatter_add(out, idxs[mode][start:end], w, Z)
 
     _run_nnz_batches(nnz, batch_nnz, _body, desc=f"shard factor {mode}")
 
@@ -145,6 +149,7 @@ def _tt_partial_tied_factor_num_for_shard(
     cp.cuda.Device(device_id).use()
     tt_cores_d = [cp.asarray(C) for C in tt_cores_np]
     factors_d = [cp.asarray(f) for f in factors_np]
+    xf = _xhat_floor(tt_cores_d, factors_d, shape, epsilon)
     group = list(group)
     out = cp.zeros_like(factors_d[group[0]])
 
@@ -164,7 +169,8 @@ def _tt_partial_tied_factor_num_for_shard(
         mats = [factors_d[k][idxs[k][start:end]] for k in range(n_modes)]
         S = sites(tt_cores_d, mats, cp)
         L, R = left_envs(S, cp), right_envs(S, cp)
-        w = vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
+        w = cp.minimum(vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=xf, a_max=None),
+                       MU_RATIO_MAX)
         for n in group:
             Z = site_grad(L[n], tt_cores_d[n], R[n + 1], cp)
             _scatter_add(out, idxs[n][start:end], w, Z)
@@ -197,6 +203,7 @@ def _tt_partial_core_num_for_shard(
     cp.cuda.Device(device_id).use()
     tt_cores_d = [cp.asarray(C) for C in tt_cores_np]
     factors_d = [cp.asarray(f) for f in factors_np]
+    xf = _xhat_floor(tt_cores_d, factors_d, shape, epsilon)
     num = cp.zeros_like(tt_cores_d[site])
 
     idxs, vals = coo_to_coords(shard, shape)
@@ -215,7 +222,8 @@ def _tt_partial_core_num_for_shard(
         mats = [factors_d[n][idxs[n][start:end]] for n in range(n_modes)]
         S = sites(tt_cores_d, mats, cp)
         L, R = left_envs(S, cp), right_envs(S, cp)
-        w = vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
+        w = cp.minimum(vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=xf, a_max=None),
+                       MU_RATIO_MAX)
         # Σ_p w_p · outer(L_k[p], A_k row, R_{k+1}[p]) as one GEMM.
         LW = (L[site] * w[:, None])[:, :, None] * mats[site][:, None, :]
         num[...] += (LW.reshape(end - start, -1).T @ R[site + 1]).reshape(num.shape)
@@ -249,6 +257,7 @@ def _tt_partial_kl_error_for_shard(
     cp.cuda.Device(device_id).use()
     tt_cores_d = [cp.asarray(C) for C in tt_cores_np]
     factors_d = [cp.asarray(f) for f in factors_np]
+    xf = _xhat_floor(tt_cores_d, factors_d, shape, epsilon)
 
     idxs, vals = coo_to_coords(shard, shape)
     nnz_full = int(vals.size)
@@ -273,7 +282,7 @@ def _tt_partial_kl_error_for_shard(
         mats = [factors_d[n][idxs[n][start:end]] for n in range(n_modes)]
         # Only the left sweep is needed for x̂.
         xhat = cp.clip(left_envs(sites(tt_cores_d, mats, cp), cp)[n_modes][:, 0],
-                       a_min=epsilon, a_max=None)
+                       a_min=xf, a_max=None)
         x_b = x_nz[start:end]
         # Both reductions before either accumulation, so a retry cannot
         # double-count the first.
@@ -391,6 +400,7 @@ def _sharded_tt_tied_factor_update(
     shape: Tuple[int, ...],
     epsilon: float = 1e-12,
     batch_nnz: Optional[int] = None,
+    power: Optional[float] = None,
     verbose: bool = False,
     subsample_frac: float = 1.0,
     iter_seed: Optional[int] = None,
@@ -401,6 +411,10 @@ def _sharded_tt_tied_factor_update(
     One fan-out/fan-in cycle for the whole group (the pooled numerator is a
     single (I, R) reduce), against |group| cycles for the per-mode updates it
     replaces. Every tied mode's core is rescaled in place on the primary.
+
+    The pooled ratio is undamped by default (``power`` is its exponent, default
+    1), exactly as the single-GPU ``tt_kl_tied_factor_update``. Pass
+    ``power=1/|group|`` to damp it.
     """
     if verbose:
         print(f"  [TT-KL/sharded] Updating tied factor group {tuple(group)}...")
@@ -440,7 +454,13 @@ def _sharded_tt_tied_factor_update(
     num_np = np.add.reduce(partials)
 
     with cp.cuda.Device(primary):
-        A_new = cp.clip(A * (cp.asarray(num_np) / den), a_min=epsilon, a_max=None)
+        # Undamped pooled ratio by default (see tt_kl_tied_factor_update for the
+        # full argument); power=1/|group| restores the damped step.
+        ratio = cp.clip(cp.asarray(num_np), a_min=0.0, a_max=None) / den
+        gamma = 1.0 if power is None else float(power)
+        if gamma != 1.0:
+            ratio = ratio ** gamma
+        A_new = cp.clip(A * ratio, a_min=epsilon, a_max=None)
         scale = cp.clip(cp.sum(A_new, axis=0), a_min=epsilon, a_max=None)
         for n in group:
             tt_cores[n] *= scale[None, :, None]

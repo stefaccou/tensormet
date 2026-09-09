@@ -136,7 +136,7 @@ class DimConsistencyJudge:
             target = self.target_device
         else:
             target = torch.device(0) if torch.cuda.is_available() else torch.device("cpu")
-        print(f"Loading dimension-consistency judge {self.model_name!r} onto {target} (fp16)...")
+        print(f"Loading dimension-consistency judge {self.model_name!r} (fp16)...")
         try:
             self._load_on(target)
         except torch.cuda.OutOfMemoryError:

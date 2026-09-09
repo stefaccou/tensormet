@@ -44,6 +44,11 @@ MAX_BATCH_ALLOC_BYTES = int(os.environ.get(
 # Floor for the OOM back-off.
 MIN_BATCH_NNZ = 256
 
+# Ceiling on the KL multiplicative ratio x/x̂. With a healthy init x̂ tracks x and
+# this never binds; it exists so a degenerate x̂ yields a large-but-finite
+# (diagnosable) step instead of inf → nan.
+MU_RATIO_MAX = 1e30
+
 
 def _quantize_batch(n):
     """Round ``n`` down to ~1/32 resolution, so repeated estimates return the
@@ -141,10 +146,31 @@ def _run_nnz_batches(nnz, batch_nnz, body, verbose=False, desc=None):
 
 def tt_sum_all_entries(tt_cores, factors, epsilon=1e-12):
     """Σ over ALL entries of X̂, in closed form (TT analogue of
-    distance._tucker_sum_all_entries)."""
+    distance._tucker_sum_all_entries).
+
+    Run in float64: one (1, ρ) vector per site, so the cost is nil, and the
+    N-fold chain product no longer overflows fp32 at high order/rank/dim. Cast
+    back at the end.
+    """
     sums = _colsum_batch(factors, epsilon)
-    return cp.clip(left_envs(sites(tt_cores, sums, cp), cp)[len(tt_cores)][0, 0],
-                   a_min=epsilon, a_max=None)
+    cores64 = [C.astype(cp.float64) for C in tt_cores]
+    sums64 = [s.astype(cp.float64) for s in sums]
+    total = left_envs(sites(cores64, sums64, cp), cp)[len(tt_cores)][0, 0]
+    return cp.clip(total.astype(factors[0].dtype), a_min=epsilon, a_max=None)
+
+
+def _xhat_floor(tt_cores, factors, shape, epsilon):
+    """Zero-lock floor for x̂, scaled to the model's mean entry Σx̂ / Π Iₙ.
+
+    A fixed ``epsilon`` floor lands inside x̂'s own range once the mean entry
+    nears it (order ≈6 at dim 1000): every x̂ clips to the constant, the KL
+    error collapses to a data-only closed form (Δ ≡ 0), and every MU ratio goes
+    uniform. Scaling by the mean keeps the guard purely relative — same
+    behaviour at any order.
+    """
+    n_cells = int(np.prod(shape, dtype=object))
+    mean_xhat = float(tt_sum_all_entries(tt_cores, factors, epsilon)) / n_cells
+    return max(float(np.finfo(factors[0].dtype).tiny), epsilon * mean_xhat)
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +209,7 @@ def tt_kl_factor_update(vec_tensor, core, factors, mode, shape,
         site_grad(left_envs(S_sum, cp)[mode], tt_cores[mode], right_envs(S_sum, cp)[mode + 1], cp),
         a_min=epsilon, a_max=None,
     )  # (1, R_mode)
+    xf = _xhat_floor(tt_cores, factors, shape, epsilon)
 
     num = cp.zeros_like(A)
     if nnz:
@@ -193,9 +220,10 @@ def tt_kl_factor_update(vec_tensor, core, factors, mode, shape,
             mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
             S = sites(tt_cores, mats, cp)
             L, R = left_envs(S, cp), right_envs(S, cp)
-            xhat = cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
+            xhat = cp.clip(L[n_modes][:, 0], a_min=xf, a_max=None)
             Z = site_grad(L[mode], tt_cores[mode], R[mode + 1], cp)
-            _scatter_add(num, idxs[mode][start:end], vals[start:end] / xhat, Z)
+            w = cp.minimum(vals[start:end] / xhat, MU_RATIO_MAX)
+            _scatter_add(num, idxs[mode][start:end], w, Z)
 
         _run_nnz_batches(nnz, batch_nnz, _body, verbose, f"  [TT-KL] factor {mode}")
 
@@ -227,6 +255,9 @@ def tt_kl_tied_factor_update(vec_tensor, core, factors, group, shape,
     The ℓ1 rescale is applied to EVERY tied mode's core, so the reparametrization
     stays exact — absorbing it into one core only (as the single-leg kernel must)
     leaves the other legs uncompensated and multiplies x̂ by s^-(|group|-1).
+
+    ``power`` is the exponent on the pooled ratio; it defaults to 1 (undamped).
+    Pass ``power=1/|group|`` to restore the damped step.
     """
     if verbose:
         print(f"  [TT-KL] Updating tied factor group {tuple(group)}...")
@@ -245,6 +276,7 @@ def tt_kl_tied_factor_update(vec_tensor, core, factors, group, shape,
         den += site_grad(left_envs(S_sum, cp)[n], tt_cores[n],
                          right_envs(S_sum, cp)[n + 1], cp)
     den = cp.clip(den, a_min=epsilon, a_max=None)
+    xf = _xhat_floor(tt_cores, factors, shape, epsilon)
 
     num = cp.zeros_like(A)
     if nnz:
@@ -255,7 +287,8 @@ def tt_kl_tied_factor_update(vec_tensor, core, factors, group, shape,
             mats = [factors[k][idxs[k][start:end]] for k in range(n_modes)]
             S = sites(tt_cores, mats, cp)
             L, R = left_envs(S, cp), right_envs(S, cp)
-            w = vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
+            w = cp.minimum(vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=xf, a_max=None),
+                           MU_RATIO_MAX)
             for n in group:
                 Z = site_grad(L[n], tt_cores[n], R[n + 1], cp)
                 _scatter_add(num, idxs[n][start:end], w, Z)
@@ -263,11 +296,13 @@ def tt_kl_tied_factor_update(vec_tensor, core, factors, group, shape,
         _run_nnz_batches(nnz, batch_nnz, _body, verbose,
                          f"  [TT-KL] tied factors {tuple(group)}")
 
-    # Damped by 1/|group| unless overridden: the pooled ratio has the right
-    # fixed point but not the MM guarantee, since x̂ is degree-|group| in a tied
-    # factor. See tucker_tied_factor_update for the full argument.
+    # Undamped pooled ratio by default. It has the right fixed point but not the
+    # MM monotonicity guarantee (x̂ is degree-|group| in a tied factor); in
+    # practice it converges, whereas the old 1/|group| damping shrank the step
+    # too far to make progress at production rank/scale. power=1/|group| restores
+    # it. See tucker_tied_factor_update for the full argument.
     ratio = cp.clip(num, a_min=0.0, a_max=None) / den
-    gamma = (1.0 / len(group)) if power is None else float(power)
+    gamma = 1.0 if power is None else float(power)
     if gamma != 1.0:
         ratio = ratio ** gamma
     A_new = cp.clip(A * ratio, a_min=epsilon, a_max=None)
@@ -307,6 +342,7 @@ def tt_kl_core_update(vec_tensor, shape, core, factors, modes=None,
         batch_nnz = estimate_batch_nnz_tt(tt_cores, factors)
 
     sums = _colsum_batch(factors, epsilon)
+    xf = _xhat_floor(tt_cores, factors, shape, epsilon)
     for k in range(n_modes):
         S_sum = sites(tt_cores, sums, cp)
         Ls, Rs = left_envs(S_sum, cp), right_envs(S_sum, cp)
@@ -321,7 +357,8 @@ def tt_kl_core_update(vec_tensor, shape, core, factors, modes=None,
             mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
             S = sites(tt_cores, mats, cp)
             L, R = left_envs(S, cp), right_envs(S, cp)
-            w = vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=epsilon, a_max=None)
+            w = cp.minimum(vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=xf, a_max=None),
+                           MU_RATIO_MAX)
             # Σ_p w_p · outer(L_k[p], A_k row, R_{k+1}[p]) as one GEMM.
             LW = (L[k] * w[:, None])[:, :, None] * mats[k][:, None, :]   # (b, ρ_k, R_k)
             # [...] so the accumulation stays in place and needs no nonlocal.
@@ -359,6 +396,7 @@ def tt_kl_compute_errors(vec_tensor, shape, core, factors,
         return cp.asarray(float("nan"), dtype=sum_all.dtype)
 
     x_nz = cp.clip(cp.asarray(vals), a_min=epsilon, a_max=None)
+    xf = _xhat_floor(tt_cores, factors, shape, epsilon)
     if batch_nnz is None:
         batch_nnz = estimate_batch_nnz_tt(tt_cores, factors)
 
@@ -369,7 +407,7 @@ def tt_kl_compute_errors(vec_tensor, shape, core, factors,
         mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
         # Only the left sweep is needed for x̂.
         xhat = cp.clip(left_envs(sites(tt_cores, mats, cp), cp)[n_modes][:, 0],
-                       a_min=epsilon, a_max=None)
+                       a_min=xf, a_max=None)
         x_b = x_nz[start:end]
         # Both reductions before either accumulation, so a retry cannot
         # double-count the first.
@@ -394,9 +432,12 @@ def initialize_tucker_tt(sparse_tensor, shape, rank, modes, init, random_state,
 
     Factors come from the existing Tucker init (``sparse_ops.initialize_nonnegative_tucker``,
     called with ``with_core=False``): the dense core it would otherwise build is
-    exactly the object this format exists to avoid. The TT cores start
-    uniform-random and are then rescaled once so that Σ_all x̂ = Σ x, which is
-    where the KL MU wants to begin.
+    exactly the object this format exists to avoid. Factor columns are then
+    ℓ1-normalized — the invariant every factor update maintains, which init
+    never established; unnormalized columns (random-init sums ~I/2) blow the
+    closed-form chain sum past fp32 at order ≥ 6. The TT cores start
+    uniform-random and the Σ_all x̂ = Σ x rescale is spread evenly over all N of
+    them, so none carries an extreme magnitude.
 
     Returns
     -------
@@ -426,13 +467,23 @@ def initialize_tucker_tt(sparse_tensor, shape, rank, modes, init, random_state,
         )
 
     factors = [cp.clip(cp.abs(cp.asarray(f)), a_min=1e-30, a_max=None) for f in factors]
+    factors = [f / cp.clip(cp.sum(f, axis=0, keepdims=True), a_min=epsilon, a_max=None)
+               for f in factors]
     dtype = factors[0].dtype
     tt_cores = [cp.asarray(rng.random_sample(s) + 0.01, dtype=dtype)
                 for s in core_shapes(rank, tt_rank)]
 
     _idxs, vals = coo_to_coords(sparse_tensor, tuple(int(s) for s in shape))
     sum_x = cp.clip(cp.sum(vals), a_min=epsilon, a_max=None)
-    tt_cores[0] *= sum_x / tt_sum_all_entries(tt_cores, factors, epsilon=epsilon)
+    sum_all = tt_sum_all_entries(tt_cores, factors, epsilon=epsilon)
+    if not bool(cp.isfinite(sum_all)) or float(sum_all) <= 0.0:
+        raise FloatingPointError(
+            f"TT init chain sum is {float(sum_all)!r} (columns ℓ1-normalized, "
+            f"cores ~U[0.01, 1.01]); cannot rescale. Check rank/tt_rank/shape."
+        )
+    scale = (sum_x / sum_all) ** (1.0 / len(tt_cores))
+    for k in range(len(tt_cores)):
+        tt_cores[k] *= scale
     return tt_cores, factors
 
 
