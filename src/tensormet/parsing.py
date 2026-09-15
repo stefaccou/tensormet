@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 import argparse
 import json
 
+from tensormet.utils import resolve_shared_factors
 from tensormet.config import (
     ExperimentConfig,
     TrainingConfig,
@@ -404,11 +405,6 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
             print(f"[parsing] --order not given; inferred order={inferred_order} from n-gram label")
             parsed_dict["order"] = inferred_order
 
-    # Resolve "all" sentinel for shared_factors now that order is known
-    if parsed_dict.get("shared_factors") == "all":
-        n = parsed_dict.get("order") or default_exp.order
-        parsed_dict["shared_factors"] = tuple(sorted((i, j) for i in range(n) for j in range(i + 1, n)))
-
     # Build new ExperimentConfig from defaults, overriding only provided values
     exp_kwargs = {}
     for field in ("dataset", "method", "order", "divergence", "dim", "name",
@@ -714,11 +710,9 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
     if d.get("top_ks_asymmetric") is not None and d.get("top_ks") is None:
         d["top_ks"] = ()
 
-    # Resolve "all" sentinel for shared_factors using cols_to_build length
     if d.get("shared_factors") == "all":
         cols = d.get("cols_to_build") or default_exp.cols_to_build
-        n = len(cols)
-        d["shared_factors"] = tuple(sorted((i, j) for i in range(n) for j in range(i + 1, n)))
+        d["shared_factors"] = resolve_shared_factors("all", len(cols))
 
     exp_kwargs = {}
     for f in (

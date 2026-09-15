@@ -47,7 +47,7 @@ import numpy as np
 
 from tensormet.utils import make_lazy_cupy_pair
 from tensormet.distance import coo_to_coords
-from tensormet.sharded_sparse import _apply_subsample
+from tensormet.sharded_sparse import apply_subsample
 from tensormet.experimental.CP.cp_ops import (
     _cp_absorb_into_weights,
     _cp_fr_mu_step,
@@ -102,7 +102,7 @@ def _cp_partial_numerator_for_shard(
     if subsample_frac < 1.0:
         # Numerators are LINEAR in the values, so rescaling by 1/frac here is
         # the unbiased choice (contrast the error workers below).
-        idxs, vals = _apply_subsample(idxs, vals, subsample_frac, iteration)
+        idxs, vals = apply_subsample(idxs, vals, subsample_frac, iteration)
 
     nnz = int(vals.size)
     if batch_nnz is None:
@@ -149,7 +149,7 @@ def _cp_partial_fr_error_for_shard(
 
     weight = 1.0
     if subsample_frac < 1.0:
-        idxs, vals = _apply_subsample(idxs, vals, subsample_frac, iteration,
+        idxs, vals = apply_subsample(idxs, vals, subsample_frac, iteration,
                                       rescale=False)
         weight = nnz_full / int(vals.size)
 
@@ -199,7 +199,7 @@ def _cp_partial_kl_error_for_shard(
 
     weight = 1.0
     if subsample_frac < 1.0:
-        idxs, vals = _apply_subsample(idxs, vals, subsample_frac, iteration,
+        idxs, vals = apply_subsample(idxs, vals, subsample_frac, iteration,
                                       rescale=False)
         weight = nnz_full / int(vals.size)
 

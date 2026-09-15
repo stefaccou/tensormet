@@ -243,7 +243,7 @@ def _build_shard(
 
     When *shuffle_seed* is given (subsampling enabled), the slice is uniformly
     shuffled before the shard is built, so that the contiguous windows taken by
-    ``_apply_subsample`` are uniform samples without replacement.  COO entry order
+    ``apply_subsample`` are uniform samples without replacement.  COO entry order
     carries no meaning for any downstream accumulation (sums are order-invariant;
     ``cp.unique`` re-sorts its input), so the shuffle is content-preserving. The
     permutation is drawn host-side on both paths (deterministic, and identical
@@ -272,7 +272,7 @@ def _build_shard(
     data_np = cp.asnumpy(coo.data[start:end])
 
     # The one-time shuffle replaces the per-iteration cp.random.permutation in
-    # _apply_subsample; the gather runs on the target device (_gather_permuted).
+    # apply_subsample; the gather runs on the target device (_gather_permuted).
     if perm_np is not None:
         row_cp, col_cp, data_cp = _gather_permuted_with_fallback(
             [row_np, col_np, data_np], perm_np, target_device
@@ -288,7 +288,7 @@ def _build_shard(
     return shard
 
 
-def _apply_subsample(
+def apply_subsample(
     idxs: List[cp.ndarray],
     vals: cp.ndarray,
     subsample_frac: float,
@@ -298,50 +298,18 @@ def _apply_subsample(
     """
     Take this iteration's contiguous NNZ window from pre-shuffled storage.
 
-    CHANGED (2026-06-12 review, Task 2): previously this drew
-    ``cp.sort(rng.permutation(nnz)[:n_sample])`` — an 8·nnz-byte int64
-    allocation plus a full device sort, *per shard per call*, on exactly the
-    GPUs subsampling is meant to relieve.  The shard's NNZ arrays are now
-    shuffled once at construction (``_build_shard(shuffle_seed=...)``), so a
-    contiguous window ``[(iteration·n_sample) % nnz : +n_sample)`` (wrapping)
-    is a uniform sample without replacement.
+    The shard's NNZ arrays are shuffled once at construction
+    (``_build_shard(shuffle_seed=...)``), so a contiguous window
+    ``[(iteration·n_sample) % nnz : +n_sample)`` (wrapping) is a uniform
+    sample without replacement, and every entry is visited once per
+    ⌈nnz/n_sample⌉ iterations. ``iteration=None`` is treated as 0.
 
-    Estimator argument: the construction shuffle makes every length-n_sample
-    contiguous window a uniformly distributed size-n_sample subset, so any
-    linear accumulation over the rescaled window is unbiased
-    (``E[sum_S x/frac] = sum x``).  Successive windows tile the shard like an
-    epoch: every entry is visited once per ⌈nnz/n_sample⌉ iterations.
-
-    Memory: slicing is O(1) (CuPy views); only the value rescale and the rare
-    wrap-around concatenation allocate, both O(n_sample) — never O(nnz).
-
-    Parameters
-    ----------
-    idxs, vals :
-        Per-mode coordinate arrays and values from ``coo_to_coords`` on a
-        shard built with ``shuffle_seed`` set (i.e. already in shuffled order).
-        CHANGED: windows the N coordinate arrays rather than one flat index,
-        which coordinate-backed shards never form. Same window arithmetic.
-    subsample_frac :
-        Fraction of NNZ to retain.  Must be < 1.0 (caller is responsible
-        for not calling this at 1.0).
-    iteration :
-        Training-loop iteration number; selects the window.  ``None`` is
-        treated as 0 (deterministic given (construction seed, iteration) —
-        no RNG state survives between calls, so resumed runs draw the same
-        windows as uninterrupted ones).
-    rescale :
-        When True (default) values are multiplied by ``1/frac`` so that a
-        **linear** accumulation over the window is unbiased — correct for the
-        MU numerators.  When False the raw windowed values are returned; the
-        caller must instead weight the *summed* result by ``nnz/n_sample``.
-        This is the unbiased path for **nonlinear** error terms
-        (``x·log(x/r)``, ``x²``), where rescaling the values would inject a
-        ``1/frac`` bias inside the nonlinearity (review finding I-1).
-
-    Returns
-    -------
-    idxs_s, vals_s : windowed arrays (values rescaled iff ``rescale``).
+    ``rescale=True`` (default) multiplies values by ``1/frac`` so a linear
+    accumulation over the window is unbiased — correct for MU numerators.
+    ``rescale=False`` returns the raw windowed values; the caller must
+    instead weight the *summed* result by ``nnz/n_sample`` — needed for
+    nonlinear error terms (``x·log(x/r)``, ``x²``), where rescaling the
+    values first would bias the nonlinearity.
     """
     nnz = int(vals.size)
     n_sample = max(1, int(round(subsample_frac * nnz)))
@@ -388,7 +356,7 @@ def _partial_numerator_for_shard(
     Runs entirely inside ``cp.cuda.Device(device_id)``.  When
     ``subsample_frac < 1.0`` the shard's NNZ is subsampled locally before
     accumulation — no resharding is needed.  *iteration* selects the
-    contiguous window of the pre-shuffled shard (see ``_apply_subsample``).
+    contiguous window of the pre-shuffled shard (see ``apply_subsample``).
 
     ``core_np`` and ``factors_np`` may be NumPy arrays *or* CuPy arrays
     already resident on ``device_id``.  ``cp.asarray`` is a no-op in the
@@ -450,10 +418,10 @@ def _partial_numerator_for_shard(
             return zero, (zero.copy() if masked else None)
 
         if subsample_frac < 1.0:
-            idxs, vals = _apply_subsample(idxs, vals, subsample_frac, iteration)
+            idxs, vals = apply_subsample(idxs, vals, subsample_frac, iteration)
 
         # Under subsampling the numerator's `vals` are already rescaled by 1/frac
-        # (see _apply_subsample). The masked denominator weights (unit / x̂) must be
+        # (see apply_subsample). The masked denominator weights (unit / x̂) must be
         # rescaled identically so the MU ratio stays unbiased; the factor cancels in
         # the ratio but only if both sides carry it.
         den_scale = (1.0 / subsample_frac) if subsample_frac < 1.0 else 1.0
@@ -825,7 +793,7 @@ def _partial_core_num_for_shard(
 
     When ``subsample_frac < 1.0`` the shard's NNZ is subsampled before both
     passes, so the two-pass KL structure operates on the same sampled subset
-    (the window selected by *iteration*; see ``_apply_subsample``).
+    (the window selected by *iteration*; see ``apply_subsample``).
 
     ``core_np`` and ``factors_np`` may be NumPy arrays *or* CuPy arrays
     already resident on ``device_id``.  ``cp.asarray`` is a no-op in the
@@ -854,11 +822,11 @@ def _partial_core_num_for_shard(
         return zero, (zero.copy() if masked else None)
 
     if subsample_frac < 1.0:
-        idxs, xvals = _apply_subsample(idxs, xvals, subsample_frac, iteration)
+        idxs, xvals = apply_subsample(idxs, xvals, subsample_frac, iteration)
         nnz = int(xvals.size)
 
     # Rescale the masked denominator weights to match the 1/frac rescaling that
-    # _apply_subsample applied to xvals (the numerator), so the MU ratio is unbiased.
+    # apply_subsample applied to xvals (the numerator), so the MU ratio is unbiased.
     den_scale = (1.0 / subsample_frac) if subsample_frac < 1.0 else 1.0
 
     Num = cp.zeros_like(core_d)
@@ -1073,7 +1041,7 @@ def _partial_kl_error_for_shard(
     # nonlinearity-safe). frac == 1 → no sampling, weight == 1.
     weight = 1.0
     if subsample_frac < 1.0:
-        idxs, x_nz = _apply_subsample(idxs, x_nz, subsample_frac, iteration, rescale=False)
+        idxs, x_nz = apply_subsample(idxs, x_nz, subsample_frac, iteration, rescale=False)
         weight = nnz_full / int(x_nz.size)
 
     nnz = int(x_nz.size)
@@ -1217,7 +1185,7 @@ def _partial_fr_error_for_shard(
 
     weight = 1.0
     if subsample_frac < 1.0:
-        idxs, x_nz = _apply_subsample(idxs, x_nz, subsample_frac, iteration, rescale=False)
+        idxs, x_nz = apply_subsample(idxs, x_nz, subsample_frac, iteration, rescale=False)
         weight = nnz_full / int(x_nz.size)
 
     nnz = int(x_nz.size)

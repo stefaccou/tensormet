@@ -16,7 +16,7 @@ import torch
 
 from tensormet.tucker_tensor import TuckerDecomposition
 from tensormet.utils import (
-    _to_np,
+    to_np,
     extract_roles_from_vocab,
     make_lazy_cupy_pair,
     np_dispatch,
@@ -75,7 +75,7 @@ class TuckerTTDecomposition(TuckerDecomposition):
         return self.core
 
     def _tt_np(self) -> List[np.ndarray]:
-        return [_to_np(C) for C in self.tt_cores]
+        return [to_np(C) for C in self.tt_cores]
 
     def get_rank(self, role=None):
         """Tucker rank of a role's factor — read off the factor, not the core."""
@@ -101,7 +101,7 @@ class TuckerTTDecomposition(TuckerDecomposition):
         for store in (self.tt_cores, self.factors):
             for i, a in enumerate(store):
                 if isinstance(a, torch.Tensor):
-                    store[i] = cp.array(_to_np(a))
+                    store[i] = cp.array(to_np(a))
 
     # --- Scoring (TT-native: a chain of matrix products, never R^N) ------
     def score_scalar(self, triple: Tuple[str, ...]) -> float:
@@ -130,7 +130,7 @@ class TuckerTTDecomposition(TuckerDecomposition):
         at the target site; the target's own latent is never gathered."""
         target = self.get_role_index(role_name)
         device = self.factors[0].device
-        tt_cores = [C if isinstance(C, torch.Tensor) else torch.as_tensor(_to_np(C))
+        tt_cores = [C if isinstance(C, torch.Tensor) else torch.as_tensor(to_np(C))
                     for C in self.tt_cores]
         tt_cores = [C.to(device=device, dtype=self.factors[0].dtype) for C in tt_cores]
 

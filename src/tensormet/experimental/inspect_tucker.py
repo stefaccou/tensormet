@@ -423,6 +423,36 @@ def resume_chain(cfg):
     return tuple(ref for n, ref in segments if n < iters) + (cfg,)
 
 
+def resolve_iters(insp):
+    """Return ``insp``, or a copy pointing at whatever iteration count actually exists.
+
+    ``InspectionConfig.iters`` is baked into the stem's trailing ``_{n}i`` token,
+    so a config built for ``iters=500`` finds nothing on disk if that run was
+    never resumed to exactly 500 (e.g. it only ever ran to 1000, or is still
+    sitting at 200). This globs the run's directory for sibling logs that
+    differ only in that iteration token and swaps in the best match: the
+    highest available count that does not exceed the target if one exists
+    (an unfinished or unresumed run), else the lowest available count above it
+    (the run finished further than asked). Returns ``None`` if no sibling
+    exists at all.
+    """
+    if insp.log_path.exists():
+        return insp
+    prefix = _chain_prefix(insp.stem)
+    candidates = []
+    for path in insp.log_path.parent.glob(f"{prefix}_*i_log.txt"):
+        seg_stem = path.name[: -len("_log.txt")]
+        m = _ITERS_STEM_RE.search(seg_stem)
+        if m is None or _chain_prefix(seg_stem) != prefix:
+            continue
+        candidates.append(int(m.group(1)))
+    if not candidates:
+        return None
+    at_or_below = [n for n in candidates if n <= insp.iters]
+    chosen = max(at_or_below) if at_or_below else min(candidates)
+    return replace(insp, iters=chosen)
+
+
 def describe_run(cfg):
     """Print what a config actually loads — the check for a suspect curve.
 
@@ -897,7 +927,15 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     device-synced update+error time the run logged per iteration — the quantity
     summed into ``solve_seconds`` — and excludes in-loop semantic evaluation.
     Runs launched with ``time_iteration`` off simply contribute no curve. Untick
-    *plot rec error* and clear *sem_keys* to look at timing on its own.
+    *plot rec error* and deselect everything in *sem_keys* to look at timing on
+    its own.
+
+    *sem_keys* is a collapsible checklist (click to expand) with one checkbox
+    per semantic metric actually logged for the currently-picked Run A / Run B
+    — tick none, one, or several. It repopulates whenever the run selection
+    changes, so it only ever offers keys that exist for what's on screen. A key
+    already ticked that's still available stays ticked across a repopulation;
+    ``default_sem_keys`` seeds the initial selection where present.
 
     Ticking *plot rec error* reveals a *log scale (rec error)* checkbox next to
     it; tick that to draw the rec-error axis on a log scale (useful once the
@@ -951,7 +989,9 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     # programmatically, so we never fight the traitlets event loop mid-rebuild.
     # `fig` holds the most recently drawn Figure so it can be saved/returned even
     # though the inline backend closes it after plt.show().
-    state = {"records": [], "mute": False, "fig": None}
+    # `sem_checks` maps each currently-offered sem key to its Checkbox widget;
+    # rebuilt by _populate_sem_dd whenever the available keys change.
+    state = {"records": [], "mute": False, "fig": None, "sem_checks": {}}
 
     dataset_chk = {
         ds: widgets.Checkbox(value=(ds in initial), description=ds, indent=False,
@@ -968,8 +1008,15 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                              style={"description_width": "55px"})
     run_b = widgets.Dropdown(description="Run B", layout=widgets.Layout(width="98%"),
                              style={"description_width": "55px"})
-    sem_box = widgets.Text(value=",".join(default_sem_keys), description="sem_keys",
-                           style={"description_width": "75px"}, layout=widgets.Layout(width="55%"))
+    # A checkbox per sem key, inside a collapsible Accordion so it reads as one
+    # "sem_keys" drop-down. Checkboxes are (re)built by _populate_sem_dd from
+    # whatever keys actually appear in the logs of the currently-selected
+    # run(s) — none exist until the first _refresh() populates sem_panel.
+    sem_panel = widgets.VBox([], layout=widgets.Layout(
+        max_height="160px", overflow_y="auto", padding="4px 8px"))
+    sem_dd = widgets.Accordion(children=[sem_panel], layout=widgets.Layout(width="260px"))
+    sem_dd.set_title(0, "sem_keys")
+    sem_dd.selected_index = None  # start collapsed
     rec_chk = widgets.Checkbox(value=False, description="plot rec error", indent=False)
     # Only meaningful once rec error is actually being plotted; hidden until then
     # (see _on_rec_toggle) rather than just disabled, so the control row doesn't
@@ -1056,6 +1103,57 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
             members.sort(key=lambda m: m["iters"])
         return idx
 
+    def _sem_keys_available(a, b):
+        """Union of Sem_all keys actually logged for the given A/B run(s).
+
+        Excludes ``_AUTO_METRIC_BLOCKLIST`` (OOV superseded by OOV_rate, and
+        the stale tilde_* diagnostics) — same as the metric list in
+        :func:`evaluate_runs`/:func:`make_run_ranker`.
+        """
+        keys = set()
+        for run in (a, b):
+            if not run:
+                continue
+            try:
+                _, _, sem = load_metrics(*run)
+            except FileNotFoundError:
+                continue
+            for d in sem:
+                keys.update(d.keys())
+        return sorted(keys - _AUTO_METRIC_BLOCKLIST)
+
+    def _sem_keys_selected():
+        return tuple(k for k, c in state["sem_checks"].items() if c.value)
+
+    def _update_sem_title():
+        n = len(_sem_keys_selected())
+        sem_dd.set_title(0, f"sem_keys ({n} selected)" if n else "sem_keys (none)")
+
+    def _on_sem_check(_change):
+        # Runs on every toggle regardless of mute (cheap, keeps the title
+        # accurate even mid-rebuild); the redraw itself still respects mute.
+        _update_sem_title()
+        if not state["mute"]:
+            _redraw()
+
+    def _populate_sem_dd():
+        # Rebuild the checkbox list from what's actually in Run A / Run B's
+        # logs, keeping whatever of the current selection still applies (or
+        # seeding from default_sem_keys on the very first call). Never re-adds
+        # a deselected key on its own — an empty selection stays empty.
+        avail = _sem_keys_available(run_a.value, run_b.value)
+        old = state["sem_checks"]
+        checked = {k for k, c in old.items() if c.value} if old else set(default_sem_keys)
+        new_checks = {}
+        for key in avail:
+            c = widgets.Checkbox(value=(key in checked), description=key, indent=False,
+                                 layout=widgets.Layout(width="auto"))
+            c.observe(_on_sem_check, "value")
+            new_checks[key] = c
+        state["sem_checks"] = new_checks
+        sem_panel.children = list(new_checks.values())
+        _update_sem_title()
+
     def _rebuild_ab():
         recs = _filtered()
         chains = _chain_index() if stitch_chk.value else None
@@ -1073,6 +1171,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
             dd.options = extra + opts
             vals = [v for _, v in dd.options]
             dd.value = cur if cur in vals else (dd.options[0][1] if dd.options else None)
+        _populate_sem_dd()
         n_sel = len(_selected_datasets())
         ts = _after_ts()
         if ts is False:
@@ -1092,7 +1191,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
             if not a:
                 print("No run selected for A (adjust the filters).")
                 return
-            keys = tuple(k.strip() for k in sem_box.value.split(",") if k.strip())
+            keys = _sem_keys_selected()
             b = run_b.value          # tuple of RunRef, or None for "(none)"
             fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
             try:
@@ -1150,6 +1249,19 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         if not state["mute"]:
             _redraw()
 
+    def _on_run_select(_change):
+        # Picking a different Run A/B directly (as opposed to via _rebuild_ab,
+        # which already calls _populate_sem_dd itself) changes which sem keys
+        # actually exist, so refresh the dropdown's options before redrawing.
+        if state["mute"]:
+            return
+        state["mute"] = True
+        try:
+            _populate_sem_dd()
+        finally:
+            state["mute"] = False
+        _redraw()
+
     def _on_rec_toggle(change):
         # Show the log-scale toggle only while it does something; untick it
         # along with hiding it so a stale check doesn't silently apply once
@@ -1192,9 +1304,10 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         c.observe(_on_dataset, "value")
     for dd in facet_dd.values():
         dd.observe(_on_filter, "value")
-    run_a.observe(_on_select, "value")
-    run_b.observe(_on_select, "value")
-    sem_box.observe(_on_select, "value")
+    run_a.observe(_on_run_select, "value")
+    run_b.observe(_on_run_select, "value")
+    # sem key checkboxes wire their own _on_sem_check observer as they're
+    # (re)created in _populate_sem_dd — nothing to attach on sem_dd itself.
     rec_chk.observe(_on_select, "value")
     # Second observer on the same trait: toggles log_rec_chk's visibility
     # (and clears it when hidden) independently of the redraw triggered above.
@@ -1218,7 +1331,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         widgets.HBox(list(dataset_chk.values()), layout=widgets.Layout(flex_flow="row wrap")),
     ])
     filters = widgets.HBox(list(facet_dd.values()), layout=widgets.Layout(flex_flow="row wrap"))
-    controls = widgets.HBox([sem_box, rec_chk, log_rec_chk, time_chk, stitch_chk, clip_chk, after_box,
+    controls = widgets.HBox([sem_dd, rec_chk, log_rec_chk, time_chk, stitch_chk, clip_chk, after_box,
                              refresh_btn, save_name, save_btn],
                             layout=widgets.Layout(flex_flow="row wrap"))
     ui = widgets.VBox([datasets_box, filters, status, run_a, run_b, controls, plot_out])
@@ -1390,24 +1503,52 @@ def _score_loaded(loaded, metrics, lower_is_better_fn):
     return out
 
 
+def _combined_score(df, keys, lower_is_better=None):
+    """Row-wise mean of several already-scored metric columns.
+
+    Each column is sign-flipped first when it's lower-is-better, so the result
+    is always "higher = better" even when mixing e.g. ``rec_error`` with
+    ``simlex_all_rho`` — a plain mean across inconsistent directions would
+    otherwise reward runs for being *worse* on half the metrics.
+    """
+    lib = _lower_is_better_fn(lower_is_better)
+    parts = [(-df[key].astype(float) if lib(key) else df[key].astype(float)) for key in keys]
+    return pd.concat(parts, axis=1).mean(axis=1)
+
+
 # Identity columns, in display order. The ranking metric's own columns are
-# spliced in right after `stem` (see _order_columns) so the number you sorted on
-# is the first thing next to the run name.
-_RANK_FRONT = ("rank_pos", "stem", "dataset", "name", "decomposition",
+# spliced in right after `full` (see _order_columns) so the number you sorted
+# on is the first thing next to the run name.
+_RANK_FRONT = ("rank_pos", "full", "dataset", "name", "decomposition",
                "divergence", "method", "dim", "rank", "subsample_frac",
-               "max_nnz", "iters", "n_segments", "when")
+               "iters", "when")
+
+# Bookkeeping identity fields that are rarely what you're scanning for — they
+# land just before `refs` instead of crowding the front next to the metrics.
+_RANK_TAIL = ("max_nnz", "n_segments", "has_log", "last_iter")
 
 
-def _order_columns(df, metric):
-    """rank_pos, stem, the ranking metric's columns, then the rest; refs last."""
-    lead = [c for c in ("rank_pos", "stem") if c in df.columns]
+def _order_columns(df, metric, component_keys=()):
+    """rank_pos, full, the ranking metric's columns, then the rest; refs last.
+
+    ``component_keys`` are the individual metrics a composite ``metric`` (e.g.
+    ``combined_mean``) was averaged from — their own ``key``/``key_iter``/
+    ``key_final`` columns are spliced in right after the composite's, ahead of
+    the identity columns, so the numbers that produced the mean are the first
+    thing next to it.
+    """
+    lead = [c for c in ("rank_pos", "full") if c in df.columns]
     metric_cols = [c for c in (metric, f"{metric}_iter", f"{metric}_final")
                    if c in df.columns]
-    ident = [c for c in _RANK_FRONT if c in df.columns and c not in lead]
-    drop = set(lead) | set(metric_cols) | set(ident) | {"refs", "mtime"}
+    for key in component_keys:
+        metric_cols += [c for c in (key, f"{key}_iter", f"{key}_final")
+                        if c in df.columns and c not in metric_cols]
+    ident = [c for c in _RANK_FRONT if c in df.columns and c not in lead and c not in metric_cols]
+    tail_ident = [c for c in _RANK_TAIL if c in df.columns]
+    drop = set(lead) | set(metric_cols) | set(ident) | set(tail_ident) | {"refs", "mtime"}
     mid = [c for c in df.columns if c not in drop]
     tail = ["refs"] if "refs" in df.columns else []
-    return df[lead + metric_cols + ident + mid + tail]
+    return df[lead + metric_cols + ident + mid + tail_ident + tail]
 
 
 def _rank_df(df, metric, thresholds=None, lower_is_better=None, top=None):
@@ -1426,6 +1567,14 @@ def _rank_df(df, metric, thresholds=None, lower_is_better=None, top=None):
     return df
 
 
+# Raw evaluate_sample() keys that "auto" metric discovery skips: OOV is a raw
+# count made redundant by OOV_rate (same information, comparable across runs
+# of different sample sizes), and the tilde_* pair are stale rewrite-era
+# diagnostics. Still readable directly from a log's Sem_all if you actually
+# want them — pass them explicitly via ``metrics=``.
+_AUTO_METRIC_BLOCKLIST = {"OOV", "tilde_excluded_prob_score", "tilde_rate"}
+
+
 def evaluate_runs(datasets="fineweb-en", data_dir=DATA_DIR,
                   metrics=("average_rank_score",), filters=None, after=None,
                   lower_is_better=None, stitch=True):
@@ -1439,7 +1588,8 @@ def evaluate_runs(datasets="fineweb-en", data_dir=DATA_DIR,
     missing or has no line for ``k`` gets NaN there.
 
     ``metrics`` may be ``"auto"`` (``None``) to score ``rec_error`` plus every
-    semantic key found in the scanned logs. ``filters`` is a
+    semantic key found in the scanned logs, minus ``_AUTO_METRIC_BLOCKLIST``.
+    ``filters`` is a
     ``{facet: value | [values]}`` dict over the discovery facets; ``after`` is a
     date string dropping older config snapshots. The metric names actually
     scored are also on ``df.attrs["metrics"]``. The ``refs`` column holds each
@@ -1469,13 +1619,14 @@ def evaluate_runs(datasets="fineweb-en", data_dir=DATA_DIR,
             if loaded:
                 for d in loaded[2]:
                     keyset.update(d)
+        keyset -= _AUTO_METRIC_BLOCKLIST
         metrics = ["rec_error"] + sorted(keyset)
 
     rows = []
     for rep, refs, loaded in loaded_chains:
         scored = _score_loaded(loaded, metrics, lib) or {}
         row = {
-            "stem": rep["stem"], "dataset": rep["dataset"], "name": rep["name"],
+            "full": rep["stem"], "dataset": rep["dataset"], "name": rep["name"],
             "decomposition": rep["decomposition"], "divergence": rep["divergence"],
             "method": rep["method"], "order": rep["order"], "dim": rep["dim"],
             "rank": rep["rank"], "subsample_frac": rep["subsample_frac"],
@@ -1546,17 +1697,24 @@ def plot_top(ranked, metric="average_rank_score", n=5, ax=None, **compare_kw):
     curve, or as the rec-error curve when it *is* ``rec_error``. The run names
     go under the plot (``legend_loc="below"``, override via ``compare_kw``).
     Extra keyword args pass through to :func:`compare_metrics`.
+
+    ``metric`` also accepts an iterable of several metric names (e.g. the set
+    behind a ranking by combined mean, see :func:`_combined_score`) — every
+    one is overlaid as its own curve, since a composite score itself has no
+    per-iteration series to plot.
     """
     top = ranked.head(int(n))
     configs = [list(r) for r in top["refs"]]
-    labels = list(top["stem"])
-    is_rec = metric in ("rec_error", "reconstruction_error")
+    labels = list(top["full"])
+    keys = (metric,) if isinstance(metric, str) else tuple(metric)
+    is_rec = keys in (("rec_error",), ("reconstruction_error",))
     compare_kw.setdefault("legend_loc", "below")
+    title_metric = metric if isinstance(metric, str) else " & ".join(keys)
     return compare_metrics(
         configs, labels,
-        sem_keys=() if is_rec else (metric,),
+        sem_keys=() if is_rec else keys,
         plot_rec_error=is_rec,
-        title=f"Top {len(top)} by {metric}",
+        title=f"Top {len(top)} by {title_metric}",
         ax=ax, stitch=False, **compare_kw,
     )
 
@@ -1574,8 +1732,16 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
     Dataset checkboxes and facet drop-downs behave as in
     :func:`make_run_browser`. Beyond them:
 
-    * **metric** — the column to rank on, populated from every metric found in
-      the logs of the checked datasets; error-like keys rank ascending.
+    * **metric** — a collapsible checklist (click to expand), one checkbox per
+      metric found in the logs of the checked datasets — the same "check
+      none/one/several" control as ``sem_keys`` in :func:`make_run_browser`.
+      Tick exactly one to rank by that metric directly (error-like keys rank
+      ascending). Tick several to rank by the mean of their sign-normalized
+      best-ever values instead (lower-is-better ones flipped so higher is
+      always better — see :func:`_combined_score`), averaged row-wise into a
+      synthetic ``combined_mean`` column, sorted best-first. *Plot top* then
+      overlays each ticked metric's own curve (a composite score has no
+      per-iteration series of its own — see :func:`plot_top`).
     * **thresholds** — free-text criteria, e.g.
       ``rec_error < 0.5, simlex_all_rho > 0.3`` (comma/``and`` separated).
     * **after** — drop runs whose snapshot predates the date.
@@ -1611,7 +1777,7 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
         )
 
     plt.close("all")
-    state = {"full": None, "ranked": None, "fig": None, "mute": False}
+    state = {"full": None, "ranked": None, "fig": None, "mute": False, "metric_checks": {}}
 
     dataset_chk = {
         ds: widgets.Checkbox(value=(ds in initial), description=ds, indent=False,
@@ -1624,10 +1790,17 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
                               layout=widgets.Layout(width="235px"))
         for label, key in _FACETS
     }
-    metric_dd = widgets.Dropdown(options=[default_metric], value=default_metric,
-                                 description="metric",
-                                 style={"description_width": "55px"},
-                                 layout=widgets.Layout(width="260px"))
+    # One checkbox per metric, inside a collapsible Accordion — the same
+    # "check none/one/several" pattern as sem_keys in make_run_browser.
+    # Options are (re)built in _recompute from every metric found in the
+    # checked datasets. One ticked ranks by that metric directly; several rank
+    # by the mean of their sign-normalized best-ever values (see
+    # _combined_score) as a synthetic combined_mean column.
+    metric_panel = widgets.VBox([], layout=widgets.Layout(
+        max_height="160px", overflow_y="auto", padding="4px 8px"))
+    metric_dd = widgets.Accordion(children=[metric_panel], layout=widgets.Layout(width="280px"))
+    metric_dd.set_title(0, "metric")
+    metric_dd.selected_index = None
     thresh_box = widgets.Text(value="", description="thresholds",
                               placeholder="rec_error < 0.5, simlex_all_rho > 0.3",
                               style={"description_width": "75px"},
@@ -1671,6 +1844,45 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
             dd.options = ["(any)"] + vals
             dd.value = cur if cur in dd.options else "(any)"
 
+    def _metric_keys_selected():
+        return tuple(k for k, c in state["metric_checks"].items() if c.value)
+
+    def _update_metric_title():
+        keys = _metric_keys_selected()
+        if not keys:
+            metric_dd.set_title(0, "metric (none)")
+        elif len(keys) == 1:
+            metric_dd.set_title(0, f"metric: {keys[0]}")
+        else:
+            metric_dd.set_title(0, f"metric ({len(keys)} averaged)")
+
+    def _on_metric_check(_change):
+        _update_metric_title()
+        if not state["mute"]:
+            _rerank()
+
+    def _populate_metric_dd(metrics):
+        # Mirrors _populate_sem_dd in make_run_browser: rebuild the checklist
+        # from the metrics on hand, keeping whatever of the current selection
+        # is still valid — seeded with default_metric (or the first metric, if
+        # that's not among them) the very first time.
+        old = state["metric_checks"]
+        if old:
+            checked = {k for k, c in old.items() if c.value}
+        elif default_metric in metrics:
+            checked = {default_metric}
+        else:
+            checked = {metrics[0]} if metrics else set()
+        new_checks = {}
+        for key in metrics:
+            c = widgets.Checkbox(value=(key in checked), description=key, indent=False,
+                                 layout=widgets.Layout(width="auto"))
+            c.observe(_on_metric_check, "value")
+            new_checks[key] = c
+        state["metric_checks"] = new_checks
+        metric_panel.children = list(new_checks.values())
+        _update_metric_title()
+
     def _recompute(_evt=None):
         sel = sorted(_selected_datasets())
         if not sel:
@@ -1684,11 +1896,7 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
                                stitch=stitch_chk.value)
             state["full"] = df
             metrics = df.attrs.get("metrics", [default_metric]) or [default_metric]
-            cur = metric_dd.value
-            metric_dd.options = metrics
-            metric_dd.value = (cur if cur in metrics
-                               else default_metric if default_metric in metrics
-                               else metrics[0])
+            _populate_metric_dd(metrics)
             _populate_facets()
         finally:
             state["mute"] = False
@@ -1702,7 +1910,6 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
             state["ranked"] = None
             _render_table("No runs scored.")
             return
-        metric = metric_dd.value
         view = _facet_filter_df(df, _facet_filters())
         note = ""
         after = after_box.value.strip()
@@ -1711,7 +1918,31 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
                 view = view[view["mtime"] >= pd.to_datetime(after).timestamp()]
             except Exception:
                 note = " &nbsp;|&nbsp; <span style='color:#c00'>unparsable 'after' date</span>"
+
+        keys = _metric_keys_selected()
+        if not keys:
+            state["ranked"] = None
+            status.value = "<b style='color:#c00'>Tick at least one metric.</b>"
+            _render_table("Pick a metric above.")
+            return
+        if len(keys) == 1:
+            metric = keys[0]
+            desc = metric
+        else:
+            # combined_mean is sign-normalized (see _combined_score) so it's
+            # always "higher = better" — no need for _rank_df's direction guess.
+            view = view.copy()
+            view["combined_mean"] = _combined_score(view, keys)
+            metric = "combined_mean"
+            desc = f"mean of {', '.join(keys)}"
+        asc = _lower_is_better_fn(None)(metric)
+
         try:
+            # lower_is_better left at its default (per-key regex inference):
+            # "combined_mean" doesn't match the error-like pattern, so it's
+            # correctly treated as higher-is-better without a global override
+            # — which would otherwise also flip the direction of any *other*
+            # metric named in thresholds (e.g. "rec_error < 0.5").
             ranked = _rank_df(view, metric, thresholds=thresh_box.value,
                               top=(top_box.value or None))
         except (ValueError, KeyError) as e:
@@ -1719,13 +1950,26 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
             status.value = f"<b style='color:#c00'>{e}</b>"
             _render_table("Fix the criteria above.")
             return
-        state["ranked"] = _order_columns(ranked, metric)
-        asc = _lower_is_better_fn(None)(metric)
+        state["ranked"] = _order_columns(ranked, metric,
+                                         component_keys=keys if len(keys) > 1 else ())
         status.value = (
-            f"<b>{len(ranked)}</b> run(s) ranked by <code>{metric}</code> "
+            f"<b>{len(ranked)}</b> run(s) ranked by <code>{desc}</code> "
             f"({'ascending' if asc else 'descending'}) &nbsp;|&nbsp; "
             f"{len(view)} pass the filters &nbsp;|&nbsp; {len(df)} scored{note}")
         _render_table()
+
+    def _break_in_two(s):
+        # Split near the midpoint, at the closest "_" so a token doesn't get
+        # cut mid-word. CSS alone (max-width + word-break) turned out to fight
+        # the notebook's own table-layout rules and wrapped down to a
+        # few characters a line, so force exactly one break instead.
+        s = str(s)
+        if len(s) <= 40:
+            return s
+        mid = len(s) // 2
+        cuts = [i for i, ch in enumerate(s) if ch == "_"]
+        brk = min(cuts, key=lambda i: abs(i - mid)) + 1 if cuts else mid
+        return s[:brk] + "<br>" + s[brk:]
 
     def _render_table(empty_msg="No runs to show."):
         with table_out:
@@ -1735,9 +1979,22 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
                 print(empty_msg)
                 return
             show = r.drop(columns=[c for c in ("refs",) if c in r.columns])
+            # No max_colwidth cap: `full` shows the whole run name (up through
+            # its iteration count), not an ellipsized stub.
             with pd.option_context("display.max_columns", None, "display.width", 200,
-                                   "display.max_colwidth", 40):
-                display(show)
+                                   "display.max_colwidth", None):
+                if "full" in show.columns:
+                    show = show.copy()
+                    show["full"] = show["full"].map(_break_in_two)
+                styler = show.style
+                # *_iter / last_iter are always whole iteration numbers, but a
+                # NaN anywhere in the column (a metric a run's log lacks)
+                # upcasts it to float64 — format those as ints, not "150.000000".
+                iter_cols = [c for c in show.columns if c.endswith("_iter") or c == "last_iter"]
+                if iter_cols:
+                    styler = styler.format(
+                        {c: (lambda v: "" if pd.isna(v) else str(int(v))) for c in iter_cols})
+                display(styler)
 
     def _plot(_btn=None):
         with plot_out:
@@ -1748,7 +2005,7 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
                 return
             fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
             try:
-                plot_top(r, metric_dd.value, nplot_box.value, ax=ax)
+                plot_top(r, _metric_keys_selected(), nplot_box.value, ax=ax)
             except FileNotFoundError as e:
                 plt.close(fig)
                 state["fig"] = None
@@ -1777,7 +2034,8 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
     stitch_chk.observe(_recompute, "value")
     for dd in facet_dd.values():
         dd.observe(_rerank, "value")
-    metric_dd.observe(_rerank, "value")
+    # metric checkboxes wire their own _on_metric_check observer as they're
+    # (re)created in _populate_metric_dd — nothing to attach on metric_dd itself.
     thresh_box.observe(_rerank, "value")
     after_box.observe(_rerank, "value")
     top_box.observe(_rerank, "value")

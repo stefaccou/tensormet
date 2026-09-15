@@ -37,13 +37,14 @@ import torch
 
 from tensormet.utils import (
     DATA_DIR,
-    _to_np,
+    to_np,
     extract_roles_from_vocab,
     make_lazy_cupy_pair,
     np_dispatch,
     np_sim,
     readonly_dispatch,
     resolve_checkpoint_path,
+    resolve_shared_factors,
     torch_or_pickle_load,
     voc_index,
 )
@@ -63,7 +64,7 @@ def _role_index(role: str, role_names: List[str]) -> int:
         raise ValueError(f"role must be one of {set(role_names)}") from e
 
 
-def _voc_list_key(role: str) -> str:
+def voc_list_key(role: str) -> str:
     return f"vocab_{role}"
 
 
@@ -93,7 +94,7 @@ class CPDecomposition:
         the Tucker core (e.g. the judge reads ``core.shape``). O(R^N) memory:
         cached after first access, refused above a size guard."""
         if self._core_cache is None:
-            w = _to_np(self.weights)
+            w = to_np(self.weights)
             R = int(w.shape[0])
             N = len(self.factors)
             if R ** N > _CORE_MATERIALIZE_MAX_ELEMENTS:
@@ -111,7 +112,7 @@ class CPDecomposition:
         return self.core
 
     def _weights_np(self) -> np.ndarray:
-        return _to_np(self.weights)
+        return to_np(self.weights)
 
     def get_role_index(self, role: str) -> int:
         return _role_index(role, self.roles)
@@ -154,18 +155,7 @@ class CPDecomposition:
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
 
-        parsed_shared = None
-        if shared_factors == "all":
-            parsed_shared = {(i, j) for i in range(order) for j in range(i + 1, order)}
-        elif shared_factors is True:
-            parsed_shared = {(1, 2)}
-        elif isinstance(shared_factors, set) and shared_factors:
-            for item in shared_factors:
-                if not (isinstance(item, tuple) and len(item) == 2):
-                    raise TypeError(
-                        f"shared_factors must be a set of 2-tuples, got item {item!r}"
-                    )
-            parsed_shared = shared_factors
+        parsed_shared = resolve_shared_factors(shared_factors, order)
 
         # Vocabulary is decomposition-agnostic: same files as Tucker.
         _vdir = os.path.join(base, "vocabularies")
@@ -267,15 +257,15 @@ class CPDecomposition:
 
     def fetch_single_latent(self, element, role) -> np.ndarray:
         el_idx = self.vocab[voc_index(role)][element]
-        return _to_np(self.factors[self.get_role_index(role)][el_idx])
+        return to_np(self.factors[self.get_role_index(role)][el_idx])
 
     def to_cupy(self):
         """Prepare for inference by moving to GPU."""
         if isinstance(self.weights, torch.Tensor):
-            self.weights = cp.array(_to_np(self.weights))
+            self.weights = cp.array(to_np(self.weights))
         for i, f in enumerate(self.factors):
             if isinstance(f, torch.Tensor):
-                self.factors[i] = cp.array(_to_np(f))
+                self.factors[i] = cp.array(to_np(f))
 
     # --- Scoring (CP-native, all O(R)) -----------------------------------
     def score_scalar(self, triple: Tuple[str, ...]) -> float:
@@ -324,7 +314,7 @@ class CPDecomposition:
             out = rows if out is None else out * rows
         w = self.weights
         if not isinstance(w, torch.Tensor):
-            w = torch.as_tensor(_to_np(w))
+            w = torch.as_tensor(to_np(w))
         w = w.to(device)
         return out * w  # broadcast (n, R) * (R,)
 
@@ -332,9 +322,9 @@ class CPDecomposition:
     def get_top_words_for_dimension(self, role: str, dim_index: int, top_k: int = 10):
         """Top-k words with highest loading on one latent dimension of a role."""
         factor_idx = self.get_role_index(role)
-        dim_values = _to_np(self.factors[factor_idx])[:, dim_index]
+        dim_values = to_np(self.factors[factor_idx])[:, dim_index]
         scores, indices = torch.topk(torch.tensor(dim_values), top_k)
-        vocab_list = self.vocab[_voc_list_key(role)]
+        vocab_list = self.vocab[voc_list_key(role)]
         return [
             (vocab_list[idx.item()], score.item())
             for idx, score in zip(indices, scores)
@@ -371,7 +361,7 @@ class CPDecomposition:
             raise ValueError("Must be tuple, str or ndarray")
 
         i = self.get_role_index(role)
-        F = _to_np(self.factors[i])
+        F = to_np(self.factors[i])
 
         eps = 1e-12
         F_norm = np.maximum(np.linalg.norm(F, axis=1), eps)
@@ -398,7 +388,7 @@ class CPDecomposition:
         else:
             raise NotImplementedError
 
-        factor = _to_np(self.factors[index])
+        factor = to_np(self.factors[index])
         if metric == "cosine":
             eps = 1e-12
             factor_norm = np.maximum(np.linalg.norm(factor, axis=1), eps)
@@ -457,8 +447,8 @@ class CPDecomposition:
         factors_free: list[np.ndarray] = []
         vocab_lists_free: list[list[str]] = []
         for role in role_names_free:
-            factor = _to_np(self.factors[self.get_role_index(role)])
-            vocab_list = list(self.vocab[_voc_list_key(role)])
+            factor = to_np(self.factors[self.get_role_index(role)])
+            vocab_list = list(self.vocab[voc_list_key(role)])
             if restrict_roles and role in restrict_roles:
                 r2i = self.vocab[voc_index(role)]
                 keep_words = [wd for wd in restrict_roles[role] if wd in r2i]

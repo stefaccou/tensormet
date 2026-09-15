@@ -39,8 +39,9 @@ from tensormet.utils import (DATA_DIR,
                             np_dispatch,
                             np_sim,
                             resolve_checkpoint_path,
+                            resolve_shared_factors,
                             sync_devices,
-                            _to_np,
+                            to_np,
                    )
 from tensormet.hpc_helpers import mirror_checkpoint
 from tensormet.sparse_ops import (
@@ -133,7 +134,7 @@ def _role_index(role: str, role_names: list[str]) -> int:
         raise ValueError(f"role must be one of {set(role_names)}") from e
 
 
-def _voc_list_key(role: str) -> str:
+def voc_list_key(role: str) -> str:
     return f"vocab_{role}"
 
 class TuckerDecomposition:
@@ -166,7 +167,7 @@ class TuckerDecomposition:
 
 
     def _core_np(self):
-        return _to_np(self.core)
+        return to_np(self.core)
 
     # --- Construction and loading ---
     @classmethod
@@ -228,20 +229,8 @@ class TuckerDecomposition:
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
 
-        parsed_shared = None
         suffix = ""
-
-        if shared_factors == "all":
-            parsed_shared = {(i, j) for i in range(order) for j in range(i + 1, order)}
-        elif shared_factors is True:
-            parsed_shared = {(1, 2)}
-        elif isinstance(shared_factors, set) and shared_factors:
-            for item in shared_factors:
-                if not (isinstance(item, tuple) and len(item) == 2):
-                    raise TypeError(
-                        f"shared_factors must be a set of 2-tuples, got item {item!r}"
-                    )
-            parsed_shared = shared_factors
+        parsed_shared = resolve_shared_factors(shared_factors, order)
 
         if parsed_shared:
             linked_nontrivial = nontrivial_linked_groups(parsed_shared, num_factors=order)
@@ -441,7 +430,7 @@ class TuckerDecomposition:
     #     v_idx = self.vocab["v2i"][triple[0]]
     #     s_idx = self.vocab["s2i"][triple[1]]
     #     o_idx = self.vocab["o2i"][triple[2]]
-    #     V, S, O = [ _to_np(F) for F in self.factors]     # shapes (DIMS,R)
+    #     V, S, O = [ to_np(F) for F in self.factors]     # shapes (DIMS,R)
     #     v = V[v_idx]                                     # (R,)
     #     s = S[s_idx]                                     # (R,)
     #     o = O[o_idx]                                     # (R,)
@@ -464,7 +453,7 @@ class TuckerDecomposition:
             role = self.roles[0] # default, useful for brevity in shared factor elements
         el_idx = self.vocab[voc_index(role)][element]
         factor_slice = self.factors[self.get_role_index(role)][el_idx]
-        return _to_np(factor_slice)
+        return to_np(factor_slice)
 
 
 
@@ -474,10 +463,10 @@ class TuckerDecomposition:
         Prepare for inference by moving to gpu
         """
         if isinstance(self.core, torch.Tensor):
-            self.core = cp.array(_to_np(self.core))
+            self.core = cp.array(to_np(self.core))
         for i, f in enumerate(self.factors):
             if isinstance(f, torch.Tensor):
-                new_f = cp.array(_to_np(f))
+                new_f = cp.array(to_np(f))
                 self.factors[i] = new_f
 
     # -- Scoring and slicing methods ---
@@ -649,10 +638,10 @@ class TuckerDecomposition:
         """
         factor_idx = self.get_role_index(role)
         role_factors = self.factors[factor_idx]  # (N, R)
-        dim_values = _to_np(role_factors)[:, dim_index]
+        dim_values = to_np(role_factors)[:, dim_index]
 
         scores, indices = torch.topk(torch.tensor(dim_values), top_k)
-        vocab_list = self.vocab[_voc_list_key(role)]
+        vocab_list = self.vocab[voc_list_key(role)]
 
         top_words = [
             (vocab_list[idx.item()], score.item())
@@ -846,8 +835,8 @@ class TuckerDecomposition:
         vocab_lists_free: list[list[str]] = []
 
         for role in role_names_free:
-            factor = _to_np(self.factors[self.get_role_index(role)])
-            vocab_list = list(self.vocab[_voc_list_key(role)])
+            factor = to_np(self.factors[self.get_role_index(role)])
+            vocab_list = list(self.vocab[voc_list_key(role)])
 
             if restrict_roles and role in restrict_roles:
                 r2i = self.vocab[voc_index(role)]
@@ -1199,8 +1188,7 @@ class SparseTupleTensor:
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
 
-        if shared_factors == "all":
-            shared_factors = tuple(sorted((i, j) for i in range(order) for j in range(i + 1, order)))
+        shared_factors = resolve_shared_factors(shared_factors, order)
 
         linked_nontrivial = nontrivial_linked_groups(shared_factors, num_factors=order)
         suffix = shared_factor_suffix(linked_nontrivial)

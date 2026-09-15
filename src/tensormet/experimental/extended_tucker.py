@@ -9,8 +9,8 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 
-from tensormet.tucker_tensor import TuckerDecomposition, _to_np, _voc_list_key
-from tensormet.utils import voc_index, ThreadBudget
+from tensormet.tucker_tensor import TuckerDecomposition, voc_list_key
+from tensormet.utils import voc_index, ThreadBudget, to_np
 from tensormet.similarity import get_eval_num_threads
 
 
@@ -128,7 +128,7 @@ class ExtendedTucker(TuckerDecomposition):
         if element in self.vocab[vocab_key]:
             el_idx = self.vocab[vocab_key][element]
             factor_slice = self.factors[self.get_role_index(role)][el_idx]
-            return _to_np(factor_slice)
+            return to_np(factor_slice)
 
         if element in self.extensions[role]:
             return np.asarray(self.extensions[role][element])
@@ -176,7 +176,7 @@ class ExtendedTucker(TuckerDecomposition):
         range_q = (1.0, 99.0)
 
         if normalize and normalize_mode == "l2":
-            F_base = _to_np(self.factors[r_idx]).astype(np.float64, copy=False)
+            F_base = to_np(self.factors[r_idx]).astype(np.float64, copy=False)
             base_row_norms = np.linalg.norm(F_base, axis=1)
             nz = base_row_norms[np.isfinite(base_row_norms) & (base_row_norms > 0)]
             target_norm = float(np.median(nz)) if nz.size else 1.0
@@ -193,7 +193,7 @@ class ExtendedTucker(TuckerDecomposition):
                 return out2
 
         elif normalize and normalize_mode == "minmax":
-            F_base = _to_np(self.factors[r_idx]).astype(np.float64, copy=False)
+            F_base = to_np(self.factors[r_idx]).astype(np.float64, copy=False)
 
             lo_q, hi_q = range_q
             base_lo = np.nanpercentile(F_base, lo_q, axis=0)
@@ -402,7 +402,7 @@ class ExtendedTucker(TuckerDecomposition):
 
         new_vocab = dict(self.vocab)
         for role in self.roles:
-            list_key = _voc_list_key(role)
+            list_key = voc_list_key(role)
             map_key = voc_index(role)
 
             new_vocab[list_key] = list(new_vocab[list_key])
@@ -427,12 +427,12 @@ class ExtendedTucker(TuckerDecomposition):
                 add = torch.tensor(vecs_np, dtype=F.dtype, device=F.device)
                 F_new = torch.cat([F, add], dim=0)
             else:
-                F_np = _to_np(F)
+                F_np = to_np(F)
                 F_new = np.vstack([F_np, vecs_np])
 
             new_factors.append(F_new)
 
-            list_key = _voc_list_key(role)
+            list_key = voc_list_key(role)
             map_key = voc_index(role)
 
             base_n = len(new_vocab[list_key])

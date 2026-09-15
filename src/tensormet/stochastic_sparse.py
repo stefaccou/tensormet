@@ -53,7 +53,7 @@ values, so all existing update functions work without modification.
 
 For multi-GPU (ShardedSparseTensor), the same pattern lives shard-side: each
 shard's NNZ arrays are shuffled once at construction and the per-shard
-functions take contiguous windows — see ``sharded_sparse._apply_subsample``.
+functions take contiguous windows — see ``sharded_sparse.apply_subsample``.
 """
 
 from __future__ import annotations

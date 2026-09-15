@@ -38,7 +38,7 @@ def np_sim(a: np.ndarray, b: np.ndarray) -> float:
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
-def _to_np(x):
+def to_np(x):
     """Accept NumPy arrays or torch tensors; return a NumPy view/copy."""
     if hasattr(x, "detach"):  # torch.Tensor
         return x.detach().cpu().numpy()
@@ -653,6 +653,27 @@ def linked_factor_groups(num_factors: int, shared_factors=None) -> list[list[int
         groups[find(i)].append(i)
 
     return list(groups.values())
+
+def resolve_shared_factors(shared_factors, num_factors: int):
+    """Normalize a shared_factors spec into a sorted tuple of (i, j) pairs, or None.
+
+    Accepts: falsy -> None; "all"/"full" -> every pair across num_factors modes;
+    True -> ((1, 2),) (legacy order-3 shortcut); an iterable of 2-item
+    pairs -> validated and returned sorted.
+    """
+    if shared_factors in ("all", "full"):
+        return tuple(sorted((i, j) for i in range(num_factors) for j in range(i + 1, num_factors)))
+    if shared_factors is True:
+        return ((1, 2),)
+    if not shared_factors:
+        return None
+    pairs = []
+    for item in shared_factors:
+        if not (isinstance(item, (tuple, list)) and len(item) == 2):
+            raise TypeError(f"shared_factors must be a set of 2-tuples, got item {item!r}")
+        pairs.append(tuple(item))
+    return tuple(sorted(pairs))
+
 
 def nontrivial_linked_groups(shared_factors, num_factors: int = 3) -> list[list[int]]:
     """

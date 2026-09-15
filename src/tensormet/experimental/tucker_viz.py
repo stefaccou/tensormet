@@ -39,7 +39,7 @@ from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
 from tensormet.utils import einsum_letters, voc_index
-from tensormet.tucker_tensor import _to_np
+from tensormet.utils import to_np
 from typing import Tuple
 
 
@@ -52,13 +52,13 @@ class TuckerVizMixin:
     #
     #     if role == "verb":
     #         # (num_verbs, R) × (R, R, R) -> (num_verbs, R, R)
-    #         slc = np.einsum('ip,pqr->i q r', _to_np(self.factors[0]), G)
+    #         slc = np.einsum('ip,pqr->i q r', to_np(self.factors[0]), G)
     #     elif role == "subject":
     #         # (num_subj, R) × (R, R, R) -> (num_subj, R, R)
-    #         slc = np.einsum('jp,pqr->j p r', _to_np(self.factors[1]), G)
+    #         slc = np.einsum('jp,pqr->j p r', to_np(self.factors[1]), G)
     #     elif role == "object":
     #         # (num_obj, R) × (R, R, R) -> (num_obj, R, R)
-    #         slc = np.einsum('kp,pqr->k p q', _to_np(self.factors[2]), G)
+    #         slc = np.einsum('kp,pqr->k p q', to_np(self.factors[2]), G)
     #
     #     else:
     #         raise ValueError("role must be one of {'verb','subject','object'}")
@@ -95,7 +95,7 @@ class TuckerVizMixin:
     def get_role_slice(self, role: str, normalize: bool = False) -> np.ndarray:
         target_idx = self.get_role_index(role)
         G = self._core_np()
-        factor = _to_np(self.factors[target_idx])
+        factor = to_np(self.factors[target_idx])
 
         modes = einsum_letters(len(self.roles))
         core_str = "".join(modes)

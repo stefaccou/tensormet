@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import os
-from tensormet.utils import DATA_DIR, shared_factor_suffix, nontrivial_linked_groups, dim_spec_str
+from tensormet.utils import DATA_DIR, shared_factor_suffix, nontrivial_linked_groups, dim_spec_str, resolve_shared_factors
 from tensormet.naming import (
     model_filename as _model_filename,
     candidate_stems as _candidate_stems,
@@ -170,19 +170,19 @@ class EvalConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    dataset: str = "fineweb-en"
-    method: str = "siiSoftPlus"
-    divergence: str = "fr"
-    dim: Union[int, Tuple[int, ...]] = 1000
-    order: int = 3
-    rank: Tuple[int, ...] = (100, 100, 100)
+    dataset: str = "4-gram-raw-bos-eos-fineweb-en_1B"
+    method: str = "scSoftPlus"
+    divergence: str = "kl"
+    dim: Union[int, Tuple[int, ...]] = 10000
+    order: int = 4
+    rank: Tuple[int, ...] = (100, 100, 100, 100)
     name: str = None
     random_state: int = 1
     epsilon: float = 1e-12
     init: str = "random"
     normalize_factors: bool = False
-    shared_factors: Optional[Tuple[Tuple[int, int], ...]] = None
-    subsample_frac: float = 1.0
+    shared_factors: Union[str, Optional[Tuple[Tuple[int, int], ...]]] = "all"
+    subsample_frac: float = 0.025
     # Hard ceiling on the number of NNZ entries used per update step, global
     # across all GPU shards (each shard gets ~max_nnz/n_shards). Combines with
     # subsample_frac as min(round(frac*nnz), max_nnz); None/0 = off. Applied as
@@ -268,6 +268,9 @@ class ExperimentConfig:
     sgd_cuda_graph: bool = False
     sgd_comm_backend: str = "auto"
     sgd_eval_sample: Optional[int] = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "shared_factors", resolve_shared_factors(self.shared_factors, self.order))
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -627,7 +630,7 @@ class InspectionConfig:
     order: int = 3
     iters: int = 2000
     rank: int = 150
-    shared_factors: Union[bool, Set[Tuple[int, int]], str] = field(default_factory=lambda: {(1, 2)})
+    shared_factors: Union[bool, Set[Tuple[int, int]], str] = "all"
     subsample_frac: float = 0.25
     max_nnz: Optional[int] = None
     solver: str = "mu"
@@ -638,17 +641,7 @@ class InspectionConfig:
         return tuple(int(x) for x in self.dim.split("-")) if isinstance(self.dim, str) else self.dim
 
     def _norm_sf(self):
-        """Resolve shared_factors the same way as TuckerDecomposition.load_from_disk."""
-        sf = self.shared_factors
-        if sf == "full":
-            sf = "all"
-        if sf == "all":
-            return tuple(sorted((i, j) for i in range(self.order) for j in range(i + 1, self.order)))
-        if sf is True:
-            return ((1, 2),)
-        if sf:
-            return tuple(tuple(p) for p in sf)
-        return None
+        return resolve_shared_factors(self.shared_factors, self.order)
 
     def _as_run_config(self) -> RunConfig:
         return RunConfig(
@@ -695,7 +688,7 @@ class InspectionConfig:
             method=self.method,
             divergence=self.divergence,
             order=self.order,
-            shared_factors="all" if self.shared_factors == "full" else self.shared_factors,
+            shared_factors=self.shared_factors,
             subsample_frac=self.subsample_frac,
             max_nnz=self.max_nnz,
             iterations=self.iters,

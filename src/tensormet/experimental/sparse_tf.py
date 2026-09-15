@@ -1,5 +1,5 @@
 from __future__ import annotations
-from tensormet.tucker_tensor import _to_np
+from tensormet.utils import to_np
 
 class TuckerVizMixin:
     """Visualization and rarely-used inspection methods for TuckerDecomposition."""
@@ -36,10 +36,10 @@ class TuckerVizMixin:
         if isinstance(self.core, tf.SparseTensor):
             self.core = tf.sparse.to_dense(self.core).numpy()
             self.factors = [
-                tf.sparse.to_dense(f).numpy() if isinstance(f, tf.SparseTensor) else _to_np(f)
+                tf.sparse.to_dense(f).numpy() if isinstance(f, tf.SparseTensor) else to_np(f)
                 for f in self.factors
             ]
         else:
             # If they’re already torch/np dense, just ensure NumPy
-            self.core = _to_np(self.core)
-            self.factors = [_to_np(f) for f in self.factors]
+            self.core = to_np(self.core)
+            self.factors = [to_np(f) for f in self.factors]

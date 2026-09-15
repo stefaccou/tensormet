@@ -93,7 +93,7 @@ import torch.nn.functional as F
 from tensorly import backend_context
 from tensorly.tucker_tensor import TuckerTensor
 
-from tensormet.utils import SparseCOOTensor, einsum_letters
+from tensormet.utils import SparseCOOTensor, einsum_letters, resolve_shared_factors
 
 _EPS = 1e-12
 
@@ -115,14 +115,7 @@ def _parse_shared_factors(shared_factors, order: int) -> List[int]:
     """Return owner[mode] — the canonical (lowest) mode each mode's factor
     aliases to. Accepts the same specs as the main package: None/False,
     True → {(1, 2)}, "all", or a set/sequence of (i, j) pairs."""
-    if shared_factors == "all":
-        pairs = [(i, j) for i in range(order) for j in range(i + 1, order)]
-    elif shared_factors is True:
-        pairs = [(1, 2)]
-    elif not shared_factors:
-        pairs = []
-    else:
-        pairs = list(shared_factors)
+    pairs = resolve_shared_factors(shared_factors, order) or ()
 
     owner = list(range(order))
 

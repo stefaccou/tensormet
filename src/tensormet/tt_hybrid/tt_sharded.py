@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from tensormet.distance import coo_to_coords
-from tensormet.sharded_sparse import _apply_subsample
+from tensormet.sharded_sparse import apply_subsample
 from tensormet.utils import make_lazy_cupy_pair
 from tensormet.tt_hybrid.tt_chain import (
     left_envs, right_envs, site_grad, sites,
@@ -103,7 +103,7 @@ def _tt_partial_factor_num_for_shard(
     if subsample_frac < 1.0:
         # The numerator is LINEAR in the values, so rescaling by 1/frac here is
         # the unbiased choice (contrast the error worker below).
-        idxs, vals = _apply_subsample(idxs, vals, subsample_frac, iteration)
+        idxs, vals = apply_subsample(idxs, vals, subsample_frac, iteration)
 
     nnz = int(vals.size)
     if batch_nnz is None:
@@ -158,7 +158,7 @@ def _tt_partial_tied_factor_num_for_shard(
         return cp.asnumpy(out)
 
     if subsample_frac < 1.0:
-        idxs, vals = _apply_subsample(idxs, vals, subsample_frac, iteration)
+        idxs, vals = apply_subsample(idxs, vals, subsample_frac, iteration)
 
     nnz = int(vals.size)
     if batch_nnz is None:
@@ -211,7 +211,7 @@ def _tt_partial_core_num_for_shard(
         return cp.asnumpy(num)
 
     if subsample_frac < 1.0:
-        idxs, vals = _apply_subsample(idxs, vals, subsample_frac, iteration)
+        idxs, vals = apply_subsample(idxs, vals, subsample_frac, iteration)
 
     nnz = int(vals.size)
     if batch_nnz is None:
@@ -266,7 +266,7 @@ def _tt_partial_kl_error_for_shard(
 
     weight = 1.0
     if subsample_frac < 1.0:
-        idxs, vals = _apply_subsample(idxs, vals, subsample_frac, iteration,
+        idxs, vals = apply_subsample(idxs, vals, subsample_frac, iteration,
                                       rescale=False)
         weight = nnz_full / int(vals.size)
 

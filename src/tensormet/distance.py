@@ -936,7 +936,9 @@ def _gpu_free_bytes():
     # Pool blocks that are cached but currently unused are reusable for the next
     # allocation without hitting the driver, so count them as available too.
     pool_reusable = int(mempool.free_bytes())
-    return int(free_b) + pool_reusable
+    # Clamp: "free" can't exceed total device memory (guards against bogus
+    # memGetInfo/pool readings seen on some clusters).
+    return min(int(free_b) + pool_reusable, int(total_b))
 
 def _estimate_batch_num_for_outer(core, factors, safety=0.70, temp_mult=2.0, reserve_b=0):
     """

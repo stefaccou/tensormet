@@ -1,6 +1,6 @@
 import os
 import csv
-from tensormet.utils import ThreadBudget, DATA_DIR, voc_index, available_cpus, _to_np
+from tensormet.utils import ThreadBudget, DATA_DIR, voc_index, available_cpus, to_np
 import random
 import numpy as np
 from pathlib import Path
@@ -380,7 +380,7 @@ def evaluate_simlex(
         if w1 not in vecs or w2 not in vecs:
             oov_count[pos] += 1
             continue
-        v1, v2 = _to_np(vecs[w1]), _to_np(vecs[w2])
+        v1, v2 = to_np(vecs[w1]), to_np(vecs[w2])
         n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
         sim = float(v1 @ v2) / max(n1 * n2, 1e-12)
         results[pos].append((sim, human))

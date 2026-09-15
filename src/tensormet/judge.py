@@ -430,14 +430,14 @@ class DimConsistencyJudge:
             # Deferred import: tucker_tensor pulls in tensorly/CuPy and imports
             # this module lazily itself, so keep it out of judge's import time.
 
-            from tensormet.tucker_tensor import _to_np
+            from tensormet.utils import to_np
             n_words = dims                       # vocabulary size of this mode
             n_bottom = n_words // 2              # first index of the bottom half
             n_top = max(1, n_words // 10)
 
             # One descending argsort of the whole (N, R) factor, against `rank`
             # separate topk calls that each convert the factor to numpy again.
-            factor = _to_np(tucker_decomp.factors[role_idx])[:, :rank]  # (N, R)
+            factor = to_np(tucker_decomp.factors[role_idx])[:, :rank]  # (N, R)
             order = np.argsort(-factor, axis=0, kind="stable")          # (N, R) vocab ids
             top_dim_words = {
                 i: [vocab_list[j] for j in order[:self.num_dim_words, i]]
