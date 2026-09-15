@@ -627,7 +627,7 @@ class InspectionConfig:
     dataset: str = "fineweb_english_1B"
     method: str = "siiSoftPlus"
     divergence: str = "kl"
-    order: int = 3
+    order: Optional[int] = None
     iters: int = 2000
     rank: int = 150
     shared_factors: Union[bool, Set[Tuple[int, int]], str] = "all"
@@ -636,6 +636,10 @@ class InspectionConfig:
     solver: str = "mu"
     decomposition: str = "tucker"
     tt_rank: Optional[int] = None
+
+    def __post_init__(self):
+        if self.order is None:
+            self.order = infer_ngram_order(self.dataset, self.name) or 3
 
     def _norm_dim(self):
         return tuple(int(x) for x in self.dim.split("-")) if isinstance(self.dim, str) else self.dim

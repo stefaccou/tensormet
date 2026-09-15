@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from tensormet.config import InspectionConfig
+from tensormet.config import InspectionConfig, infer_ngram_order
 from tensormet.utils import DATA_DIR
 
 
@@ -792,7 +792,8 @@ def _discover_one(dataset, data_dir):
         insp = InspectionConfig(
             dim=dim, name=exp.get("name"), dataset=exp.get("dataset", dataset),
             method=exp.get("method", "siiSoftPlus"), divergence=exp.get("divergence", "kl"),
-            order=exp.get("order", 3), iters=iters, rank=rank0,
+            order=exp.get("order") or infer_ngram_order(exp.get("dataset", dataset), exp.get("name")) or 3,
+            iters=iters, rank=rank0,
             shared_factors=sf, subsample_frac=ss, max_nnz=(mn or None),
             solver=solver, decomposition=decomposition, tt_rank=tt_rank,
         )

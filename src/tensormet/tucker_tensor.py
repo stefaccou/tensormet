@@ -18,7 +18,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 
-from tensormet.config import RunConfig
+from tensormet.config import RunConfig, infer_ngram_order
 from pathlib import Path
 from tensormet.utils import (DATA_DIR,
                             date_run,
@@ -177,7 +177,7 @@ class TuckerDecomposition:
                        divergence: str="kl",
                        dims: "int | tuple[int, ...]"=4000,
                        rank: int=100,
-                       order: int=3,
+                       order: Optional[int]=None,
                        iterations: int|None=None,
                        shared_factors: bool|set|str=False,
                        map_location: str="cpu",
@@ -215,6 +215,9 @@ class TuckerDecomposition:
         """
         if method not in ALL_METHODS:
             raise ValueError(f"method must be one of {set(ALL_METHODS)}")
+
+        if order is None:
+            order = infer_ngram_order(dataset, name) or 3
 
         decomposition = (decomposition or cls._DECOMPOSITION).lower()
         if decomposition == "cp":
@@ -1165,7 +1168,7 @@ class SparseTupleTensor:
             cls,
             dataset: str = "fineweb-en",
             method: str = "siiSoftPlus",
-            order: int = 3,
+            order: Optional[int] = None,
             dims: "int | tuple[int, ...]" = 1000,
             map_location: str = "cpu",
             tier1: bool = False,
@@ -1184,6 +1187,9 @@ class SparseTupleTensor:
         """
         if method not in ALL_METHODS:
             raise ValueError(f"method must be one of {set(ALL_METHODS)}")
+
+        if order is None:
+            order = infer_ngram_order(dataset) or 3
 
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)

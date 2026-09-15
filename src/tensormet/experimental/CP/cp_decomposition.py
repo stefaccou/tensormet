@@ -49,6 +49,7 @@ from tensormet.utils import (
     voc_index,
 )
 from tensormet.naming import ALL_METHODS, candidate_stems, vocab_filename, vocab_filename_legacy
+from tensormet.config import infer_ngram_order
 
 cp, cpx_sparse = make_lazy_cupy_pair()
 
@@ -135,7 +136,7 @@ class CPDecomposition:
                        divergence: str = "kl",
                        dims: "int | tuple[int, ...]" = 4000,
                        rank: int = 100,
-                       order: int = 3,
+                       order: Optional[int] = None,
                        iterations: int | None = None,
                        shared_factors: bool | set | str = False,
                        map_location: str = "cpu",
@@ -152,6 +153,10 @@ class CPDecomposition:
         """
         if method not in ALL_METHODS:
             raise ValueError(f"method must be one of {set(ALL_METHODS)}")
+
+        if order is None:
+            order = infer_ngram_order(dataset, name) or 3
+
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
 
