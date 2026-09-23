@@ -23,6 +23,12 @@ import torch.nn.functional as F
 
 # DEFAULT_JUDGE_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_JUDGE_MODEL = "Qwen/Qwen3.5-2B" # heavier model, but needed for good performance
+# Chat messages; "{listing}" is filled with the comma-separated candidates.
+DEFAULT_JUDGE_MESSAGES = [
+    {"role": "user",
+     "content": "Which word does not belong with the others? {listing}. "
+                "Answer with only the word."},
+]
 
 def _gpu_free_bytes(device) -> int:
     """Conservative 'free bytes now' estimate,
@@ -72,8 +78,10 @@ class DimConsistencyJudge:
                  num_dim_words: int = 5,
                  diversity_aware: bool = True,
                  chunk: int = 64,
-                 device=None):
+                 device=None,
+                 messages: Optional[list[dict]] = None):
         self.model_name = model_name
+        self.messages = messages if messages is not None else DEFAULT_JUDGE_MESSAGES
         self.num_dim_words = num_dim_words
         self.diversity_aware = diversity_aware
         self.chunk = chunk
@@ -180,12 +188,8 @@ class DimConsistencyJudge:
         """Chat prompt asking the judge model to name the outlier, up to (but not
         including) the assistant's answer."""
         listing = ", ".join(candidates)
-        messages = [
-            {"role": "user",
-             "content": f"Which word does not belong with the others? {listing}. "
-                        "Answer with only the word."
-             },
-        ]
+        messages = [{**m, "content": m["content"].format(listing=listing)}
+                    for m in self.messages]
         # messages = [
         #     {"role": "system",
         #      "content": "You are a helpful assistant tasked with identifying the outlier in a list of words."},
