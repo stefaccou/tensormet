@@ -252,6 +252,17 @@ def _place_legend(ax, lines, loc, n_right):
                   frameon=False)
 
 
+def _smooth(vals, window):
+    """Centered rolling mean of ``vals``; a window of ``None``/0/1 returns it as-is.
+
+    ``min_periods=1`` keeps the series length, so a smoothed curve still spans the
+    full iteration range — its two ends are just averaged over fewer points.
+    """
+    if not window or window <= 1 or len(vals) == 0:
+        return vals
+    return pd.Series(vals).rolling(window, center=True, min_periods=1).mean().tolist()
+
+
 def _time_axis(ax1, n_right):
     """Twin axis for the iteration-time curve, offset clear of ``n_right`` existing ones."""
     axt = ax1.twinx()
@@ -263,7 +274,7 @@ def _time_axis(ax1, n_right):
 
 def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
                  plot_rec_error=True, plot_iter_time=False, title="", ax=None,
-                 stitch=True):
+                 stitch=True, smooth=None):
     """Plot reconstruction error, semantic scores and/or iteration time for one run.
 
     Pass ``ax`` to draw into an existing axis (a twin axis is created
@@ -279,6 +290,10 @@ def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
     chain via :func:`resume_chain`, so a run that was resumed to a higher
     ``n_iter_max`` plots from iteration 0 rather than from where the resume
     began. Pass ``stitch=False`` to plot exactly the segment(s) given.
+
+    ``smooth`` is an optional rolling-average window (in iterations) applied to
+    every curve — rec error, scores and iteration time alike — to damp
+    per-iteration jitter. ``None``/1 plots the raw series (see :func:`_smooth`).
     """
     if stitch and len(cfgs) == 1:
         cfgs = resume_chain(cfgs[0])
@@ -299,15 +314,15 @@ def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
         ax2 = ax1.twinx()
         n_right = 1
         its0, vals0 = _values_for_key(sem_keys[0], all_its, all_sem)
-        (l0,) = ax1.plot(its0, vals0, label=sem_keys[0], color=colors[0])
+        (l0,) = ax1.plot(its0, _smooth(vals0, smooth), label=sem_keys[0], color=colors[0])
         ax1.set_ylabel(sem_keys[0])
         its1, vals1 = _values_for_key(sem_keys[1], all_its, all_sem)
-        (l1,) = ax2.plot(its1, vals1, label=sem_keys[1], color=colors[1])
+        (l1,) = ax2.plot(its1, _smooth(vals1, smooth), label=sem_keys[1], color=colors[1])
         ax2.set_ylabel(sem_keys[1])
         all_lines = [l0, l1]
     else:
         if plot_rec_error:
-            (l,) = ax1.plot(all_its, all_rec, label="Rec error", color="red")
+            (l,) = ax1.plot(all_its, _smooth(all_rec, smooth), label="Rec error", color="red")
             ax1.set_ylabel("Reconstruction Error")
             all_lines.append(l)
         if sem_keys:
@@ -318,8 +333,8 @@ def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
                 # Offset so the first score curve isn't solid like rec error.
                 ls = _LINESTYLES[(i + (1 if plot_rec_error else 0)) % len(_LINESTYLES)]
                 its_k, vals_k = _values_for_key(key, all_its, all_sem)
-                (l,) = ax2.plot(its_k, vals_k, label=key, color=colors[i % len(colors)],
-                                linestyle=ls)
+                (l,) = ax2.plot(its_k, _smooth(vals_k, smooth), label=key,
+                                color=colors[i % len(colors)], linestyle=ls)
                 all_lines.append(l)
 
     if plot_iter_time:
@@ -332,7 +347,7 @@ def plot_metrics(*cfgs, sem_keys=("average_rank_score",),
             else:
                 axt = ax1
                 ax1.set_ylabel("Iteration time (s)")
-            (l,) = axt.plot(t_its, t_secs, color="0.35",
+            (l,) = axt.plot(t_its, _smooth(t_secs, smooth), color="0.35",
                             linestyle=_LINESTYLES[-1], label="Iteration time (s)")
             all_lines.append(l)
 
@@ -494,7 +509,7 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
                     plot_rec_error=True, plot_iter_time=False,
                     title="Training Metrics Comparison",
                     ax=None, clip_common=False, color_by=None, stitch=True,
-                    legend_loc="right"):
+                    legend_loc="right", smooth=None):
     """Overlay any number of runs on a shared figure.
 
     ``configs`` is the list of runs to plot and ``labels`` a parallel list of
@@ -539,6 +554,10 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
 
     ``legend_loc`` is ``"right"`` (beside the plot) or ``"below"`` (under the
     axes, up to 3 columns) — the latter reads better with many long run labels.
+
+    ``smooth`` is an optional rolling-average window (in iterations) applied to
+    every curve of every run, to damp per-iteration jitter; ``None``/1 plots the
+    raw series (see :func:`_smooth`).
     """
     if isinstance(configs, dict):
         if labels is None:
@@ -590,7 +609,7 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
             for k_i, (key, axis) in enumerate(zip(sem_keys, (ax1, ax2))):
                 ls = _LINESTYLES[k_i % len(_LINESTYLES)]
                 its_k, vals_k = _values_for_key(key, its, sem)
-                (l,) = axis.plot(its_k, vals_k, color=c, linestyle=ls,
+                (l,) = axis.plot(its_k, _smooth(vals_k, smooth), color=c, linestyle=ls,
                                  label=f"{lbl} · {key}")
                 all_lines.append(l)
     else:
@@ -601,14 +620,14 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
             ax2.set_ylabel("Score")
         for (its, rec, sem), lbl, c in zip(loaded, labels, run_colors):
             if plot_rec_error:
-                (l,) = ax1.plot(its, rec, color=c, linestyle=_LINESTYLES[0],
+                (l,) = ax1.plot(its, _smooth(rec, smooth), color=c, linestyle=_LINESTYLES[0],
                                 label=f"{lbl} · Rec error")
                 all_lines.append(l)
             for k_i, key in enumerate(sem_keys):
                 # Offset so the first score curve isn't solid like rec error.
                 ls = _LINESTYLES[(k_i + (1 if plot_rec_error else 0)) % len(_LINESTYLES)]
                 its_k, vals_k = _values_for_key(key, its, sem)
-                (l,) = ax2.plot(its_k, vals_k, color=c, linestyle=ls,
+                (l,) = ax2.plot(its_k, _smooth(vals_k, smooth), color=c, linestyle=ls,
                                 label=f"{lbl} · {key}")
                 all_lines.append(l)
 
@@ -628,7 +647,7 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
                 else:
                     axt = ax1
                     ax1.set_ylabel("Iteration time (s)")
-            (l,) = axt.plot(t_its, t_secs, color=c, linestyle=_LINESTYLES[-1],
+            (l,) = axt.plot(t_its, _smooth(t_secs, smooth), color=c, linestyle=_LINESTYLES[-1],
                             label=f"{lbl} · iter time")
             all_lines.append(l)
 
@@ -943,6 +962,13 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     curve has decayed enough that a linear axis flattens it out). It's hidden
     (and cleared) whenever *plot rec error* is off, since it has no effect there.
 
+    Tick *smooth* to draw every curve as a centered rolling average instead of the
+    raw series — handy for noisy semantic scores. It's off by default; ticking it
+    reveals a *window* box (in iterations, default 5) next to it. The window is
+    applied to all curves on screen, iteration time included, and the ends of each
+    curve average over fewer points rather than being dropped, so the x-range is
+    unchanged.
+
     When comparing two runs of unequal length, tick *clip to common iters* to cap
     the x-axis at the shorter run's final iteration (e.g. 250 vs 2000 → x stops at
     250), so the shared range is compared head-to-head rather than squashed.
@@ -1025,6 +1051,12 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     log_rec_chk = widgets.Checkbox(value=False, description="log scale (rec error)", indent=False,
                                    layout=widgets.Layout(display="none"))
     time_chk = widgets.Checkbox(value=False, description="plot iter time", indent=False)
+    # Off by default: smoothing is a reading aid, so the raw series is what you
+    # get unless you ask. The window box only shows while it's on (_on_smooth_toggle).
+    smooth_chk = widgets.Checkbox(value=False, description="smooth", indent=False)
+    smooth_win = widgets.BoundedIntText(value=5, min=2, max=10000, step=1, description="window",
+                                        style={"description_width": "50px"},
+                                        layout=widgets.Layout(width="130px", display="none"))
     stitch_chk = widgets.Checkbox(value=True, description="stitch resume chains", indent=False)
     clip_chk = widgets.Checkbox(value=False, description="clip to common iters", indent=False)
     after_box = widgets.Text(value="", description="after", placeholder="YYYY-MM-DD",
@@ -1194,6 +1226,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                 return
             keys = _sem_keys_selected()
             b = run_b.value          # tuple of RunRef, or None for "(none)"
+            win = smooth_win.value if smooth_chk.value else None
             fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
             try:
                 # a[-1] is the representative (latest) segment — used for titles/labels.
@@ -1202,13 +1235,13 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                 # so the plot functions must not re-expand them.
                 if b is None:
                     plot_metrics(*a, sem_keys=keys, plot_rec_error=rec_chk.value,
-                                 plot_iter_time=time_chk.value,
+                                 plot_iter_time=time_chk.value, smooth=win,
                                  title=a[-1].stem, ax=ax, stitch=False)
                 else:
                     shared, (la, lb) = _diff_labels([a[-1].insp, b[-1].insp])
                     compare_metrics([list(a), list(b)], [la, lb],
                                     sem_keys=keys, plot_rec_error=rec_chk.value,
-                                    plot_iter_time=time_chk.value,
+                                    plot_iter_time=time_chk.value, smooth=win,
                                     title=shared, ax=ax, clip_common=clip_chk.value,
                                     stitch=False)
             except FileNotFoundError as e:
@@ -1273,6 +1306,12 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
             log_rec_chk.layout.display = "none"
             log_rec_chk.value = False
 
+    def _on_smooth_toggle(change):
+        # Same pattern as _on_rec_toggle: the window box is only visible while
+        # smoothing is on. Its value is kept (it's a setting, not a filter) — with
+        # the checkbox off _redraw passes no window, so nothing stale applies.
+        smooth_win.layout.display = "" if change["new"] else "none"
+
     def _save(_btn=None):
         fig = state["fig"]
         if fig is None:
@@ -1315,6 +1354,11 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     rec_chk.observe(_on_rec_toggle, "value")
     log_rec_chk.observe(_on_select, "value")
     time_chk.observe(_on_select, "value")
+    # Smoothing only changes the drawn y-values — redraw, plus a visibility
+    # observer for the window box (cf. rec_chk / log_rec_chk above).
+    smooth_chk.observe(_on_select, "value")
+    smooth_chk.observe(_on_smooth_toggle, "value")
+    smooth_win.observe(_on_select, "value")
     # Clipping only changes the x-axis limit on the existing curves — just redraw.
     clip_chk.observe(_on_select, "value")
     # Toggling stitch changes the A/B option values (chains vs single runs), so it
@@ -1332,7 +1376,8 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         widgets.HBox(list(dataset_chk.values()), layout=widgets.Layout(flex_flow="row wrap")),
     ])
     filters = widgets.HBox(list(facet_dd.values()), layout=widgets.Layout(flex_flow="row wrap"))
-    controls = widgets.HBox([sem_dd, rec_chk, log_rec_chk, time_chk, stitch_chk, clip_chk, after_box,
+    controls = widgets.HBox([sem_dd, rec_chk, log_rec_chk, time_chk, smooth_chk, smooth_win,
+                             stitch_chk, clip_chk, after_box,
                              refresh_btn, save_name, save_btn],
                             layout=widgets.Layout(flex_flow="row wrap"))
     ui = widgets.VBox([datasets_box, filters, status, run_a, run_b, controls, plot_out])
