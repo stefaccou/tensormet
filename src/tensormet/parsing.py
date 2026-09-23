@@ -69,24 +69,28 @@ def _parse_shared_factors(s: str):
     Parse shared factor links.
 
     Accepts:
-      --shared-factors none
-      --shared-factors all
+      --shared-factors none   (or any _parse_bool false: f/false/no/n/0)
+      --shared-factors all    (or any _parse_bool true)
       --shared-factors 1-2
       --shared-factors 1-2,2-0
       --shared-factors 1:2,2:0
 
     Returns:
-      None   (if 'none'/'null'/'')
+      False  (no sharing; not None, which callers read as "flag not given")
       "all"  (sentinel — resolved to all pairs after order is known)
       tuple(((a,b), ...))
     """
     if s is None:
         return None
     s2 = str(s).strip().lower()
-    if s2 in ("", "none", "null", "no"):
-        return None
+    if s2 in ("", "none", "null"):
+        return False
     if s2 in ("all", "full"):
         return "all"
+    try:
+        return "all" if _parse_bool(s2) else False
+    except argparse.ArgumentTypeError:
+        pass  # not a boolean: parse as pairs
 
     pairs = set()
     for token in s.split(","):
@@ -424,7 +428,11 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         order = parsed_dict.get("order") or default_exp.order
         exp_kwargs["rank"] = _parse_rank(parsed_dict["rank"], n_modes=order)
 
-    new_exp = replace(default_exp, **exp_kwargs) if exp_kwargs else default_exp
+    # default_exp resolved its "all" default at the default order and replace()
+    # would copy those pairs; pass the raw spec so it resolves at the final order.
+    exp_kwargs.setdefault("shared_factors", ExperimentConfig.__dataclass_fields__["shared_factors"].default)
+
+    new_exp = replace(default_exp, **exp_kwargs)
 
     # Training overrides
     train_kwargs = {}
@@ -710,6 +718,8 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
     if d.get("top_ks_asymmetric") is not None and d.get("top_ks") is None:
         d["top_ks"] = ()
 
+    if d.get("shared_factors") is False:
+        d["shared_factors"] = None  # the config default is already None
     if d.get("shared_factors") == "all":
         cols = d.get("cols_to_build") or default_exp.cols_to_build
         d["shared_factors"] = resolve_shared_factors("all", len(cols))

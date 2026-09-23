@@ -346,6 +346,8 @@ def _fill_range(st: dict, start: int, end: int, variant) -> tuple:
         vals["count_log"] = np.log(cnt_f).astype(np.float32)
     if need["count_log_eps"]:
         vals["count_log_eps"] = (np.log(cnt_f) + _COUNT_LOG_EPS).astype(np.float32)
+    if need["count_log_p1"]:
+        vals["count_log_p1"] = np.log1p(cnt_f).astype(np.float32)
     if need["sii"]:
         vals["sii"] = _sii_range(st, sel, cnt_f).astype(np.float32)
     if need["sc"]:
@@ -909,6 +911,7 @@ def populate_tensors_parquet(
     need_prob_log  = any(t in want for t in ("probLog", "probLogSoftPlus", "probLogShifted"))
     need_count_log = "countingLog" in want          # pure log(count); log(1)=0 kept as-is
     need_count_log_eps = "countingLogEps" in want
+    need_count_log_p1 = "countingLogPlusOne" in want  # log1p(count); singletons -> log(2)
     need_sii       = any(t in want for t in ("sii", "siiSoftPlus", "siiShifted"))
     need_sc        = any(t in want for t in ("sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat"))
 
@@ -1073,6 +1076,7 @@ def populate_tensors_parquet(
     need = {
         "count": need_count, "prob_log": need_prob_log,
         "count_log": need_count_log, "count_log_eps": need_count_log_eps,
+        "count_log_p1": need_count_log_p1,
         "sii": need_sii, "sc": need_sc,
     }
     base = max(len(vocabs_max[col]) for col in cols_to_build)
@@ -1282,6 +1286,7 @@ def populate_tensors_parquet(
             if need_prob_log:      buf["prob_log"][n] = log(cnt / total_len)
             if need_count_log:     buf["count_log"][n] = log(cnt)
             if need_count_log_eps: buf["count_log_eps"][n] = log(cnt) + _COUNT_LOG_EPS
+            if need_count_log_p1:  buf["count_log_p1"][n] = log(cnt + 1)
             if need_sii:
                 v = specific_interaction_information(els_to_check)
                 buf["sii"][n] = float(v) if v != float("-inf") else -1e38
@@ -1324,6 +1329,8 @@ def populate_tensors_parquet(
                 count_log_tensor = _make_sparse_coo(idx, empty, size).coalesce()
             if need_count_log_eps:
                 count_log_eps_tensor = _make_sparse_coo(idx, empty, size).coalesce()
+            if need_count_log_p1:
+                count_log_p1_tensor = _make_sparse_coo(idx, empty, size).coalesce()
             if need_sii:
                 sii_tensor = _make_sparse_coo(idx, empty, size).coalesce()
             if need_sc:
@@ -1340,6 +1347,8 @@ def populate_tensors_parquet(
                 count_log_tensor = _make_sparse_coo(idx, torch.from_numpy(vals["count_log"]), size).coalesce()
             if need_count_log_eps:
                 count_log_eps_tensor = _make_sparse_coo(idx, torch.from_numpy(vals["count_log_eps"]), size).coalesce()
+            if need_count_log_p1:
+                count_log_p1_tensor = _make_sparse_coo(idx, torch.from_numpy(vals["count_log_p1"]), size).coalesce()
             if need_sii:
                 sii_tensor = _make_sparse_coo(idx, torch.from_numpy(vals["sii"]), size).coalesce()
             if need_sc:
@@ -1408,6 +1417,7 @@ def populate_tensors_parquet(
         if "counting"        in want: built["counting"]        = count_tensor
         if "countingLog"     in want: built["countingLog"]     = count_log_tensor
         if "countingLogEps"  in want: built["countingLogEps"]  = count_log_eps_tensor
+        if "countingLogPlusOne" in want: built["countingLogPlusOne"] = count_log_p1_tensor
         if "probLog"         in want: built["probLog"]         = prob_log_tensor
         if "probLogShifted"  in want: built["probLogShifted"]  = prob_log_shifted
         if "probLogSoftPlus" in want: built["probLogSoftPlus"] = prob_log_softplus

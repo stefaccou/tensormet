@@ -37,7 +37,7 @@ _SF    = Optional[Tuple[Tuple[int, int], ...]]
 # the whitelist for what can be loaded back).
 # ---------------------------------------------------------------------------
 ALL_METHODS = [
-    "counting", "countingLog", "countingLogEps",
+    "counting", "countingLog", "countingLogEps", "countingLogPlusOne",
     "probLog", "probLogSoftPlus", "probLogShifted",
     "sii", "siiSoftPlus", "siiShifted",
     "sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat",
