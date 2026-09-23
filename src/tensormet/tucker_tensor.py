@@ -172,18 +172,18 @@ class TuckerDecomposition:
     # --- Construction and loading ---
     @classmethod
     def load_from_disk(cls,
-                       dataset: str="fineweb-en",
-                       method: str="siiSoftPlus",
+                       dataset: str="4-gram-raw-bos-eos-fineweb-en_1B",
+                       method: str="scSoftPlus",
                        divergence: str="kl",
-                       dims: "int | tuple[int, ...]"=4000,
+                       dims: "int | tuple[int, ...]"=10000,
                        rank: int=100,
                        order: Optional[int]=None,
                        iterations: int|None=None,
-                       shared_factors: bool|set|str=False,
+                       shared_factors: bool|set|str="all",
                        map_location: str="cpu",
-                       name: Optional[str]=None,
+                       name: Optional[str]="h100",
                        tier1: bool=False,
-                       subsample_frac: float=1.0,
+                       subsample_frac: float=0.025,
                        max_nnz: Optional[int]=None,
                        solver: str="mu",
                        decomposition: Optional[str]=None,
@@ -400,11 +400,11 @@ class TuckerDecomposition:
         "divergence": "kl",
         "dims": 10000,
         "rank": 100,
-        "order": 4,
+        "decomposition":"tt",
         "shared_factors": "all",
-        "name": "h100_1B_sgd",
-        "subsample_frac": 1,
-        "solver": "sgd",
+        "name": "h100",
+        "subsample_frac": 0.025,
+        "solver": "mu",
     }
 
     @classmethod
@@ -778,7 +778,6 @@ class TuckerDecomposition:
 
         i = self.get_role_index(role)
         F = self.factors[i].cpu().numpy() if hasattr(self.factors[0], "cpu") else self.factors[i]
-
 
         # --- defensive norm computation ---
         F_norm = np.linalg.norm(F, axis=1)
