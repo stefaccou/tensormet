@@ -1,37 +1,8 @@
 """
-Mixin for visualization and inspection methods that can be lifted out of TuckerDecomposition.
+Slicing and visualization methods lifted out of TuckerDecomposition.
 
-HOW TO USE
-----------
-1. Move the desired methods from TuckerDecomposition into TuckerVizMixin below.
-   Keep 'self' as-is — the mixin pattern preserves the full instance API.
-
-2. Add TuckerVizMixin as a base class in tucker_tensor.py:
-
-       class TuckerDecomposition(TuckerVizMixin):
-           ...
-
-   Put the mixin first so its methods are easy to override.
-
-3. Remove the moved methods from TuckerDecomposition.
-
-CANDIDATES (marked with # [CANDIDATE] in tucker_tensor.py)
------------------------------------------------------------
-From the "Visualisation and inspection" section (~line 644):
-    - visualize_slice              matplotlib heatmap; not part of the core scoring API
-    - retrieve_highest_activations diagnostic/debug utility; not called during training
-
-From the TF-sparse section (~line 355) — rarely used, depend on TensorFlow:
-    - sparse_representation        TF-based sparse conversion; consider experimental/tucker_sparse.py
-    - tensor_to_sparse             thin wrapper over sparse_representation (TF path)
-    - tensor_to_dense              thin wrapper; TF path only meaningful here
-
-IMPORTS NEEDED WHEN METHODS ARE MOVED HERE
--------------------------------------------
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from tensormet.utils import voc_index
-    # plus anything the specific method uses (see tucker_tensor.py method bodies)
+Not mixed in yet: to use them, make ``TuckerVizMixin`` a base class of
+``TuckerDecomposition`` in tucker_tensor.py.
 """
 
 from __future__ import annotations
@@ -45,53 +16,6 @@ from typing import Tuple
 
 class TuckerVizMixin:
     """Visualization and rarely-used inspection methods for TuckerDecomposition."""
-    # Paste candidate methods from TuckerDecomposition here.
-
-    # def get_role_slice(self, role: str, normalize: bool=False) -> np.ndarray:
-    #     G = self._core_np()
-    #
-    #     if role == "verb":
-    #         # (num_verbs, R) × (R, R, R) -> (num_verbs, R, R)
-    #         slc = np.einsum('ip,pqr->i q r', to_np(self.factors[0]), G)
-    #     elif role == "subject":
-    #         # (num_subj, R) × (R, R, R) -> (num_subj, R, R)
-    #         slc = np.einsum('jp,pqr->j p r', to_np(self.factors[1]), G)
-    #     elif role == "object":
-    #         # (num_obj, R) × (R, R, R) -> (num_obj, R, R)
-    #         slc = np.einsum('kp,pqr->k p q', to_np(self.factors[2]), G)
-    #
-    #     else:
-    #         raise ValueError("role must be one of {'verb','subject','object'}")
-    #     if normalize:
-    #         slc = slc / np.linalg.norm(slc, axis=-1, keepdims=True)
-    #     return slc
-    #
-    # def role_slice_from_tuple(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
-    #     G = self._core_np()
-    #     v, s, o = self.fetch_latents(triple)
-    #     if role == "verb":
-    #         slc = np.einsum('pqr,q,r->qr', G, s, o)
-    #     elif role == "subject":
-    #         slc = np.einsum('pqr,p,r->pr', G, v, o)
-    #     elif role == "object":
-    #         slc = np.einsum('pqr,p,q->pq', G, v, s)
-    #     else:
-    #         raise ValueError("role must be one of {'verb','subject','object'}")
-    #     return slc
-    #
-    # def get_weighted_role_slice_from_tuple(self, triple: Tuple[str, str, str], role: str) -> np.ndarray:
-    #     G = self._core_np()
-    #     v, s, o = self.fetch_latents(triple)
-    #     if role == "verb":
-    #         slc = np.einsum('pqr,p,q,r->qr', G, v, s, o)
-    #     elif role == "subject":
-    #         slc = np.einsum('pqr,p,q,r->pr', G, v, s, o)
-    #     elif role == "object":
-    #         slc = np.einsum('pqr,p,q,r->pq', G, v, s, o)
-    #     else:
-    #         raise ValueError("role must be one of {'verb','subject','object'}")
-    #     return slc
-
     def get_role_slice(self, role: str, normalize: bool = False) -> np.ndarray:
         target_idx = self.get_role_index(role)
         G = self._core_np()
@@ -147,12 +71,6 @@ class TuckerVizMixin:
 
 
 
-    # -- Visualisation and inspection methods ---
-    # [CANDIDATE → experimental/tucker_viz.py]
-    # visualize_slice and retrieve_highest_activations are matplotlib-based
-    # diagnostic tools that are not part of the core scoring API.
-    # Move them to TuckerVizMixin in experimental/tucker_viz.py when they are
-    # no longer needed in the main class.
     def visualize_slice(self,
                         triple: Tuple[str, ...],
                         role: str,

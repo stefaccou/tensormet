@@ -1,36 +1,22 @@
 """
 cp_ops.py — Nonnegative CP (CANDECOMP/PARAFAC) multiplicative-update kernels.
 
-EXPERIMENTAL (see reviews/CP_IMPLEMENTATION_PLAN.md). Everything CP-specific
-lives under src/tensormet/experimental/CP/ so the Tucker pipeline is untouched;
-the only integration points in the main package are guarded swap points that
-default to the Tucker behaviour.
+EXPERIMENTAL (see reviews/CP_IMPLEMENTATION_PLAN.md).
 
 Model (Kolda & Bader 2009, §3):
 
     X̂ = [[λ; A(1), …, A(N)]] = Σ_{r=1..R} λ_r · a_r(1) ∘ … ∘ a_r(N)
 
-with nonnegative factor matrices A(n) (I_n × R) and weight vector λ (R,).
-There is NO core tensor: λ plays the core's role, so these kernels accept the
-weight vector through the ``core`` parameter to stay drop-in compatible with
-the UpdateRouting seam of ``SparseTupleTensor.non_negative_tucker_with_similarity``.
+with nonnegative factors A(n) (I_n × R) and weights λ (R,). λ is passed
+through the ``core`` parameter to fit the UpdateRouting seam.
 
-Representation invariant maintained by the factor updates (CP-APR-style
-normalization, Chi & Kolda 2012 §4.2): after each mode's update, that mode's
-columns are normalized (ℓ1 for KL, ℓ2 for FR) and the norms are absorbed into
-λ. The λ update therefore happens INSIDE the factor update: the ``core``
-(weights) array handed in by the loop is updated IN PLACE, and the loop's
-"core slot" (``cp_weight_update`` / ``cp_fr_combined_weights_errors``) is a
-clip-passthrough (+ fused FR error on log steps).
+After each mode's update its columns are normalized (ℓ1 for KL, ℓ2 for FR;
+CP-APR, Chi & Kolda 2012 §4.2) and the norms absorbed into λ, IN PLACE. The
+loop's core slot (``cp_weight_update`` / ``cp_fr_combined_weights_errors``) is
+therefore a clip-passthrough (+ fused FR error on log steps).
 
-All kernels follow the ``distance.py`` conventions: CuPy in/out, block-encoded
-COO input (``vec_tensor``), ``thread_budget``/``epsilon``/``verbose`` kwargs,
-ε-clipping against zero-locking (Lin 2007).
-
-Only ONE kernel family exists (NNZ-streaming): CP has no dense-Z formulation
-worth keeping — the streaming form is simultaneously the memory-safe and the
-fast path, so the Tucker dense-vs-largedim routing split does not apply.
-Transients are O(batch_nnz · R), far smaller than Tucker's R^N objects.
+Kernels follow the ``distance.py`` conventions. There is one, NNZ-streaming,
+family: transients are O(batch_nnz · R), so no dense/largedim split.
 
 References
 ----------

@@ -202,13 +202,7 @@ def kl_compute_errors(
 
     shape = tuple(shape)
 
-    # --- 1) Dense reconstruction R = G ×_1 A^{(1)} × ... ×_N A^{(N)} ---
-    # This is exactly step 3 in Table 2 of the paper.
-    # This breaks with dims over 1000
-    # R = tucker_to_tensor((core, factors))      # cp.ndarray, shape=shape
-    # R = tl.clip(R, a_min=epsilon, a_max=None)
-    # R_flat = R.ravel()                         # length = size
-
+    # --- 1) Dense reconstruction R (step 3 in Table 2 of the paper) ---
     r_nz = gather_dense_at_block_nz(R, vec_tensor, shape)
     r_nz = tl.clip(r_nz, a_min=epsilon, a_max=None)
     # --- 2) Decode sparse X indices to flat indices ---
@@ -395,16 +389,13 @@ def fr_combined_core_errors(vec_tensor, shape, core, factors, modes, thread_budg
 
     new_core = core * numerator / (denominator + epsilon)
 
-    # error_start = time.time()
     tensor_coo = vec_tensor.tocoo()
     norm_tensor = cp.sqrt((cp.abs(tensor_coo.data) ** 2).sum())
-    # norm_time = print_elapsed_time(error_start, "norm calculation")
     norm_X_sq = norm_tensor ** 2
     norm_Xhat_sq = tl.sum(new_core * denominator)
     inner_prod = tl.sum(numerator * new_core)
     residual_norm = tl.sqrt(norm_X_sq + norm_Xhat_sq - 2 * inner_prod)
     relative_error = residual_norm / norm_tensor
-    # end = print_elapsed_time(norm_time, "full error calculation")
     return new_core, relative_error
 
 def null_compute_errors(vec_tensor: cpx_sparse.spmatrix,
@@ -502,14 +493,9 @@ def _rhat_from_factor_rows_sequential(core, mats, epsilon=1e-12):
     -------
     r_hat : (b,)
 
-    The einsum body is the default: the 2026-08-03/04 bisect measured its
-    2026-07-30 peel rewrite (the branch below) as part of a ~2x iteration-time
-    regression. The peel is kept behind TENSORMET_PEEL_CONTRACTION=1 because
-    it bounds the einsum's machine-dependent path choice: the einsum path
-    depends on ``b`` (derived from free VRAM), and once materialized a
-    (b, R0, ..., R_{N-1}) intermediate on an 80 GB node at rank 100
-    (b ≈ 166k). If this contraction ever OOMs, flip the flag rather than
-    shrinking the batch estimate.
+    Einsum by default (faster). TENSORMET_PEEL_CONTRACTION=1 switches to a
+    memory-bounded peel: the einsum path depends on ``b`` and once
+    materialized a (b, R0, ..., R_{N-1}) intermediate. Flip it if this OOMs.
     """
     if use_peel_contraction():
         # Memory-bounded fallback: fixed-order peel, largest live array is
@@ -602,12 +588,9 @@ def _accumulate_core_num_outer(Num, w, mats):
         Num += slice_sum.reshape([mats[i].shape[1] for i in left_modes + right_modes])
         return
 
-    # Absorb loop modes into the left/right KR blocks (ceil/floor split) then do a
-    # single matmul.  The multi-operand einsum used previously let CuPy's path
-    # optimizer produce gigantic intermediates of shape (nnz, L, R, a) or larger —
-    # the same 1.45 TB OOM seen for order-4 tensors with high ranks.
-    # After absorption the peak intermediate is (L_ext, R_ext) = core-sized,
-    # matching what _estimate_batch_num_for_outer already budgets for.
+    # Absorb loop modes into the left/right KR blocks (ceil/floor split), then one
+    # matmul. A multi-operand einsum here can pick (nnz, L, R, a)-sized
+    # intermediates (TB-scale OOM at order 4); this keeps the peak core-sized.
     n_loop = len(loop_modes)
     n_left_loop  = (n_loop + 1) // 2   # ceil — absorbed into left KR
     n_right_loop = n_loop // 2          # floor — absorbed into right KR
@@ -645,22 +628,6 @@ def _accumulate_core_num_outer(Num, w, mats):
     target_shape = [mats[i].shape[1] for i in left_modes + loop_modes + right_modes]
     Num += result.reshape(target_shape)
 
-    # -- old Python iteration over loop-mode rank combinations (kept for reference) --
-    # loop_ranks = [mats[i].shape[1] for i in loop_modes]
-    # for loop_idx in itertools.product(*[range(r) for r in loop_ranks]):
-    #     v = w.copy()
-    #     for loop_i, r in zip(loop_modes, loop_idx):
-    #         v *= mats[loop_i][:, r]
-    #     if KR_L is not None and KR_R is not None:
-    #         slice_sum = (KR_L * v[:, None]).T @ KR_R
-    #         full_slice = [slice(None) if i in left_modes + right_modes else loop_idx[loop_modes.index(i)]
-    #                       for i in range(N)]
-    #         Num[tuple(full_slice)] += slice_sum.reshape([mats[i].shape[1] for i in left_modes + right_modes])
-    #     elif KR_L is not None:
-    #         slice_sum = cp.sum(KR_L * v[:, None], axis=0)
-    #         full_slice = [slice(None) if i in left_modes else loop_idx[loop_modes.index(i)] for i in range(N)]
-    #         Num[tuple(full_slice)] += slice_sum.reshape([mats[i].shape[1] for i in left_modes])
-
 
 def _blocked_coo_to_flat_indices(vec_tensor, orig_shape):
     orig_shape = tuple(orig_shape)
@@ -677,13 +644,9 @@ def _blocked_coo_to_flat_indices(vec_tensor, orig_shape):
 def coo_to_coords(vec_tensor, orig_shape):
     """Per-mode NNZ coordinates and values, whatever the storage form.
 
-    The single seam every NNZ-streaming (``*_largedim``) kernel goes through,
-    replacing the ``_blocked_coo_to_flat_indices`` + ``_unravel_flat_indices_C``
-    pair they used to open with.
-
-    Free for a ``CoordCOO`` (coordinates are already stored, and no linear index
-    is formed — which is what lets order-5 tensors work at all); an identical
-    decode to before for the legacy block-encoded ``coo_matrix``.
+    Entry point for every NNZ-streaming (``*_largedim``) kernel. Free for a
+    ``CoordCOO`` (no linear index is formed, which is what lets order-5 tensors
+    work); decodes the flat index for a block-encoded ``coo_matrix``.
 
     Returns
     -------
@@ -704,39 +667,22 @@ def coords_nnz(vec_tensor) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Per-mode NNZ grouping cache (2026-06-12 review, Task 3 — findings E-1/E-2/E-3)
+# Per-mode NNZ grouping cache
 # ---------------------------------------------------------------------------
-#
-# The largedim factor update groups NNZ by unfolding column (`cp.unique`), then
-# scans the full inverse-map (`cp.where`) once per column batch. Both are done
-# every iteration on a *static* tensor, so they are the single largest avoidable
-# cost in the hot loop. SOTA sparse-tensor formats (SPLATT/CSF, HiCOO, ALTO)
-# hoist exactly this per-mode grouping out of the loop. ModeGrouping precomputes
-# it once per (tensor, mode); the kernels then operate on contiguous slices.
+# Grouping NNZ by unfolding column is the same every iteration on a static
+# tensor, so it is computed once per (tensor, mode) and reused.
 
 @dataclass
 class ModeGrouping:
     """Precomputed per-mode NNZ grouping for a largedim factor update.
 
-    Built once per (tensor, mode) and reused every iteration, so the
-    ``cp.unique`` sort (E-1), the flat-index decode (E-3), and the per-batch
-    full-``inv`` ``cp.where`` scan (E-2) are all hoisted out of the training
-    loop.
+    NNZ are reordered so entries sharing an unfolding column are contiguous: a
+    batch of unique columns ``[start:end)`` is the slice
+    ``[segment_offsets[start]:segment_offsets[end])``, and the per-entry Z-row
+    index within it is ``col_index[slice] - start``.
 
-    The NNZ are reordered so that all entries sharing an unfolding column are
-    contiguous: ``rows_sorted[segment_offsets[j]:segment_offsets[j+1]]`` are the
-    mode-``mode`` coordinates of the entries in unique column ``ucols[j]`` (and
-    ``vals_sorted`` the corresponding values). A batch of unique columns
-    ``[start:end)`` is therefore the single contiguous slice
-    ``[segment_offsets[start]:segment_offsets[end])`` — no ``cp.where`` scan of
-    the whole array, just two offset lookups. ``col_index`` holds, per sorted
-    entry, the index into ``ucols`` of its column, so the per-entry Z-row index
-    within a batch is ``col_index[slice] - start`` (a plain slice + subtract; no
-    ``cp.repeat``, which CuPy will not take a device array of counts for).
-
-    Depends only on the tensor's NNZ pattern (not on the divergence or the
-    masked/full objective), so one grouping serves all of those. NOT valid under
-    stochastic subsampling, where the sampled entries change every iteration.
+    Depends only on the NNZ pattern (any divergence/objective). Not valid under
+    subsampling, where the sampled entries change every iteration.
     """
     ucols: "cp.ndarray"            # (n_ucols,) sorted unique unfolding-column ids
     segment_offsets: "cp.ndarray"  # (n_ucols+1,) run boundaries in the sorted order
@@ -842,7 +788,7 @@ def _tucker_gram_ZtZ(core, factors, mode, epsilon=1e-12):
     """
     Compute Gram = Z^T Z exactly, without forming Z.
 
-    In your dense version:
+    Dense equivalent:
         Z = transpose(unfold(tucker_to_tensor(skip_factor=mode), mode))  # (J, R_mode)
         Gram = Z^T Z                                                    # (R_mode, R_mode)
 
@@ -905,31 +851,14 @@ def _core_multilinear_grams(core, grams, epsilon=1e-12):
     tmp = cp.einsum(eq, core, *grams, optimize=cp_einsum_optimize(1 + N))
     return cp.clip(tmp, a_min=epsilon, a_max=None)
 
-    # -- old sequential tensordot+moveaxis loop (kept for reference) --
-    # tmp = core
-    # for n in range(N):
-    #     G = grams[n]  # (R_n, R_n)
-    #     # tensordot over core axis n: (R_n,R_n) x (...,R_n,...) -> (R_n, ..., ...)
-    #     tmp = cp.tensordot(G, tmp, axes=(1, n))
-    #     # tensordot brings the new R_n axis to the front; move it back to position n
-    #     tmp = cp.moveaxis(tmp, 0, n)
-    # return cp.clip(tmp, a_min=epsilon, a_max=None)
-
 
 # batch estimation helpers
 def _gpu_free_bytes():
     """
-    Conservative 'free bytes now' estimate.
+    Conservative 'free bytes now' estimate: driver free + reusable pool bytes.
 
-    CHANGED (2026-06-15): no longer calls ``mempool.free_all_blocks()`` first.
-    That flush returned every cached block to the CUDA driver via ``cudaFree``
-    — a synchronizing, single-threaded driver call — and the next kernel then
-    had to ``cudaMalloc`` it all back. Run from the per-iteration batch-size
-    estimators (~6-7×/iteration), it drained the GPU to idle while one host
-    thread sat in the driver, producing the stop-start iteration stalls (and
-    defeating the whole point of the memory pool). The driver's own free figure
-    plus the pool's cached-but-reusable bytes give the same headroom estimate
-    without any cudaFree/cudaMalloc churn.
+    Deliberately does not call ``mempool.free_all_blocks()``: the cudaFree /
+    cudaMalloc churn stalls the GPU when estimators run every iteration.
     """
     mempool = cp.get_default_memory_pool()
     free_b, total_b = cp.cuda.runtime.memGetInfo()
@@ -942,14 +871,11 @@ def _gpu_free_bytes():
 
 def _estimate_batch_num_for_outer(core, factors, safety=0.70, temp_mult=2.0, reserve_b=0):
     """
-    New estimator for the optimized matrix-multiplication accumulator.
-    It no longer assumes the materialization of the full core outer product!
+    Batch size for ``_accumulate_core_num_outer`` (Khatri-Rao + matmul).
 
     reserve_b :
-        Bytes held back from the free-VRAM budget for allocations that are not
-        live at estimate time. Used when the estimate is hoisted out of the
-        iteration loop (precompute_largedim_batches) to reserve the kernel's
-        transient NNZ decode arrays, preserving the in-kernel snapshot headroom.
+        Bytes held back for allocations not live at estimate time (the kernel's
+        transient NNZ arrays, when hoisted into precompute_largedim_batches).
     """
     N = len(factors)
     itemsize = int(np.dtype(core.dtype).itemsize)
@@ -968,16 +894,14 @@ def _estimate_batch_num_for_outer(core, factors, safety=0.70, temp_mult=2.0, res
 
     b = max(1, budget_b // max(1, bytes_per_b))
 
-    # OLD SAFE CODE: hard_cap = max(1, int(1_000_000_000 // max(1, bytes_per_b)))
-    # Hard cap: safety rail proportional to free VRAM so it scales with GPU size.
-    # 0.95 > safety (0.80), so this only binds if the budget estimate overshoots.
+    # Hard cap proportional to free VRAM; 0.95 > safety, so it only binds if the
+    # budget estimate overshoots.
     hard_cap = max(1, int(free_b * 0.95 // max(1, bytes_per_b)))
     return min(int(b), hard_cap)
 
 
-def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.7, temp_mult=4.0, reserve_b=0):  # Increased temp_mult; safety raised from 0.60
-    # reserve_b: bytes held back for allocations not live at estimate time
-    # (see _estimate_batch_num_for_outer); set when hoisted out of the loop.
+def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.7, temp_mult=4.0, reserve_b=0):
+    # reserve_b: see _estimate_batch_num_for_outer.
     N = core.ndim
     R = [int(factors[n].shape[1]) for n in range(N)]
     dtype = core.dtype
@@ -1001,18 +925,13 @@ def _estimate_batch_rhat_for_tensordot(core, factors, safety=0.7, temp_mult=4.0,
 def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.8, temp_mult=4.0,
                                masked=False, workspace_reserve=512 * 1024**2):
     """
-    Estimate safe batch size for compute_Zcols_batch.
-    Uses pure Python math to avoid numpy 32-bit overflows and sets a hard cap.
-    temp_mult has to be sufficiently high: 2 massively undershot the temp need
+    Estimate safe batch size for compute_Zcols_batch (pure Python math: no
+    32-bit overflow). temp_mult=2 undershot the temporaries badly.
 
     masked : bool
-        The masked/completion objective builds a *second* CSR (S_den) and runs a
-        second SpMM per batch (denominator += S_den @ Z_rows, see
-        _partial_numerator_for_shard), roughly doubling the per-batch sparse
-        working set. The default (numerator-only) budget under-counts this, which
-        let masked runs overshoot VRAM — the cuBLAS workspace cudaMalloc (done
-        outside CuPy's pool) then failed as CUBLAS_STATUS_NOT_INITIALIZED. When
-        masked=True the per-batch cost is inflated accordingly.
+        Doubles the per-batch cost: the masked objective runs a second CSR +
+        SpMM for the denominator. Under-counting it overshot VRAM and surfaced as
+        CUBLAS_STATUS_NOT_INITIALIZED.
     workspace_reserve : int
         Bytes held back from the free-memory budget for out-of-pool allocations
         (cuBLAS/cuSPARSE handle workspaces) so they always have room.
@@ -1043,10 +962,7 @@ def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.8, temp_mult=4.0,
 
     b = max(1, budget_b // max(1, bytes_per_b))
 
-    # OLD SAFE CODE: hard_cap = max(1, int(2_000_000_000 // max(1, tmp_bytes_per_b)))
-    # Hard cap: anchor to free VRAM so it scales with GPU size.
-    # b = free_b * safety / (tmp * temp_mult) = free_b * 0.40 / tmp;
-    # hard_cap = free_b * 0.50 / tmp = b * 1.25, so it is always above b and normally doesn't bind.
+    # Hard cap anchored to free VRAM; above b at the defaults, so normally unbinding.
     hard_cap = max(1, int(free_b * 0.50 // max(1, tmp_bytes_per_b)))
 
     return min(int(b), hard_cap)
@@ -1055,29 +971,18 @@ def _estimate_batch_cols_for_Z(core, factors, mode, safety=0.8, temp_mult=4.0,
 def precompute_largedim_batches(core, factors, modes, masked=False, nnz_live=0,
                                 coord_backed=False):
     """
-    Precompute the single-GPU largedim KL per-iteration batch sizes ONCE.
+    Precompute the single-GPU largedim KL batch sizes once per run.
 
-    CHANGED (2026-06-15): the batch-size estimates depend only on core/factor
-    shapes and dtype (fixed for a run) plus a free-VRAM snapshot, so calling
-    them inside every factor/core/error update just repeated identical
-    arithmetic — and, before the ``_gpu_free_bytes`` fix, flushed the memory
-    pool 6-7×/iteration. The main loop now calls this once, after all persistent
-    device allocations are live, and threads the results into the kernels'
-    ``batch_*`` kwargs so the kernels skip their internal estimate entirely.
+    The estimates depend only on core/factor shapes and a free-VRAM snapshot,
+    so the loop calls this once (after persistent allocations) and passes the
+    results to the kernels' ``batch_*`` kwargs.
 
     nnz_live :
-        Per-iteration NNZ count of the tensor the kernels will decode (the
-        subsample window size under stochastic subsampling, else the full nnz).
-        The kernels allocate ~(N+3)·8·nnz_live bytes of transient decode arrays
-        (flat / idxs / cols / ucols / inv) that are not live at precompute time;
-        reserving those bytes here reproduces the headroom the in-kernel
-        estimate got from snapshotting after that bookkeeping (review Task 1),
-        so hoisting the call out does not regress peak-memory safety.
+        Per-iteration NNZ the kernels decode (window size under subsampling).
+        Reserves their ~(N+3)·8·nnz_live bytes of transient decode arrays.
     coord_backed :
-        True when the kernels consume a ``CoordCOO``, whose coordinates are
-        persistent (already in the snapshot) and passed as views — ``flat`` and
-        the N ``idxs`` are never allocated, leaving only cols/ucols/inv
-        transient. Reserving the full (N+3) tail would shrink every batch.
+        True for a ``CoordCOO``: coordinates are persistent views, so only
+        cols/ucols/inv (3 arrays) are transient.
 
     Returns a dict with ``batch_cols`` (mode -> int), ``batch_rhat`` and
     ``batch_num``.
@@ -1112,8 +1017,8 @@ def kl_factor_update_largedim(
     return_parts=False,
 ):
     """
-    KL multiplicative update for Tucker factor A^(mode) WITHOUT building dense Z,
-    but mathematically equivalent to your dense-Z implementation:
+    KL multiplicative update for Tucker factor A^(mode) without building dense Z;
+    equivalent to the dense-Z update:
 
         A <- A * ( (W @ Z.T) / sum_j Z[:, j] )
 
@@ -1127,28 +1032,15 @@ def kl_factor_update_largedim(
         contribute: den[i, r] = sum_{j in Omega_i} Z[r, j]. This is the weighted/
         completion objective (treat unobserved entries as missing, not zero).
     grouping : ModeGrouping, optional
-        CHANGED (2026-06-12 review, Task 3 — E-1/E-2/E-3): precomputed per-mode
-        NNZ grouping for this (static) tensor. When supplied, the per-iteration
-        flat-index decode, ``cp.unique`` sort, and per-batch full-``inv``
-        ``cp.where`` scan are all skipped — the NNZ are already column-grouped, so
-        each column batch is a contiguous slice. Must be ``None`` under stochastic
-        subsampling (the sampled values change every iteration).
+        Precomputed column grouping of this static tensor; skips the decode,
+        ``cp.unique`` and per-batch scan. Must be ``None`` under subsampling.
     """
-
-    # Sparse unfolding X_(mode)
-    # X = unfold_from_vectorized_sparse(vec_tensor, shape, mode).tocoo()
-    # rows = X.row
-    # cols = X.col
-    # vals = X.data
-
     if verbose:
         print(f"  Updating factor {mode}...")
 
     other_modes = [m for m in range(len(shape)) if m != mode]
 
     if grouping is not None:
-        # Cached path (Task 3): NNZ already decoded, sorted and grouped by
-        # unfolding column. No _blocked_coo_to_flat_indices / cp.unique here.
         ucols = grouping.ucols
         segment_offsets = grouping.segment_offsets
         rows_sorted = grouping.rows_sorted
@@ -1156,10 +1048,7 @@ def kl_factor_update_largedim(
         col_index = grouping.col_index
         inv = None  # contiguous segments replace the inv-scan
     else:
-        # Uncached path: decode + group this iteration (subsampled tensors land
-        # here, since their NNZ pattern changes every call). Coordinate-backed
-        # tensors have nothing to decode — coo_to_coords hands back its stored
-        # coordinates, so only the grouping below costs anything.
+        # Uncached path (e.g. subsampled tensors): decode + group this call.
         idxs, vals = coo_to_coords(vec_tensor, shape)
 
         rows = idxs[mode]
@@ -1187,13 +1076,7 @@ def kl_factor_update_largedim(
     # Accumulate numerator = W @ Z.T without building full Z
     numerator = cp.zeros_like(A)
 
-    # CHANGED (2026-06-12 review, Task 1): estimate AFTER all NNZ bookkeeping
-    # (flat, idxs, cols, ucols, inv) is live on the GPU, so the free-memory
-    # snapshot reflects the actual headroom for the per-batch temporaries.
-    # Previously estimated at the top of the function, which overestimated
-    # free VRAM by ~(N+3)*8*nnz bytes. Ported from the sharded path
-    # (sharded_sparse.py::_partial_numerator_for_shard). With a grouping the
-    # cached arrays are persistent, so the snapshot is already representative.
+    # Estimate after the NNZ arrays are live, so free VRAM reflects them.
     if batch_cols is None:
         batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
 
@@ -1219,7 +1102,7 @@ def kl_factor_update_largedim(
 
         # nnz entries belonging to these unique columns
         if grouping is not None:
-            # E-2: contiguous slice of the column-grouped arrays — no full scan.
+            # Contiguous slice of the column-grouped arrays — no full scan.
             seg_lo = int(segment_offsets[start])
             seg_hi = int(segment_offsets[end])
             if seg_hi == seg_lo:
@@ -1239,9 +1122,8 @@ def kl_factor_update_largedim(
         nnz_b = int(r_i.size)
 
         if use_legacy_factor_batch():
-            # Legacy body (pre 2026-07-29): two (nnz_b, R) gathers + an
-            # (I, nnz_b) arange-column CSR faking the scatter-add. Kept behind
-            # TENSORMET_LEGACY_FACTOR_BATCH=1 for A/B validation.
+            # Legacy body (TENSORMET_LEGACY_FACTOR_BATCH=1, for A/B): two
+            # (nnz_b, R) gathers + an arange-column CSR as the scatter-add.
             A_rows = A[r_i]                # (nnz_b, R_mode)
             Z_rows = Z_u[u_i]              # (nnz_b, R_mode)
 
@@ -1269,11 +1151,8 @@ def kl_factor_update_largedim(
                 denominator_acc += S_one @ Z_rows
             continue
 
-        # CHANGED (2026-07-29): scatter-free batch body. R_nz comes from a
-        # fused sampled row-dot (SDDMM) instead of two (nnz_b, R) gathers, and
-        # the numerator SpMM runs against the UNGATHERED Z_u via the (m, I)
-        # transposed batch matrix P — Z_rows is never materialized. With a
-        # grouping, P is built sort-free straight from the segment offsets.
+        # Scatter-free body: R_nz from a fused sampled row-dot, and the SpMM runs
+        # against the ungathered Z_u via the (m, I) batch matrix P.
         m_b = end - start                  # rows of P == Z_u.shape[0]
         if grouping is not None:
             indptr_b = (segment_offsets[start:end + 1] - seg_lo).astype(cp.int32)
@@ -1302,7 +1181,7 @@ def kl_factor_update_largedim(
     if return_parts:
         return numerator, denominator
 
-    # Multiplicative KL update (matching your dense version structure)
+    # Multiplicative KL update
     A_new = A * (numerator / (denominator + 1e-12))
     A_new = cp.clip(A_new, a_min=epsilon, a_max=None)
     return A_new
@@ -1350,10 +1229,7 @@ def kl_core_update_largedim(
     # Stashing w costs nnz floats; if that's too big, you can stream (see note below).
     w_all = cp.empty_like(xvals)
 
-    # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
-    # (flat, idxs, Num/Den, w_all) is live so the free-memory snapshot is
-    # accurate. Previously estimated at the top of the function. Ported from
-    # the sharded path (sharded_sparse.py::_partial_core_num_for_shard).
+    # Estimate after the NNZ arrays are live, so free VRAM reflects them.
     if batch_rhat is None:
         batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
     if batch_num is None:
@@ -1446,9 +1322,7 @@ def kl_compute_errors_largedim(
     # --- compute r_nz in batches (like your core update r_hat pass) ---
     r_nz = cp.empty_like(x_nz)
 
-    # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
-    # (flat, x_nz, idxs, r_nz) is live so the free-memory snapshot is accurate.
-    # Previously estimated at the top of the function.
+    # Estimate after the NNZ arrays are live, so free VRAM reflects them.
     if batch_rhat is None:
         batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
 
@@ -1497,7 +1371,7 @@ def fr_factor_update_largedim(
 ):
     """
     Frobenius (Euclidean) multiplicative update for Tucker factor A^(mode)
-    WITHOUT building dense Z, but equivalent to your dense function 3:
+    without building dense Z; equivalent to the dense update:
 
         numerator   = X @ Z
         denominator = A @ (Z^T Z)
@@ -1511,24 +1385,14 @@ def fr_factor_update_largedim(
         to observed entries: den[i, r] = sum_{j in Omega_i} Xhat[i, j] Z[r, j],
         accumulated per batch. This is the weighted/completion objective.
     grouping : ModeGrouping, optional
-        CHANGED (2026-06-12 review, Task 3 — E-1/E-2/E-3): precomputed per-mode
-        NNZ grouping for this (static) tensor. When supplied, the per-iteration
-        decode, ``cp.unique`` sort, and per-batch ``cp.where`` scan are skipped
-        (the NNZ are already column-grouped). Must be ``None`` under stochastic
-        subsampling.
+        As in ``kl_factor_update_largedim``.
     """
-    # Sparse unfolding X_(mode)
-    # X = unfold_from_vectorized_sparse(vec_tensor, shape, mode).tocoo()
-    # rows = X.row
-    # cols = X.col
-    # vals = X.data
     if verbose:
         print(f"  Updating factor {mode}...")
 
     other_modes = [m for m in range(len(shape)) if m != mode]
 
     if grouping is not None:
-        # Cached path (Task 3): NNZ already decoded, sorted and grouped by column.
         ucols = grouping.ucols
         segment_offsets = grouping.segment_offsets
         rows_sorted = grouping.rows_sorted
@@ -1563,11 +1427,7 @@ def fr_factor_update_largedim(
     # ---- Numerator part: numerator = X @ Z via batching unique columns, no full Z
     numerator = cp.zeros_like(A)
 
-    # CHANGED (2026-06-12 review, Task 1): estimate AFTER all NNZ bookkeeping
-    # (flat, idxs, cols, ucols, inv) is live on the GPU so the free-memory
-    # snapshot reflects the actual headroom. Previously estimated at the top
-    # of the function. Ported from the sharded path
-    # (sharded_sparse.py::_partial_numerator_for_shard).
+    # Estimate after the NNZ arrays are live, so free VRAM reflects them.
     if batch_cols is None:
         batch_cols = _estimate_batch_cols_for_Z(core, factors, mode, masked=masked)
 
@@ -1593,7 +1453,6 @@ def fr_factor_update_largedim(
 
         # nnz entries belonging to these unique columns
         if grouping is not None:
-            # E-2: contiguous slice of the column-grouped arrays — no full scan.
             seg_lo = int(segment_offsets[start])
             seg_hi = int(segment_offsets[end])
             if seg_hi == seg_lo:
@@ -1612,8 +1471,7 @@ def fr_factor_update_largedim(
         nnz_b = int(r_i.size)
 
         if use_legacy_factor_batch():
-            # Legacy body (pre 2026-07-29), kept behind
-            # TENSORMET_LEGACY_FACTOR_BATCH=1 for A/B validation.
+            # Legacy body (TENSORMET_LEGACY_FACTOR_BATCH=1, for A/B).
             Z_rows = Z_u[u_i]           # (nnz_b, R_mode)
 
             # numerator[row] += X_ij * Z[j,:]  — cuSPARSE SpMM (no serialised atomics)
@@ -1635,9 +1493,8 @@ def fr_factor_update_largedim(
                 denominator_acc += S_den @ Z_rows
             continue
 
-        # CHANGED (2026-07-29): scatter-free batch body — same restructuring as
-        # kl_factor_update_largedim (see there). FR numerator weights are the
-        # raw values v_i, so no sampled row-dot is needed unless masked.
+        # Scatter-free body as in kl_factor_update_largedim; FR weights are the
+        # raw values, so the sampled row-dot is only needed when masked.
         m_b = end - start
         if grouping is not None:
             indptr_b = (segment_offsets[start:end + 1] - seg_lo).astype(cp.int32)
@@ -1775,10 +1632,7 @@ def fr_core_update_largedim(
     Num = cp.zeros_like(core)
     Den = cp.zeros_like(core) if masked else None
 
-    # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
-    # (flat, xvals, idxs, Num/Den) is live so the free-memory snapshot is
-    # accurate. Previously estimated at the top of the function. Ported from
-    # the sharded path (sharded_sparse.py::_partial_core_num_for_shard).
+    # Estimate after the NNZ arrays are live, so free VRAM reflects them.
     if batch_num is None:
         batch_num = _estimate_batch_num_for_outer(core, factors)
 
@@ -1857,9 +1711,7 @@ def fr_combined_core_errors_largedim(
     residual_sq = cp.asarray(0.0, dtype=core.dtype)
     norm_X_sq = cp.asarray(0.0, dtype=core.dtype)
 
-    # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
-    # (flat, xvals, idxs, Num/Den_masked) is live so the free-memory snapshot
-    # is accurate. Previously estimated at the top of the function.
+    # Estimate after the NNZ arrays are live, so free VRAM reflects them.
     if batch_num is None:
         batch_num = _estimate_batch_num_for_outer(core, factors)
 
@@ -1962,10 +1814,7 @@ def fr_compute_errors_largedim(
         norm_Xhat = cp.sqrt(cp.maximum(norm_Xhat_sq, epsilon))
         return norm_Xhat / cp.maximum(norm_X, epsilon)
 
-    # CHANGED (2026-06-12 review, Task 1): estimate AFTER the NNZ bookkeeping
-    # (x_nz, idxs) is live so the free-memory snapshot is accurate.
-    # Previously estimated at the top of the function (only triggered when the
-    # caller passed batch_rhat=None explicitly; the default is 1000).
+    # Estimate after the NNZ arrays are live, so free VRAM reflects them.
     if batch_rhat is None:
         batch_rhat = _estimate_batch_rhat_for_tensordot(core, factors)
 

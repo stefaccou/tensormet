@@ -13,47 +13,19 @@ estimator of the full numerator:
 The denominator is analytical (depends only on core and factors) and is
 always kept exact.
 
-CHANGED (2026-06-12 review, Task 2): sampling no longer draws a fresh
-``rng.permutation(nnz)`` per iteration (an 8·nnz-byte device allocation plus a
-full sort — at nnz = 10⁸–10⁹ that is 0.8–8 GB per iteration on the very GPU
-subsampling is meant to relieve).  Instead, ``CooSubsampler`` fixes one
-uniform permutation of the NNZ at construction and takes a contiguous rotating
-window of it per iteration:
+``CooSubsampler`` shuffles the NNZ once and takes a contiguous rotating window
+per iteration:
 
     window(t) = perm[(t·n_sample) % nnz : +n_sample]    (wrapping)
 
-Estimator argument: a contiguous window of a uniformly shuffled sequence is a
-uniform sample without replacement, so linear accumulations over the rescaled
-window remain unbiased; successive windows tile the NNZ like an epoch (every
-entry visited once per ⌈nnz/n_sample⌉ iterations).  The sample is a pure
-function of (base_seed, iteration) — no RNG state advances between calls, so
-a resumed run draws exactly the same windows as an uninterrupted one (this
-also fixes review finding I-3).
+A window of a uniform shuffle is a uniform sample without replacement, so the
+rescaled accumulations stay unbiased, and successive windows tile the NNZ like
+an epoch. The sample is a pure function of (base_seed, iteration), so resumed
+runs draw the same windows.
 
-Wall-clock time per iteration scales as O(p) on the NNZ-bound operations.
-Typical useful range: p = 0.1–0.3 for large NNZ counts.
-
-``cfg.exp.max_nnz`` (hard NNZ ceiling) is applied upstream in tucker_tensor.py
-as an effective fraction, so the *p* received here may already embed it.
-
-Usage
------
-In the main decomposition loop (tucker_tensor.py), build the sampler once
-before the loop and draw from it per iteration:
-
-    _iter_sampler = CooSubsampler(self.tensor, shape, subsample_frac,
-                                  cfg.exp.random_state)
-    ...
-    _current_tensor = (
-        _iter_sampler.sample(iteration) if _use_subsample else self.tensor
-    )
-
-The returned COO has the same ``(block_size, n_blocks)`` shape and rescaled
-values, so all existing update functions work without modification.
-
-For multi-GPU (ShardedSparseTensor), the same pattern lives shard-side: each
-shard's NNZ arrays are shuffled once at construction and the per-shard
-functions take contiguous windows — see ``sharded_sparse.apply_subsample``.
+``cfg.exp.max_nnz`` is applied upstream in tucker_tensor.py as an effective
+fraction, so *p* may already embed it. The multi-GPU equivalent is
+``sharded_sparse.apply_subsample``.
 """
 
 from __future__ import annotations
@@ -72,14 +44,8 @@ class CooSubsampler:
     Owns a one-time shuffled ordering of a COO matrix's NNZ and yields
     per-iteration contiguous-window subsamples.
 
-    CHANGED (Task 2): replaces the former ``subsample_coo(coo, shape, frac,
-    rng)`` + ``make_iteration_rng(seed)`` pair, which permuted the full NNZ on
-    the GPU every iteration with a stateful RNG (not checkpoint-safe).
-
-    Memory: one persistent int64 index array of 8·nnz bytes on the device
-    (built from a host-side ``np.random.default_rng`` permutation, so no GPU
-    sort ever runs); per-iteration allocations are O(n_sample) — the gathered
-    row/col/data of the window — never O(nnz).
+    Memory: one persistent int64 permutation (8·nnz bytes, drawn host-side);
+    per-iteration allocations are O(n_sample).
 
     Parameters
     ----------
@@ -123,12 +89,8 @@ class CooSubsampler:
         """
         Return iteration *t*'s rescaled subsample of the wrapped COO.
 
-        The window is ``perm[(t·n_sample) % nnz : +n_sample]`` (wrapping), and
-        values are multiplied by ``1/frac`` so any downstream accumulation is
-        an unbiased estimator of the same accumulation over the full matrix.
-        The returned matrix preserves the input's ``(block_size, n_blocks)``
-        shape, so it is a drop-in replacement wherever ``vec_tensor`` is
-        expected.
+        Values are multiplied by ``1/frac`` (unbiased accumulations); the shape
+        is unchanged, so it drops in wherever ``vec_tensor`` is expected.
         """
         if self._perm is None:
             return self.coo

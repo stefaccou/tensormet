@@ -128,11 +128,8 @@ class TrainingConfig:
     tier1: bool = False
     overwrite: bool = False
     data_dir: Path = DATA_DIR
-    # HPC mode: stage all per-run artifact writes (model, errors, fitness,
-    # checkpoints, log) to node-local scratch ($TMPDIR) during the run, then
-    # copy them back to data_dir (shared GPFS) once at the end. Relieves the
-    # metadata-lock contention that explodes iteration times when many array
-    # tasks write to the same GPFS decomposition directory simultaneously.
+    # HPC mode: write run artifacts to node-local $TMPDIR, copy to data_dir at the
+    # end (avoids GPFS metadata-lock contention between array tasks).
     hpc: bool = False
 
 @dataclass(frozen=True)
@@ -140,7 +137,7 @@ class EvalConfig:
     rec_check_every: int = 20
     rec_log_every: Optional[int] = None  # None/0 → falls back to rec_check_every
     sem_check_every: int = 20
-    sem_error_type: Union[str, Tuple[str, ...]] = "full" # updated 2026-03-04
+    sem_error_type: Union[str, Tuple[str, ...]] = "full"
     sem_primary_key: Optional[str] = None  # overrides auto-derived primary key for patience/diff/logging
     sem_softmax_temperature: float = 0.1
     sem_fitness_target: int = 10_000
@@ -150,20 +147,14 @@ class EvalConfig:
     dim_consistency_words: int = 5          # top words per dimension shown to the judge
     dim_consistency_diversity: bool = True  # rescale by distinct-top-word diversity
     dim_consistency_model: str = "Qwen/Qwen3.5-2B"
-    # Which DimConsistencyJudge method(s) to run at each semantic check when
-    # dim_consistency is enabled:
-    #   "score"      -> score() (per-latent-dimension outlier task)
-    #   "similarity" -> score_similarity_consistency() (nearest-neighbour outlier task)
-    #   "both"       -> run both and merge their outputs into sem_out
+    # "score" (per-dimension outlier task) | "similarity" (nearest-neighbour
+    # outlier task) | "both"
     dim_consistency_method: str = "both"
     remove_OOV: bool = False # whether to set OOV in test set to OOV token (false ignores the sentences)
     time_iteration: bool = True # whether to print the time taken by an iteration
     save_intermediate: bool = True # whether to save the current best model (safety for interrupted code)
-    # Proactive GPU pool trim cadence (iterations). None -> default to sem_check_every.
-    # Every this-many iterations the CuPy memory pool's cached-but-unused blocks are
-    # returned to the driver on each shard device, reclaiming transient eval/copy
-    # memory so out-of-pool cuBLAS/cuSPARSE workspaces keep their headroom (the
-    # device-0 CUBLASError cascade). Kept off the per-iteration hot path on purpose.
+    # Iterations between CuPy pool trims (keeps cuBLAS workspace headroom).
+    # None -> sem_check_every. Never per iteration: that stalls the GPU.
     pool_trim_every: Optional[int] = None
     log_file: Optional[Union[str, Path]] = None
 
@@ -183,91 +174,36 @@ class ExperimentConfig:
     normalize_factors: bool = False
     shared_factors: Union[str, Optional[Tuple[Tuple[int, int], ...]]] = "all"
     subsample_frac: float = 0.025
-    # Hard ceiling on the number of NNZ entries used per update step, global
-    # across all GPU shards (each shard gets ~max_nnz/n_shards). Combines with
-    # subsample_frac as min(round(frac*nnz), max_nnz); None/0 = off. Applied as
-    # an effective fraction at fit time (tucker_tensor.py); the raw int is the
-    # identity carried by filenames ("_{max_nnz}mn") and resume checks.
+    # Global cap on NNZ per update step: min(round(frac*nnz), max_nnz); None/0 =
+    # off. The raw int is part of filenames ("_{max_nnz}mn") and resume checks.
     max_nnz: Optional[int] = None
-    # "full"   -> fit the entire (zero-filled) tensor; correct for count/co-occurrence data
-    #             where an unobserved entry genuinely means 0.
-    # "masked" -> fit ONLY observed (nonzero) entries; treat the rest as missing
-    #             (weighted/completion objective). Correct for recommendation/generalisation
-    #             data (e.g. Netflix) where "unobserved" != "rated 0".
+    # "full": zero-filled tensor (count data, unobserved = 0).
+    # "masked": observed entries only (completion; unobserved = missing).
     objective: str = "full"
-    # EXPERIMENTAL (reviews/CP_IMPLEMENTATION_PLAN.md): which decomposition
-    # family to fit. "tucker" (default) is the existing pipeline, unchanged;
-    # "cp" routes to the nonnegative CP kernels in experimental/CP/ (single-GPU,
-    # objective="full" only for now). Validated at unpack time in the loop.
+    # "tucker" | "tt" | "cp" (EXPERIMENTAL, reviews/CP_IMPLEMENTATION_PLAN.md).
     decomposition: str = "tucker"
-    # CP-only knobs (ignored for decomposition="tucker"):
-    #   cp_inner_iters   — CP-APR 'maxinner': Φ/B repetitions per mode per sweep
-    #                      (default 1 = plain sweep, matching the Tucker loop).
-    #   cp_scooch_kappa  — CP-APR §4.1 nudge for inadmissible zeros (default 0 =
-    #                      off; the ε-clip already prevents exact zeros).
+    # CP-only: CP-APR inner repetitions per mode, and §4.1 zero nudge (0 = off).
     cp_inner_iters: int = 1
     cp_scooch_kappa: float = 0.0
-    # Tucker-TT hybrid only (tt_hybrid): uniform bond dimension of
-    # the tensor-train core. Capped per cut by the exact TT rank.
+    # TT only: uniform bond dimension, capped per cut by the exact TT rank.
     tt_rank: int = 100
-    # Which optimizer family fits the model (sgd/README.md). "mu" (default) is
-    # the existing multiplicative-update pipeline, unchanged; "sgd" routes to
-    # the torch minibatch trainer in sgd/ (Tucker only). Orthogonal to
-    # `decomposition`.
-    # Validated at unpack time in the loop.
+    # "mu" | "sgd" (torch minibatch trainer, Tucker only; see sgd/README.md).
     solver: str = "mu"
-    # SGD-only knobs (ignored for solver="mu"). One loop "iteration" is a block
-    # of sgd_steps_per_iteration optimizer steps, so every iteration-based knob
-    # (n_iter_max, rec/sem_check_every, checkpoint_saving_steps, patience, ...)
-    # keeps its meaning at block granularity.
+    # SGD-only knobs. One loop iteration = sgd_steps_per_iteration steps.
     sgd_lr: float = 1e-2
     sgd_batch_size: int = 4096
     sgd_optimizer: str = "adam"            # "adam" | "sgd"
     sgd_parametrization: str = "softplus"  # "softplus" | "clamp"
     sgd_steps_per_iteration: int = 100
-    # Path to an MU model .pt used as INIT (warm start). Distinct from resume:
-    # optimizer state starts fresh and the step counter starts at 0. Part of the
-    # resume-compatibility identity because it changes the whole trajectory.
-    sgd_warm_start: Optional[str] = None
-    # SGD multi-GPU knobs (ignored when n_gpus == 1, except sgd_micro_batch and
-    # sgd_cuda_graph which apply to the single-GPU trainer too).
-    #   sgd_batch_scope   — "per_device" (default): every GPU samples
-    #                       sgd_batch_size entries, so the effective batch is
-    #                       n_gpus x sgd_batch_size and per-device work is
-    #                       constant in n_gpus. "global": the old behaviour,
-    #                       sgd_batch_size split across the GPUs. TRAJECTORY.
-    #   sgd_sync_every    — local-SGD cadence: K local Adam steps per device,
-    #                       then parameter averaging. Divides the barrier count
-    #                       by K, but makes every device pay the exact
-    #                       zero-entry term every step — a win for KL/order 3,
-    #                       a loss when that term dominates. TRAJECTORY.
-    #   sgd_micro_batch   — entries per forward/backward inside one step;
-    #                       gradients accumulate, so this is exact, not an
-    #                       approximation. None derives it from the rank, which
-    #                       under the two-group contraction is the whole batch
-    #                       up to ~order 4 / rank 200; it binds at order 5+.
-    #   sgd_cuda_graph    — capture the fixed-shape step body as a CUDA graph.
-    #                       Opt-in; addresses the dispatch-bound regime.
-    #   sgd_comm_backend  — "auto" | "nccl" | "host" (sgd/collectives.py).
-    #   sgd_eval_sample   — nnz evaluated per logged error. None (default) is
-    #                       the exact pass over every nnz, which costs the same
-    #                       per entry as a training step: roughly
-    #                       nnz / (3 · sgd_batch_size · sgd_steps_per_iteration ·
-    #                       rec_check_every) times a block's compute, so on a
-    #                       large tensor it dominates the run. Setting it
-    #                       evaluates a FIXED random subset instead (unbiased for
-    #                       the KL numerator / squared FR numerator); the final
-    #                       reported error is still computed exactly. Affects the
-    #                       logged curve and hence when patience fires, not the
-    #                       update sequence.
-    # Only sgd_batch_scope and sgd_sync_every affect the trajectory and hence
-    # resume compatibility.
-    sgd_batch_scope: str = "per_device"
-    sgd_sync_every: int = 1
-    sgd_micro_batch: Optional[int] = None
-    sgd_cuda_graph: bool = False
-    sgd_comm_backend: str = "auto"
-    sgd_eval_sample: Optional[int] = None
+    sgd_warm_start: Optional[str] = None   # MU model .pt used as init (not resume)
+    # Multi-GPU SGD knobs (see sgd/README.md). Only batch_scope and sync_every
+    # change the trajectory, and hence resume compatibility.
+    sgd_batch_scope: str = "per_device"    # "per_device" | "global"
+    sgd_sync_every: int = 1                # local steps between parameter averages
+    sgd_micro_batch: Optional[int] = None  # entries per fwd/bwd; None = rank-derived
+    sgd_cuda_graph: bool = False           # capture the step body as a CUDA graph
+    sgd_comm_backend: str = "auto"         # "auto" | "nccl" | "host"
+    sgd_eval_sample: Optional[int] = None  # fixed nnz subset per logged error; None = exact
 
     def __post_init__(self):
         object.__setattr__(self, "shared_factors", resolve_shared_factors(self.shared_factors, self.order))
@@ -281,19 +217,10 @@ class RunConfig:
     def run_id(self) -> str:
         """Fingerprint of the FULL invocation (every exp/train/eval field).
 
-        This is deliberately environment-inclusive: two runs that differ only in
-        execution context (``gpu_id``, ``n_gpus``, ``data_dir``, ``hpc``,
-        ``log_file``, …) get distinct ids. That is required by ``staging_root``,
-        which uses ``run_id`` to isolate concurrent array tasks that happen to
-        share a ``$TMPDIR`` — narrowing it to "scientific" fields would let two
-        such tasks collide. It also keeps ``run_id`` recomputable from the ``cfg``
-        stored alongside it in ``runs.jsonl`` / ``*_config.json`` (a 1:1 mapping
-        back to the exact invocation).
-
-        It is NOT the scientific/structural identity of an experiment. Artifact
-        retrieval is keyed by ``model_filename()`` (divergence/method/order/dim/
-        rank/iters/…), and resume-compatibility is decided by
-        ``get_resume_state()`` comparing structural fields — neither uses run_id.
+        Deliberately includes execution context (``gpu_id``, ``hpc``, ...):
+        ``staging_root`` uses it to keep concurrent tasks sharing a ``$TMPDIR``
+        apart. It is not the experiment identity: artifacts are keyed by
+        ``model_filename()`` and resume by ``get_resume_state()``.
         """
         payload = json.dumps(asdict(self), sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha1(payload).hexdigest()[:10]

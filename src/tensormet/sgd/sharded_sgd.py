@@ -1,53 +1,19 @@
 """
 sharded_sgd.py — single-process multi-GPU SGD Tucker trainer.
 
-Parallel counterpart of ``sgd_trainer.SGDTrainer``, selected by the loop
-when ``cfg.exp.solver == "sgd"`` and ``cfg.train.n_gpus > 1``.
-Same idea as the sharded_sparse.ShardedSparseTensor idea for Multi-GPU handling in Multiplicative Updates.
-no torch.distributed / DDP / spawn, so the tee logger, SIGINT handler,
-judge, and checkpoint writer stay unambiguous.
+Parallel counterpart of ``sgd_trainer.SGDTrainer`` (``--n_gpus > 1``), in one
+process like ``sharded_sparse.ShardedSparseTensor``: no torch.distributed, so
+the logger, SIGINT handler, judge and checkpoint writer stay unambiguous.
 
+Each device holds a contiguous NNZ shard with its own ``EntryBatcher``, a full
+model replica, optimizer and ``GradStepper``; device 0's is ``self.master`` /
+``self.opt`` and is what gets checkpointed.
 
-Layout
-------
-- The coalesced NNZ is split contiguously into ``len(device_ids)`` shards;
-  shard *g*'s indices/values live on device *g* with its own ``EntryBatcher``
-  seeded ``random_state * 1000 + g`` (same convention as sharded_sparse), so
-  every shard's batch remains a pure function of (seed, step) and resume
-  replays exactly.
-- Every device holds a full model replica, its own optimizer, and its own
-  ``GradStepper``. Device 0's is aliased as ``self.master`` / ``self.opt`` so
-  checkpointing is unchanged and payloads stay byte-compatible with the
-  single-GPU trainer's.
-
-Per step (``sgd_sync_every == 1``)
-----------------------------------
-1. fan out to the pool: each device computes the *sampled* loss term on its own
-   sub-batch (scale = nnz_g / batch_g, so the sum over devices is unbiased for
-   the total) and backprops it, micro-batched, into its flat gradient buffer.
-   The EXACT zero-entry term is added on device 0 only — it is a function of
-   the parameters alone, so adding it once keeps the summed gradient correct;
-2. one all-reduce of the G flat gradient buffers;
-3. fan out again: every device runs ``opt.step()`` + ``project_()`` on the same
-   summed gradient, so all replicas stay bit-identical without any broadcast.
-
-Per ``sgd_sync_every == K > 1``
--------------------------------
-Each device takes K local Adam steps, then parameters are averaged
-(all-reduce / G) — standard local SGD. This divides the barrier count by K,
-which is the highest-leverage knob when the step is dispatch-bound. The loss
-changes under local steps: each device must optimize an unbiased estimate of
-the *full* objective on its own, so ``scale_g = nnz / batch_g`` (global nnz)
-and **every** device adds the zero-entry term in full. That makes ``K > 1`` a
-win when the zero-entry term is cheap relative to overhead (KL, order 3) and a
-loss when it dominates (FR with a large core). See SGD/README.md.
-
-Checkpoints carry only device 0's state — identical payload to the single-GPU
-trainer. Resume across a *different* ``n_gpus`` no longer reproduces the same
-trajectory under the new defaults (per-device batching and local steps both
-make the trajectory a function of G), so ``n_gpus`` joined the
-resume-compatibility key; under ``batch_scope="global"`` with
-``sync_every=1`` the old promise still holds.
+Per step (``sync_every == 1``): each device backprops its sampled loss (the
+exact zero-entry term only on device 0), one all-reduce sums the gradients,
+and every device steps on the same sum, so replicas stay bit-identical.
+With ``sync_every == K > 1``: K local steps (each device adds the full
+zero-entry term), then parameter averaging. See sgd/README.md.
 """
 from __future__ import annotations
 
@@ -71,8 +37,7 @@ from tensormet.sgd.sgd_tucker import (
 )
 from tensormet.utils import SparseCOOTensor
 
-# Back-compat alias: the pre-Phase-1 module exposed the shard-local objective
-# under this name and the multi-GPU notebook imports it from here.
+# Alias kept for the multi-GPU notebook, which imports it from here.
 _sampled_loss = sampled_loss
 
 
@@ -544,23 +509,10 @@ class ShardedSGDTrainer:
             )
         self.master.load_state_dict(payload["raw_state_dict"])
         self._broadcast_params()
-        # Every device runs its own optimizer, so every device needs the
-        # restored moments — resuming with fresh moments on the replicas would
-        # make them step differently from device 0 and break the replicas'
-        # bit-identity.
-        #
-        # The deepcopy is load-bearing, not defensive. Optimizer.load_state_dict
-        # moves each state tensor with ``value.to(device=param.device)``, which
-        # yields a fresh tensor per optimizer for the moments — but Adam's
-        # ``step`` counter is deliberately kept on the HOST (it is only moved to
-        # the device for the capturable/fused paths), and ``.to()`` on a tensor
-        # already on the target device returns *the same object*. Loading one
-        # payload into all G optimizers therefore hands them a single shared
-        # ``step`` tensor, which every ``opt.step()`` increments in place — from
-        # G pool threads at once. The replicas then apply different bias
-        # corrections and diverge on the first post-resume step. Copying per
-        # optimizer removes the aliasing for ``step`` and anything else that
-        # happens to land on the host.
+        # Every device steps, so every optimizer needs the restored moments.
+        # The deepcopy is load-bearing: Adam keeps ``step`` on the host, where
+        # ``.to()`` returns the same object, so without it all G optimizers
+        # share one ``step`` tensor, increment it concurrently, and diverge.
         for opt in self._opts:
             opt.load_state_dict(copy.deepcopy(payload["optim_state"]))
         self._check_optimizer_state_disjoint()

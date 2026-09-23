@@ -1670,9 +1670,6 @@ class SparseTupleTensor:
         else:
             rank = validate_tucker_rank(shape, rank=rank)
             modes = list(range(len(rank)))
-        # NOTE (Task 6): the routing size decision is centralised in
-        # needs_largedim(dim, ...) (see _largedim_selected below); no local
-        # max(shape) threshold variable is needed here anymore.
         # SGD checkpoints are dict payloads carrying optimizer state alongside
         # the (core, factors) views; they are consumed by the trainer below,
         # never by the CuPy init path. Cross-solver loads are impossible by
@@ -1857,39 +1854,23 @@ class SparseTupleTensor:
             _sst = ShardedSparseTensor.from_coo(
                 self.tensor, shape, device_ids=list(range(_n_gpus)),
                 subsample_frac=_subsample_frac, masked=masked,
-                # CHANGED (2026-06-12 review, Task 2): seeds the one-time per-shard
-                # NNZ shuffle that backs contiguous-window subsampling.
+                # Seeds the one-time per-shard NNZ shuffle used by subsampling.
                 subsample_seed=int(cfg.exp.random_state or 0),
             )
         else:
             _sst = None
 
         # --- stochastic subsampling (single-GPU path) ---
-        # CHANGED (2026-06-12 review, Task 2): CooSubsampler shuffles the NNZ once
-        # here and serves contiguous rotating windows per iteration, replacing the
-        # stateful RNG + per-iteration full permutation of subsample_coo. Samples
-        # are now a pure function of (random_state, iteration), so resumed runs
-        # draw the same sequence as uninterrupted ones (review finding I-3).
+        # Windows are a pure function of (random_state, iteration): resume-safe.
         _iter_sampler = (
             CooSubsampler(self.tensor, shape, _subsample_frac, cfg.exp.random_state)
             if (_subsample_frac < 1.0 and _sst is None) else None
         )
 
         # --- per-mode NNZ grouping cache (single-GPU largedim path) ---
-        # CHANGED (2026-06-12 review, Task 3 — E-1/E-2/E-3): when the single-GPU
-        # largedim factor kernels run on a static tensor, precompute each mode's
-        # column grouping (sort + unique + segment offsets) once here and reuse it
-        # every iteration, replacing the per-iteration decode + cp.unique + per-batch
-        # cp.where scan. Mirror routing.get_update_routing_step's factor decision so
-        # the cache is built only when the factor function is actually a largedim
-        # kernel (the only one that accepts `grouping`). Disabled under subsampling
-        # (sampled NNZ change every iteration) and on the multi-GPU path (the SST
-        # owns its own per-shard caches).
-        # CHANGED (2026-06-12 review, Task 6): the dense vs. largedim decision is
-        # now the single needs_largedim() predicate, shared by routing, this cache
-        # gate AND the multi-GPU override below — so all of them agree on the
-        # selected family (previously this gate used divergence-specific 4000
-        # literals that could disagree with routing for FR dims in (3000, 4000]).
+        # Built once and reused every iteration. Only for the largedim factor
+        # kernels on a static tensor: not under subsampling, and not multi-GPU
+        # (the SST keeps its own). needs_largedim() matches routing's choice.
         _largedim_selected = needs_largedim(dim, largedim=largedim, masked=masked)
         _factor_is_largedim = _largedim_selected
         # The CP and TT kernels stream NNZ directly (no column grouping, own
@@ -1902,16 +1883,8 @@ class SparseTupleTensor:
         )
 
         # --- per-iteration batch sizes (single-GPU largedim KL path) ---
-        # CHANGED (2026-06-15): the largedim KL factor/core/error kernels sized
-        # their column/NNZ batches by calling _estimate_batch_*() every update,
-        # and each estimate flushed the CuPy pool to the driver (cudaFree +
-        # re-cudaMalloc), stalling the GPU to idle ~6-7×/iteration. The estimates
-        # depend only on core/factor shapes+dtype (fixed for the run), so compute
-        # them ONCE here and thread them into the kernels' batch_* kwargs. Gated
-        # to the KL single-GPU largedim path (FR/sharded/plain kernels size
-        # themselves; the SST owns its own batching). nnz_live reserves the
-        # kernels' transient decode arrays so hoisting keeps Task 1's headroom.
-        # (_full_nnz is computed once above, alongside the max_nnz resolution.)
+        # Estimated once here (shapes are fixed for the run) and passed to the
+        # kernels' batch_* kwargs; other paths size their own batches.
         _nnz_live = _iter_sampler.n_sample if _iter_sampler is not None else _full_nnz
         _largedim_batches = (
             precompute_largedim_batches(core, factors, modes, masked=masked, nnz_live=_nnz_live,
@@ -2044,9 +2017,7 @@ class SparseTupleTensor:
                 _tt_batch_nnz = estimate_batch_nnz_tt(core, factors)
 
         print(divergence, rank, _subsample_frac)
-        # CHANGED (2026-06-12 review, Task 6): announce the routing family chosen by
-        # the unified needs_largedim() predicate. Sharding engages iff largedim does
-        # (and n_gpus > 1), so the three cases below are mutually exclusive.
+        # Announce the routing family (sharding engages iff largedim and n_gpus > 1).
         if _is_cp:
             _selected_path = (f"cp (nnz-streaming, inner_iters={cp_inner_iters}"
                               + (f", sharded×{_n_gpus}" if _sst is not None else "")
@@ -2100,18 +2071,10 @@ class SparseTupleTensor:
         # launch.py's runtime_seconds). Persisted so benchmarks can report a
         # decomposition time distinct from total process runtime.
         _decomp_loop_start = time.time()
-        # Per-iteration solve time (updates + error kernel), excluding the
-        # semantic evaluation that also runs inside the loop. Summed into
-        # solve_seconds below so benchmarks can separate "time spent actually
-        # decomposing" from eval and data-loading overhead. GPU work is
-        # asynchronous, so the timer is bracketed by sync_devices() — without
-        # it the per-iteration numbers measure kernel *queueing* and the cost
-        # lands on whichever later iteration happens to block.
-        # CHANGED (2026-08-04, perf regression fix): the barriers run on log
-        # steps only. Syncing every iteration serialized the loop against the
-        # devices and was part of the Aug-03 iteration-time regression; the
-        # cost of the looser bracketing is only that a non-log iteration's
-        # queued tail is charged to the next log step's time=.
+        # Per-iteration solve time (updates + error, excluding semantic eval),
+        # summed into solve_seconds. GPU work is async, so the timer is bracketed
+        # by sync_devices() on log steps only: syncing every iteration serializes
+        # the loop. A non-log iteration's queued tail lands on the next log step.
         _iter_seconds = []
         _sync_backend = "torch" if _is_sgd else "cupy"
         # Initialized so post-loop bookkeeping (e.g. "iterations": iteration + 1) is well
@@ -2139,12 +2102,8 @@ class SparseTupleTensor:
                                                   cp_inner_iters=cp_inner_iters,
                                                   cp_scooch_kappa=cp_scooch_kappa)
                 # --- multi-GPU routing override (largedim variants only) ---
-                # CHANGED (2026-06-12 review, Task 6): gate on the same needs_largedim()
-                # predicate as routing (via _largedim_selected) instead of re-deriving
-                # divergence-specific 4000 literals. Sharding now engages iff the
-                # largedim path is selected and a shard set exists (n_gpus > 1).
-                # CP and TT each have one kernel family, so _largedim_selected
-                # does not apply to them.
+                # Sharding engages iff largedim is selected and n_gpus > 1. CP and
+                # TT have a single kernel family, so _largedim_selected doesn't apply.
                 if _is_cp and _sst is not None:
                     from tensormet.experimental.CP.cp_routing import (
                         get_sharded_cp_update_routing_step,
@@ -2242,15 +2201,10 @@ class SparseTupleTensor:
                         epsilon=epsilon,
                         verbose=verbose,
                     )
-                    # CHANGED (2026-06-12 review, Task 3): hand the largedim factor
-                    # kernel its cached per-mode grouping (built lazily on first use)
-                    # so it skips the decode/unique/scan. Only set when the cache is
-                    # active (single-GPU largedim, no subsampling); the SST path caches
-                    # internally and other kernels never receive this kwarg.
+                    # Cached per-mode grouping (only when the cache is active).
                     if _grouping_cache is not None:
                         _factor_kwargs["grouping"] = _grouping_cache.get(mode)
-                    # Precomputed col-batch size (largedim KL factor kernel only);
-                    # skips the per-update _estimate_batch_cols_for_Z + pool flush.
+                    # Precomputed col-batch size (largedim KL factor kernel only).
                     if _largedim_batches is not None:
                         _factor_kwargs["batch_cols"] = _largedim_batches["batch_cols"][mode]
                     if _tt_batch_nnz is not None:
@@ -2264,12 +2218,8 @@ class SparseTupleTensor:
 
                 # --- core + error ---
                 if routing.core_returns_error:
-                    # FR: combined core update + error in one call.
-                    # CHANGED (2026-06-12 review, Task 5 — I-1): feed the FULL tensor,
-                    # not the subsampled/rescaled _current_tensor. This call only fires
-                    # on log steps (routing sets core_returns_error = True*log_step), so
-                    # the fused error portion (norm_X², ⟨X,X̂⟩) is unbiased; the core MU
-                    # step it also performs is then the exact full-NNZ update that step.
+                    # FR: combined core update + error in one call. Only runs on log
+                    # steps, and gets the FULL tensor so the error is unbiased.
                     core, rel_err = routing.core_update(
                         vec_tensor=self.tensor,
                         shape=shape,
@@ -2292,8 +2242,7 @@ class SparseTupleTensor:
                         epsilon=epsilon,
                         verbose=verbose,
                     )
-                    # Precomputed NNZ-batch sizes (largedim KL core kernel only);
-                    # skips the per-update _estimate_batch_* + pool flush.
+                    # Precomputed NNZ-batch sizes (largedim KL core kernel only).
                     if _largedim_batches is not None:
                         _core_kwargs["batch_rhat"] = _largedim_batches["batch_rhat"]
                         _core_kwargs["batch_num"] = _largedim_batches["batch_num"]
@@ -2301,13 +2250,10 @@ class SparseTupleTensor:
                         _core_kwargs["batch_nnz"] = _tt_batch_nnz
                     core = routing.core_update(**_core_kwargs)
 
-                    # CHANGED (2026-06-12 review, Task 5 — I-1): the KL error runs on
-                    # the FULL tensor, not the subsampled/rescaled _current_tensor.
-                    # x·log(x/r), the sum_R_nz zero-correction, and ‖X‖ are nonlinear
-                    # in the rescaled values, so a subsampled error is biased by frac.
-                    # error_fn only does real work on log steps (else null_compute_errors),
-                    # so full-NNZ evaluation is cheap. The core update above keeps using
-                    # _current_tensor (its MU numerator is linear → 1/frac-unbiased).
+                    # The KL error runs on the FULL tensor: it is nonlinear in the
+                    # rescaled values, so a subsampled error would be biased. It only
+                    # does real work on log steps. (The core update above is linear,
+                    # so the subsample is fine there.)
                     _err_kwargs = dict(
                         vec_tensor=self.tensor,
                         shape=shape,

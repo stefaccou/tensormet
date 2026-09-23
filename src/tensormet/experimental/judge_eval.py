@@ -269,51 +269,16 @@ def make_judge_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                        judge_model=DEFAULT_JUDGE_MODEL, device=None):
     """Interactive browser for judge-evaluating saved decompositions.
 
-    Requires ``ipywidgets`` (and, for GPU scoring, a CUDA-visible device — the
-    judge falls back to CPU with a warning otherwise).
+    Requires ``ipywidgets`` (the judge falls back to CPU without CUDA).
 
-    Layout mirrors :func:`~tensormet.experimental.inspect_tucker.make_run_browser`:
-    dataset checkboxes pool runs across ``tensors/*/decomposition`` directories and
-    the facet drop-downs narrow them. Instead of Run A/B pickers there is a
-    multi-select — ctrl/cmd-click any number of runs and hit **▶ Evaluate** to
-    score them with the judge. Results accumulate across clicks (cached per run +
-    judge settings, so re-evaluating is free) and are shown three ways:
+    Pick runs as in :func:`~tensormet.experimental.inspect_tucker.make_run_browser`,
+    multi-select any number and hit **▶ Evaluate**. Results are cached per run +
+    judge settings and shown as a ranked table, a bar chart, and a per-dimension
+    **detail** view (tick *only misses* for failures). Only one judge is loaded
+    at a time. *checkpoints* scores every checkpoint instead of the saved model
+    (a score-vs-iteration plot; with *stitch*, across the resume chain).
 
-    * a summary table ranked by ``dim_consistency`` (with raw accuracy and the
-      diversity multiplier), carrying the judge settings used per row;
-    * a bar chart of the same, for eyeballing model differences;
-    * a **detail** drop-down: pick any evaluated run to see one row per latent
-      dimension — its top words, the injected outlier, the judge's pick and the
-      verdict. Tick *only misses* to page through just the failed dimensions.
-
-    Judge settings (model id, words per dimension, diversity awareness, seed) are
-    editable between clicks; changing the model id unloads the old judge before
-    loading the new one so at most one judge occupies the GPU. *Unload judge*
-    frees it explicitly (~1 GB). Ticking *checkpoints* scores every checkpoint in
-    each run's ``*_checkpoints/`` directory instead of just the saved model, and
-    the bar chart is replaced by a score-vs-iteration line plot (the summary
-    table and detail view then show the last checkpoint).
-
-    The *plot* checkboxes choose which judge metrics appear in both charts:
-    the final ``consistency`` score, the ``raw accuracy`` before diversity
-    rescaling, and the ``diversity`` multiplier itself. In the checkpoint line
-    plot runs are told apart by color and metrics by linestyle (as in
-    :func:`~tensormet.experimental.inspect_tucker.compare_metrics`); metrics a
-    result doesn't carry (diversity on a non-diversity-aware judge) are skipped.
-
-    Runs resumed to a higher ``n_iter_max`` are auto-detected exactly as in
-    :func:`~tensormet.experimental.inspect_tucker.make_run_browser`: with
-    *stitch resume chains* ticked (the default), a checkpoint sweep of a run
-    also sweeps its earlier segments' checkpoint directories, so the curve
-    starts at the chain's first checkpoint rather than where the resume began.
-    Chained runs are marked ``⛓×N`` in the picker. Stitching only affects
-    checkpoint sweeps — the plain (saved-model) score is that of the selected
-    segment either way.
-
-    The summary table can be exported with *Save CSV*; the full result dicts
-    (including per-dimension details) are available as ``browser.get_results()``.
-
-    Returns the displayed ``VBox``.
+    Export via *Save CSV* or ``browser.get_results()``. Returns the ``VBox``.
     """
     try:
         import ipywidgets as widgets

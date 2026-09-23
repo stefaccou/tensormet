@@ -31,15 +31,8 @@ DEFAULT_JUDGE_MESSAGES = [
 ]
 
 def _gpu_free_bytes(device) -> int:
-    """Conservative 'free bytes now' estimate,
-    --> torch analogue of the CuPy-side``distance._gpu_free_bytes``:
-    the driver's own free figure (``cudaMemGetInfo``
-    via ``torch.cuda.mem_get_info``) plus the caching allocator's already-reserved
-    but currently-unallocated bytes, which are reusable without a fresh
-    cudaMalloc. Deliberately does not call ``torch.cuda.empty_cache()`` first —
-    same reasoning as the CuPy version: that flush is a synchronizing
-    cudaFree/cudaMalloc round trip, and this is called once per chunk.
-    """
+    """Torch analogue of ``distance._gpu_free_bytes``: driver free + reserved but
+    unallocated bytes. No ``empty_cache()`` (a synchronizing round trip)."""
     free_b, _total_b = torch.cuda.mem_get_info(device)
     reserved = torch.cuda.memory_reserved(device)
     allocated = torch.cuda.memory_allocated(device)
@@ -214,21 +207,12 @@ class DimConsistencyJudge:
     def score_sequences(self, prompts: list[str], completions: list[str]) -> list[float]:
         """Batched, length-normalised log-prob of each completion given its prompt.
 
-        `prompts[i]` is scored against `completions[i]` (parallel lists). Prefix and
-        completion lengths may differ from row to row, so the completion span is
-        tracked per row rather than assuming a single shared prefix length. This lets
-        a single batch mix candidates from *different* dimensions (whose prompts differ).
+        `prompts[i]` is scored against `completions[i]`; the completion span is
+        tracked per row, so one batch can mix prompts from different dimensions.
+        Right-padding is safe under a causal model + attention mask.
 
-        Right-padding is safe: with a causal model + attention mask, pad tokens sit to
-        the right of every completion and never influence the scored positions.
-
-        The window size is capped at ``self.chunk`` but shrinks below it under GPU
-        memory pressure: each window is first probed at up to ``self.chunk`` rows
-        to find its worst-case padded length, then re-sized against currently-free
-        VRAM via ``_gpu_free_bytes``/``_estimate_chunk_rows`` (same machinery as
-        the CuPy-side batch estimators in distance.py). This is what keeps a
-        chunk from overshooting available memory when a batch happens to contain
-        an unusually long prompt/completion.
+        Windows are capped at ``self.chunk`` rows and shrink to fit free VRAM
+        (``_estimate_chunk_rows``) when a batch holds unusually long sequences.
         """
         # Every candidate of a task repeats that task's prompt, so only `rank` of
         # the `rank * (k+1)` strings are distinct.
@@ -373,14 +357,8 @@ class DimConsistencyJudge:
                        top 10% of some dimension -- salient elsewhere, weak here, so
                        the judge cannot win by spotting a rare/odd token.
 
-        The current `efficient` implementation for "teaLeaves": True ranks the whole (N, R) factor with
-        one np.argsort, while the old reference implementation calls
-        get_top_words_for_dimension once per dimension (which re-materializes the
-        factor as numpy every time). The two can disagree on words with tied
-        loadings, the rows under our sparsity setting, mostly and commonly, because torch.topk
-        and argsort break ties differently, so many dimensions may draw a
-        different intruder
-        -> This hurts reproducibility, so we only ship the efficient version which is correct
+        "teaLeaves" ranks the whole (N, R) factor with one np.argsort; tied
+        loadings (common with sparse factors) break differently from torch.topk.
 
         Returns a dict of [0,1] scores:
           dim_consistency           final score (accuracy × diversity multiplier when

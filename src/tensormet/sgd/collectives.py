@@ -2,39 +2,20 @@
 collectives.py — cross-device sum-reductions for the
 single-process SGD trainers.
 
-``ShardedSGDTrainer`` runs G model replicas inside ONE process (no
-torch.distributed, no spawn — see ``sharded_sgd`` module docstring for why).
-Everything it needs from a communication layer is "sum these G tensors, one per
-device, in place, leaving the result on every device". That is the whole
-``Collective`` surface below, and isolating it here buys three things:
-
-1. the hot path calls **one** collective per step over **one** flattened
-   buffer, instead of one cross-device ``.to()`` allocation per parameter per
-   replica (which is what the pre-Phase-1 code did);
-2. because an all-reduce leaves the sum on every device, the optimizer can run
-   redundantly per device and the parameter *broadcast* disappears entirely —
-   half the per-step traffic;
-3. it is the seam a real DDP backend would slot into unchanged (see the "DDP
-   escape hatch" section of ``SGD/README.md``).
+A ``Collective`` sums G tensors (one per device) in place, leaving the result
+on every device. It is also the seam a DDP backend would slot into (see
+sgd/README.md).
 
 Backends
 --------
-``NcclSingleProcess``  ``torch.cuda.nccl.all_reduce`` — the single-process,
-                       multi-device NCCL API (a list of tensors, one per
-                       device). No process group, no rank, no launcher, so the
-                       one-process design holds. Preferred.
-``HostReduce``         Fallback: preallocated **pinned** host staging buffers,
-                       device-0 accumulation, then a scatter back. Used when
-                       NCCL is unavailable or the selected devices have no
-                       peer-to-peer path (``select_gpu`` picks devices by load,
-                       so a bad topology is entirely possible). Costs
-                       ``(G-1) x buffer`` bytes of pinned host memory.
-``SingleDevice``       No-op, so ``SGDTrainer`` and ``ShardedSGDTrainer`` can
-                       share one code path.
+``NcclSingleProcess``  ``torch.cuda.nccl.all_reduce`` (single-process,
+                       multi-device). Preferred.
+``HostReduce``         Pinned host staging; fallback when NCCL or peer access
+                       is missing. Costs ``(G-1) x buffer`` pinned bytes.
+``SingleDevice``       No-op, so both trainers share one code path.
 
-Buffers are cached by ``(numel, dtype)``: the trainer reduces the same
-flattened gradient buffer every step and the same 1-element tensors for the
-scalar reductions, so in steady state nothing is allocated.
+Buffers are cached by ``(numel, dtype)``, so nothing is allocated in steady
+state.
 """
 from __future__ import annotations
 
@@ -133,10 +114,8 @@ class NcclSingleProcess(Collective):
 class HostReduce(Collective):
     """Pinned-host staging + device-0 accumulation + scatter back.
 
-    The pre-Phase-1 code did the same thing implicitly, one ``p.grad.to(dev0)``
-    allocation per parameter per replica per step. Here the staging buffers are
-    allocated once per ``(numel, dtype)`` and reused, and the accumulation is
-    an in-place ``add_``.
+    Staging buffers are allocated once per ``(numel, dtype)`` and reused; the
+    accumulation is an in-place ``add_``.
 
     The host hop is deliberate: this backend exists precisely for topologies
     where devices cannot reach each other directly, and pinned memory makes the
@@ -215,11 +194,8 @@ class _ProbeTimeout(Exception):
 def _call_with_timeout(fn: Callable[[], bool], timeout: float) -> bool:
     """Run ``fn()`` on a daemon thread and raise ``_ProbeTimeout`` if it stalls.
 
-    A stalled ``ncclCommInitAll`` is blocked inside a C call, so the thread
-    cannot be cancelled — it is abandoned as a daemon instead. That is a real
-    (small, one-off) leak, and it is deliberately the lesser evil: the
-    alternative, which this function exists to prevent, is the whole job
-    sitting in comm init until the scheduler kills it at walltime.
+    A stalled C call can't be cancelled, so the thread is abandoned as a
+    daemon: a small one-off leak, preferable to the job hanging until walltime.
     """
     box: Dict[str, object] = {}
 
@@ -243,26 +219,11 @@ def _call_with_timeout(fn: Callable[[], bool], timeout: float) -> bool:
 def _nccl_works(devices: Sequence[torch.device]) -> bool:
     """Actually run a 1-element all-reduce and check the answer.
 
-    ``is_available`` only reports that the NCCL library loaded and the tensors
-    sit on distinct CUDA devices; it never initializes a communicator. Comm
-    init is where the single-process multi-device path (``ncclCommInitAll``,
-    deprecated in NCCL >= 2.19) fails on real clusters: restricted P2P/IPC
-    between GPUs, a too-small ``/dev/shm`` under a job scheduler, MIG-sliced
-    devices, or a Hopper NVLS/multicast setup NCCL cannot use. Those surface on
-    the *first* reduction — i.e. hundreds of steps into a benchmark, long after
-    the backend choice looked fine. ``can_device_access_peer`` does not cover it
-    either: it reports what the driver permits, not what NCCL can build a
-    transport over.
-
-    So pay one tiny collective at construction and let the failure pick the
-    fallback instead of killing the run.
-
-    The probe runs under a watchdog because comm init's most common failure mode
-    is to **block**, not to raise — an exception handler alone cannot catch that,
-    and a hang here is indistinguishable from a hung job (no output, no error,
-    walltime exhausted). A timeout is treated as a failed probe: NCCL that
-    cannot finish a 1-element all-reduce in 30s is not a backend this trainer
-    can use, whatever the reason.
+    ``is_available`` never initializes a communicator, and comm init is where
+    NCCL fails on clusters (P2P/IPC limits, small ``/dev/shm``, MIG, Hopper
+    NVLS) — otherwise only on the first real reduction. Comm init usually
+    *blocks* rather than raises, so the probe runs under a watchdog and a
+    timeout counts as failure.
     """
     def _probe() -> bool:
         probe = [torch.full((1,), 1.0, device=d) for d in devices]

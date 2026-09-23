@@ -1,29 +1,11 @@
 """
 sgd_tucker.py — SGD/Adam-based non-negative Tucker decomposition.
 
-Stochastic-gradient alternative to the multiplicative-update (MU) loop in
-``tucker_tensor.non_negative_tucker_with_similarity``. Pure PyTorch: no CuPy,
-no pytensorlab, no largedim/sharded kernel machinery.
-
-Per-step cost: O(batch) for ``objective="masked"``. The default
-``objective="full"`` additionally pays the exact zero-entry term every step —
-O(Σ_m I_m·R_m) for KL (column sums) and O(Σ_m I_m·R_m²) for FR (Grams) — which
-dominates a small batch at production mode dimensions. Both are independent of
-nnz; the one O(nnz) piece is the exact-error pass on log steps.
-
-Per-step *memory* is set by ``predict_entries``, which contracts the modes in
-two groups rather than one at a time (see ``_contraction_plan``): the gathered
-rows of each group are combined into a row-wise Khatri-Rao product and the two
-groups meet in a single GEMM against the reshaped core. Flops are unchanged —
-``batch × prod(rank)`` is irreducible for a dense core — but the largest
-intermediate drops from ``batch × prod(rank)/max(rank)`` to
-``batch × ~sqrt(prod(rank))``: 16 GB → 160 MB at order 4 / rank 100 / B=4096,
-and the forward becomes three kernels instead of an N-operand einsum
-decomposition. ``GradStepper`` can still split a step into micro-batches with
-gradients accumulating — exact, since the sampled loss is a sum over entries —
-but with the two-group plan that only binds past order 4, and
-``resolve_micro_batch`` refuses an over-large explicit setting with a message
-naming the knob rather than letting CUDA OOM.
+Stochastic-gradient alternative to the MU loop in
+``tucker_tensor.non_negative_tucker_with_similarity``. Pure PyTorch. Per-step
+cost is O(batch), plus the exact zero-entry term for ``objective="full"``;
+memory is bounded by the two-group contraction (``_contraction_plan``). See
+sgd/README.md for costs, multi-GPU knobs and integration.
 
 Model
 -----
@@ -51,19 +33,10 @@ curves are directly comparable with the MU baseline.
 
 Sampling & reproducibility
 --------------------------
-``EntryBatcher`` mirrors ``stochastic_sparse.CooSubsampler``: one host-side
-seeded permutation of the NNZ at construction, then contiguous rotating
-windows — every batch is a pure function of (seed, step), so runs are
-deterministic given a seed and resume replays identical batches. Note that
-unlike MU, the backward pass accumulates gradients into factor rows via
-scatter-adds that are atomicAdd-nondeterministic on CUDA by default; pass
-``deterministic=True`` to trade speed for bitwise reproducibility.
-
-Production integration lives one directory up the import path:
-``--solver sgd`` routes ``non_negative_tucker_with_similarity`` through
-``sgd_trainer.SGDTrainer`` (single GPU) / ``sharded_sgd.ShardedSGDTrainer``
-(``--n_gpus > 1``); see sgd/README.md for the seams. This module
-stays standalone for notebook use via ``sgd_non_negative_tucker``.
+``EntryBatcher`` mirrors ``stochastic_sparse.CooSubsampler``: every batch is a
+pure function of (seed, step), so resume replays identical batches. The
+backward scatter-adds are nondeterministic on CUDA; pass
+``deterministic=True`` for bitwise reproducibility.
 
 Usage (standalone)
 ------------------
@@ -140,39 +113,18 @@ def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
 def _contraction_plan(rank: Sequence[int]) -> Tuple[int, bool, int]:
     """``(split, gemm_left, width)`` for the two-group entry contraction.
 
-    ``predict_entries`` evaluates ``sum_{r...} G[r...] · A1[i1,r1] · … `` by
-    splitting the modes at ``split`` into a left and a right group, forming the
-    row-wise Khatri-Rao product of each group's gathered rows, and contracting
-    the two against the core reshaped to ``(prod(rank[:split]),
-    prod(rank[split:]))``. One group goes through a GEMM against that matrix and
-    the other meets the result elementwise; ``gemm_left`` says which. ``width``
-    is the largest resulting intermediate *per entry*, so a forward pass costs
-    ``B · width`` elements.
-
-    The intermediates are the two Khatri-Rao products — each allocated only when
-    its group holds more than one mode, since a one-mode group *is* its gathered
-    rows — and the GEMM output, which is the size of whichever group did *not*
-    go through the GEMM. Hence
+    The modes are split at ``split`` into a left and right group; each group's
+    gathered rows form a row-wise Khatri-Rao product, and the two meet the core
+    reshaped to ``(prod(rank[:split]), prod(rank[split:]))`` — one via a GEMM
+    (``gemm_left`` says which), the other elementwise. ``width`` is the largest
+    intermediate per entry:
 
         width(s, gemm_left)  = max(kr_left, prod(rank[s:]))   if gemm_left
                              = max(kr_right, prod(rank[:s]))  otherwise
 
-    minimised over both. For uniform ranks the answer is ``~sqrt(prod(rank))``
-    instead of the ``prod(rank)/max(rank)`` that contracting the core against
-    one row set at a time forces — 10^4 rather than 10^6 at order 4 / rank 100.
-
-    The split must be contiguous in mode order (a non-contiguous one would need
-    the core permuted, and a core-sized permute per step costs more than it
-    saves), so the guarantee is: **never worse than contracting one mode at a
-    time from either end**, i.e. ``min(prod(rank)/rank[0],
-    prod(rank)/rank[-1])`` — those are the ``s=1`` and ``s=n-1`` plans. A rank
-    tuple whose largest entry sits strictly in the *middle* (say ``(2, 9, 2)``)
-    is the one case where permuting first would beat this; it does not arise
-    from a scalar ``--rank``.
-
-    Flops are ``B · prod(rank)`` under every plan (the first contraction that
-    touches the core must touch all of it), so this is purely a memory and
-    kernel-count choice.
+    minimised over both (~sqrt(prod(rank)) for uniform ranks). The split is
+    contiguous, so it is never worse than peeling one mode from either end.
+    Flops are ``B · prod(rank)`` under every plan: this only trades memory.
     """
     r = [int(x) for x in rank]
     n = len(r)

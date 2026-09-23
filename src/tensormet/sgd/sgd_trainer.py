@@ -11,23 +11,11 @@ narrow surface ``non_negative_tucker_with_similarity`` consumes when
     payload = trainer.checkpoint_payload(iteration)    # resumable dict
 
 One loop "iteration" is a block of ``steps_per_iteration`` optimizer steps;
-block *i* runs global steps ``i*K .. (i+1)*K-1``. Batches are a pure function
-of (seed, step) (see ``EntryBatcher``), so a resumed run — which restores the
-raw parameters and optimizer state from ``checkpoint_payload`` and continues
-at ``start_iteration`` — replays exactly the batches an uninterrupted run
-would have seen.
+batches are a pure function of (seed, step), so resume replays them exactly.
 
-Unlike the MU kernels this trainer carries state the UpdateRouting seam cannot
-express (Adam moments, raw pre-softplus parameters, the step counter), which
-is why the loop branches on the solver instead of routing kernels.
-
-The step body itself lives in ``sgd_tucker.GradStepper``, shared verbatim with
-``sharded_sgd.ShardedSGDTrainer`` (which runs one per device behind a
-collective). Single-GPU runs therefore get micro-batching — required for
-order 4 / rank 100 to fit at all — and the opt-in CUDA-graph capture that
-addresses the dispatch-bound order-3 regime, without a second implementation.
-Note the one constraint that follows: parameter ``.grad``s are views into the
-stepper's flat buffer, so nothing here may call ``zero_grad(set_to_none=True)``.
+The step body is ``sgd_tucker.GradStepper``, shared with ``ShardedSGDTrainer``.
+Parameter ``.grad``s are views into its flat buffer, so never call
+``zero_grad(set_to_none=True)`` here.
 """
 from __future__ import annotations
 

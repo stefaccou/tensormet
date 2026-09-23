@@ -11,13 +11,8 @@ from tensormet.distance import (kl_factor_update, kl_core_update, kl_compute_err
 # -- Routing function --
 Divergence = Literal["kl", "fr"]
 
-# CHANGED (2026-06-12 review, Task 6): single source of truth for the dense vs.
-# largedim/NNZ-streaming routing decision. Replaces the scattered literal
-# `3000`/`4000` comparisons that previously lived (and disagreed: KL factor used
-# 4000 while KL core/error used 3000) in both this module and the multi-GPU
-# override in TuckerDecomposition.fit. One constant, one predicate, used for all
-# three kernel choices AND the sharding override so factor/core/error always
-# select the same family and multi-GPU engages iff the largedim path does.
+# Single dense vs. largedim threshold: factor, core, error and multi-GPU sharding
+# all go through needs_largedim(), so they always pick the same family.
 LARGEDIM_THRESHOLD = 3000
 
 
@@ -27,11 +22,6 @@ def needs_largedim(dim, largedim: bool = False, masked: bool = False) -> bool:
     Returns True when the caller forces it (``largedim``), when the masked
     objective is requested (only the largedim kernels implement masking), or
     when the largest mode dimension reaches :data:`LARGEDIM_THRESHOLD`.
-
-    This is the *only* place the size threshold is encoded; callers (routing
-    below and the multi-GPU override in ``fit``) must funnel through it so the
-    dense/largedim/sharded choice stays consistent across factor, core and
-    error kernels.
     """
     _max_dim = max(dim) if isinstance(dim, (tuple, list)) else dim
     return bool(largedim or masked or (_max_dim >= LARGEDIM_THRESHOLD))

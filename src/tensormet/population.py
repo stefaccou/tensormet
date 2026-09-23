@@ -958,7 +958,6 @@ def populate_tensors_parquet(
 
     dataset = ds.dataset(parquet_files, format="parquet")
 
-    # dataset = ds.dataset(path_to_vectors, format="parquet")
     total_rows = dataset.count_rows(use_threads=True, cache_metadata=True)
     print(f"Total rows: {total_rows:,} | Shards: {len(parquet_files)} | batch_rows={batch_rows:,}")
 
@@ -966,33 +965,6 @@ def populate_tensors_parquet(
     # -------------------------
     # PASS 1: marginals only
     # -------------------------
-
-    # single_probs = {column:Counter() for column in cols_to_build}
-    #
-    # batches1 = dataset.to_batches(
-    #     columns=cols_to_build,
-    #     batch_size=batch_rows,
-    #     batch_readahead=batch_readahead,
-    #     fragment_readahead=fragment_readahead,
-    #     use_threads=True,
-    #     cache_metadata=True,
-    # )
-    #
-    # print("Pass 1/2: computing global marginals (v,s,o) ...")
-    # seen_rows = 0
-    # with tqdm(total=total_rows, desc="Pass 1/2", unit="rows") as pbar:
-    #     for batch in batches1:
-    #         pbar.update(batch.num_rows)
-    #         seen_rows += batch.num_rows
-    #
-    #         t = pa.table({col:_normalize_str_array(batch.column(i)) for i, col in enumerate(cols_to_build)})
-    #         for col in cols_to_build:
-    #             g_col = t.group_by([col]).aggregate([(col, "count")]).rename_columns([col, "count"])
-    #             _update_counter_from_grouped(single_probs[col], g_col, [col], "count")
-    #
-    # if seen_rows == 0:
-    #     raise ValueError("No rows found in the parquet dataset.")
-    # total_len = seen_rows  # global denominator for probabilities
 
     cache_path = _marginals_cache_path(path_to_tensors, path_to_vectors,
                                        cols_to_build, src_fingerprint)

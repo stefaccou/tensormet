@@ -3,19 +3,14 @@ tt_sharded.py — Multi-GPU NNZ sharding for the Tucker-TT hybrid kernels (KL).
 
 EXPERIMENTAL (see README.md in this directory).
 
-Mirrors ``experimental/CP/cp_sharded.py``, which mirrors ``sharded_sparse.py``:
-NNZ-partitioned shards, one thread per GPU, partials reduced on the CPU,
-finalize on the primary device. Shard construction, the persistent thread pool,
-the cuBLAS warm-up, the per-iteration subsample window and ``trim_pools`` are
-all inherited from ``ShardedSparseTensor`` — this module supplies only the TT
+Mirrors ``sharded_sparse.py``; shards, thread pool, warm-up and subsampling
+are inherited from ``ShardedSparseTensor``. This module adds only the TT
 per-shard workers and their orchestrators.
 
 What is sharded, and what is not
 --------------------------------
-Only the NNZ-dependent accumulations cross devices. Every TT denominator is a
-*closed form* over the factor column sums (the same chain run on
-``_colsum_batch``), so unlike Tucker's sharded core update nothing but the
-numerators is reduced:
+Only the numerators; every TT denominator is a closed form over the factor
+column sums:
 
     sharded   factor numerator  Num[i, r]        → (I_mode, R_mode) reduce
     sharded   core numerator    Num_k[a, r, b]   → (ρ_k, R_k, ρ_{k+1}) reduce
@@ -27,17 +22,10 @@ No R^N object ever crosses the bus; the largest payload is one TT core.
 
 The core sweep costs N reduce rounds
 ------------------------------------
-``tt_kl_core_update`` visits sites sequentially so each site update sees the
-previous ones — that is what makes the sweep a genuine block MU, and therefore
-monotone. Sharded, that becomes one fan-out/fan-in cycle *per site*: N full NNZ
-passes and N barriers per core update, against CP's zero (its λ update is a
-passthrough) and Tucker's one. Updating all sites from a single pass would cost
-one barrier instead of N, but each site would then be updated against stale
-neighbours and the monotonicity guarantee — the correctness oracle for these
-kernels — would be gone. The sequential sweep is kept.
-
-Only the core just written is re-broadcast between sites (``tt_cores_buf[k]``),
-so the host traffic per sweep is Σ_k |C_k| rather than N·Σ_k |C_k|.
+Sites are updated sequentially so each sees the previous ones; that keeps the
+sweep a monotone block MU (the correctness oracle), at the cost of N NNZ
+passes and N barriers per core update. Only the core just written is
+re-broadcast between sites.
 """
 from __future__ import annotations
 

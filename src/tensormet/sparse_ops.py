@@ -491,38 +491,9 @@ def gather_dense_at_block_nz(dense_nd: np.ndarray,
     flat = coo.row.astype(cp.int64) + coo.col.astype(cp.int64) * cp.int64(block_size)
     return dense_flat[flat.get()]
 
-# def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=1e-12):
-#     """
-#     Compute Z columns (as rows) for a batch of unfolding columns, without building full Z.
-#
-#     Returns Z_u with shape (m, R_mode), where m = batch size.
-#     """
-#     N = core.ndim
-#     letters = einsum_letters(N)
-#     core_subs = "".join(letters)
-#
-#     # factor-row matrices for each other mode: (m, Rk)
-#     mats = [factors[k][idxs_by_mode[k]] for k in other_modes]
-#
-#     # einsum: core[a b c ...], M_b[m b], M_c[m c], ... -> out[m a_mode]
-#     in_terms = [core_subs] + [("m" + letters[k]) for k in other_modes]
-#     out_term = "m" + letters[mode]
-#     eq = ",".join(in_terms) + "->" + out_term
-#
-#     Z_u = cp.einsum(eq, core, *mats)
-#     Z_u = cp.clip(Z_u, a_min=epsilon, a_max=None)
-#     return Z_u
-
-# CHANGED (2026-08-04, perf regression fix): the einsum bodies of
-# compute_Zcols_batch and distance._rhat_from_factor_rows_sequential are the
-# default again. Their 2026-07-30 mode-at-a-time peel rewrites (m-batched
-# (1,R)x(R,rest) GEMVs) were identified by the Aug-03/04 bisect as the
-# iteration-time regression: the jul29 snapshot (einsum) is fast, the peel is
-# ~2x slower, and TENSORMET_LEGACY_FACTOR_BATCH=1 does not recover it. The
-# peel is kept behind TENSORMET_PEEL_CONTRACTION=1: it bounds the einsum's
-# machine-dependent path choice (a (b, R0..R_{N-1}) intermediate was once
-# materialized on an 80 GB node), so switch it on if a rank-space contraction
-# ever OOMs.
+# compute_Zcols_batch and distance._rhat_from_factor_rows_sequential use einsum
+# by default (~2x faster). TENSORMET_PEEL_CONTRACTION=1 switches both to a
+# memory-bounded mode-at-a-time peel; use it if a rank-space contraction OOMs.
 PEEL_CONTRACTION = os.environ.get("TENSORMET_PEEL_CONTRACTION", "") not in ("", "0", "false", "False")
 
 
@@ -575,17 +546,11 @@ def compute_Zcols_batch(core, factors, mode, other_modes, idxs_by_mode, epsilon=
 
 
 # ---------------------------------------------------------------------------
-# Factor-update batch helpers (2026-07-29: SDDMM-style sampled row-dot and
-# scatter-free SpMM for the largedim MU inner loop).
-#
-# The legacy batch body gathered two (nnz_b, R) dense temporaries per batch
-# (A[r_i], Z_u[u_i]) and faked a scatter-add with an (I, nnz_b) CSR whose
-# columns were arange(nnz_b). These helpers replace that with:
-#   - sampled_row_dots: per-entry <A[r], Z[u]> without materializing either
-#     gather (an SDDMM: entries of A @ Z.T at the NNZ pattern);
-#   - build_batch_csr_T + spmm_T: one (m, I) CSR against the UNGATHERED Z_u,
-#     built sort-free from a ModeGrouping's segment offsets when available.
-# Set TENSORMET_LEGACY_FACTOR_BATCH=1 to restore the old batch body (A/B).
+# Factor-update batch helpers for the largedim MU inner loop:
+#   - sampled_row_dots: per-entry <A[r], Z[u]> without the (nnz_b, R) gathers
+#     (an SDDMM: entries of A @ Z.T at the NNZ pattern);
+#   - build_batch_csr_T + spmm_T: one (m, I) CSR against the ungathered Z_u.
+# TENSORMET_LEGACY_FACTOR_BATCH=1 restores the old gather-based body (A/B).
 # ---------------------------------------------------------------------------
 
 LEGACY_FACTOR_BATCH = os.environ.get("TENSORMET_LEGACY_FACTOR_BATCH", "") not in ("", "0", "false", "False")
@@ -655,12 +620,9 @@ def group_batch_by_column(u_idx, m, *arrays):
     Uncached-path counterpart of the ModeGrouping segment offsets. Returns
     ``(indptr, u_sorted, *arrays_sorted)``.
 
-    CHANGED (2026-07-29 fix): the uncached path originally built P through the
-    COO->CSR constructor, whose internal sort left ``P.data`` in SORTED order
-    while per-entry weights handed to ``same_pattern_csr`` (masked FR
-    denominator) stayed in ENTRY order — silently misaligning them. Sorting
-    the batch up front makes entry order and P.data order identical, exactly
-    like the grouping path, so pattern reuse is valid by construction.
+    Sorting up front keeps entry order equal to ``P.data`` order, so per-entry
+    weights passed to ``same_pattern_csr`` stay aligned (a COO->CSR build would
+    re-sort ``P.data`` and silently misalign them).
     """
     order = cp.argsort(u_idx)
     u_sorted = u_idx[order]
@@ -731,13 +693,9 @@ def _is_canonical(P) -> bool:
 def _canonicalize(P):
     """A canonical copy of P, leaving the caller's P untouched.
 
-    ``sum_duplicates`` sorts indices within each row and adds any duplicate
-    (row, col) entries — which is what P.T @ B does with them anyway, so the
-    product is unchanged. Copying matters: the caller may still hold P for
-    ``same_pattern_csr``, and mutating it in place would leave those reused
-    indices sorted while the separately-computed weights stay in entry order,
-    reintroducing exactly the misalignment the 2026-07-29 group_batch_by_column
-    fix removed.
+    ``sum_duplicates`` doesn't change P.T @ B. The copy matters: the caller may
+    reuse P in ``same_pattern_csr``, and sorting it in place would misalign it
+    with weights in entry order (see ``group_batch_by_column``).
     """
     Pc = P.copy()
     Pc.sum_duplicates()
@@ -817,14 +775,9 @@ def spmm_T(P, B):
     or format conversion); the backend is resolved once by probe_spmm_backends
     (or pinned via TENSORMET_SPMM_T) and reused for every call.
 
-    The canonical-format check is per call, deliberately. cupyx.cusparse.spmm
-    asserts ``a.has_canonical_format``, and that is a property of the individual
-    matrix, not a capability of the backend — so the one-shot probe cannot
-    settle it. build_batch_csr_T orders P's columns by the tensor row ids
-    ``r_idx`` in entry order, which is ascending-and-unique for some batches and
-    not for others; probing on a batch that happened to be canonical and then
-    reusing that verdict is what produced the AssertionError at
-    cupyx/cusparse.py:1481 on 2026-07-31.
+    The canonical-format check is per call on purpose: cupyx.cusparse.spmm
+    asserts ``a.has_canonical_format``, and some batches' P are canonical while
+    others aren't, so a one-shot probe can't settle it.
     """
     global _SPMM_T_NONCANONICAL
     if _SPMM_T_BACKEND is None:

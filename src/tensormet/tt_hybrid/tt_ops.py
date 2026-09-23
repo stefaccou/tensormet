@@ -148,9 +148,8 @@ def tt_sum_all_entries(tt_cores, factors, epsilon=1e-12):
     """Σ over ALL entries of X̂, in closed form (TT analogue of
     distance._tucker_sum_all_entries).
 
-    Run in float64: one (1, ρ) vector per site, so the cost is nil, and the
-    N-fold chain product no longer overflows fp32 at high order/rank/dim. Cast
-    back at the end.
+    Run in float64 (cost is nil): the N-fold chain product overflows fp32 at
+    high order/rank/dim.
     """
     sums = _colsum_batch(factors, epsilon)
     cores64 = [C.astype(cp.float64) for C in tt_cores]

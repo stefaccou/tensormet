@@ -510,54 +510,21 @@ def compare_metrics(configs, labels=None, sem_keys=("average_rank_score",),
                     title="Training Metrics Comparison",
                     ax=None, clip_common=False, color_by=None, stitch=True,
                     legend_loc="right", smooth=None):
-    """Overlay any number of runs on a shared figure.
+    """Overlay any number of runs on a shared figure; returns the figure.
 
-    ``configs`` is the list of runs to plot and ``labels`` a parallel list of
-    legend names. Each *run* is either a single config or a list/tuple of configs
-    treated as resume-chain segments (concatenated as in :func:`load_metrics`), so
-    to overlay several chains pass a list of lists. A ``dict`` may be given instead
-    of ``configs``: its values become the runs and its keys the labels (an explicit
-    ``labels`` still overrides the keys). When a label is missing it falls back to
-    the run's ``stem``.
+    configs        : list of runs (a config, or a list of resume-chain segments),
+                     or a ``{label: run}`` dict.
+    labels         : legend names (fall back to each run's ``stem``).
+    color_by       : callable ``label -> group`` or ``{label: group}``; runs in a
+                     group share a color. Default: one color per run.
+    plot_iter_time : add per-iteration time on its own right-hand axis.
+    clip_common    : cap the x-axis at the shortest run's last iteration.
+    stitch         : expand a single config into its resume chain so resumed
+                     runs start at 0.
+    legend_loc     : ``"right"`` or ``"below"``.
+    smooth         : rolling-average window in iterations (``None``/1 = raw).
 
-    ``color_by`` controls how colors are assigned. When omitted each run gets its
-    own tab10 color. Pass either:
-
-    * a **callable** ``label -> group`` — e.g. ``lambda l: l.split(" rs")[0]``
-      to colour by the method name extracted from the label; or
-    * a **dict** ``{label: group}`` for explicit per-label group assignment.
-
-    Runs that map to the same group share a color; each distinct group gets a
-    different tab10 color. This lets you visually separate methods while keeping
-    random-state curves the same hue.
-
-    Reconstruction error and the semantic keys are told apart by line style.
-    Returns the figure.
-
-    With ``plot_iter_time``, each run's per-iteration decomposition time
-    (:func:`load_iter_times`) is added in the run's own color on a shared
-    right-hand axis of its own — seconds share no scale with errors or scores.
-    Runs whose log holds no timing lines (``time_iteration`` off), and averaged
-    triples from :func:`average_runs` (which carry no timing series), are
-    skipped.
-
-    With ``clip_common`` set, the x-axis is capped at the last iteration shared by
-    every run (the smallest of their final iterations), so short and long runs are
-    compared over their common range instead of being squashed.
-
-    With ``stitch`` (the default), a run given as a *single* config is expanded
-    into its resume chain via :func:`resume_chain` — a resumed run's own log
-    holds only the tail, so without this its curve starts wherever the resume
-    began instead of at 0, and runs resumed different numbers of times don't
-    share an x-range. Runs passed as an explicit list of segments are left alone.
-    Pass ``stitch=False`` to plot exactly what was given.
-
-    ``legend_loc`` is ``"right"`` (beside the plot) or ``"below"`` (under the
-    axes, up to 3 columns) — the latter reads better with many long run labels.
-
-    ``smooth`` is an optional rolling-average window (in iterations) applied to
-    every curve of every run, to damp per-iteration jitter; ``None``/1 plots the
-    raw series (see :func:`_smooth`).
+    Rec error and semantic keys are told apart by line style.
     """
     if isinstance(configs, dict):
         if labels is None:
@@ -920,64 +887,15 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
 
     Requires ``ipywidgets`` and an interactive matplotlib backend.
 
-    Every dataset under ``tensors/`` that has decomposition snapshots gets a
-    checkbox at the top; tick several to pool their runs and compare runs that
-    live in *different* directories. The facet drop-downs and the Run A / Run B
-    pickers always reflect only the datasets currently checked, so options never
-    include runs you can't actually select. (Run B = ``(none)`` plots one run.)
+    Tick one or more datasets to pool their runs; ``dataset`` sets the initial
+    ticks (a name, a list, or ``None`` for all). The *after* box hides runs
+    whose snapshot predates a date, but resumed runs are still stitched to
+    earlier segments (marked ``⛓×N``; untick *stitch* to see one segment).
+    *sem_keys* offers only metrics logged for the picked runs, seeded from
+    ``default_sem_keys``.
 
-    ``dataset`` sets which boxes start checked — a single name, a list of names,
-    or ``None`` to check every discovered dataset. Hit *Refresh* after new runs
-    land.
-
-    The *after* box takes a date (e.g. ``2026-06-01``, or anything pandas can
-    parse) and restricts the selectable runs to those whose config snapshot was
-    written on or after it; leave it empty for no cutoff. The cutoff only narrows
-    the picker — a recent resumed run is still stitched back to its earlier
-    segments even if those predate the cutoff.
-
-    Runs that were resumed to a higher ``n_iter_max`` are auto-detected and
-    stitched: with *stitch resume chains* ticked (the default), selecting a run
-    plots it together with its earlier segments, so the curve starts at 0 rather
-    than at the iteration the resume began. Chained entries are marked ``⛓×N``.
-    Untick to view a single segment (e.g. just the resumed tail) in isolation.
-
-    Tick *plot iter time* to add each run's per-iteration decomposition time on a
-    dedicated right-hand axis (seconds, so it gets its own scale). This is the
-    device-synced update+error time the run logged per iteration — the quantity
-    summed into ``solve_seconds`` — and excludes in-loop semantic evaluation.
-    Runs launched with ``time_iteration`` off simply contribute no curve. Untick
-    *plot rec error* and deselect everything in *sem_keys* to look at timing on
-    its own.
-
-    *sem_keys* is a collapsible checklist (click to expand) with one checkbox
-    per semantic metric actually logged for the currently-picked Run A / Run B
-    — tick none, one, or several. It repopulates whenever the run selection
-    changes, so it only ever offers keys that exist for what's on screen. A key
-    already ticked that's still available stays ticked across a repopulation;
-    ``default_sem_keys`` seeds the initial selection where present.
-
-    Ticking *plot rec error* reveals a *log scale (rec error)* checkbox next to
-    it; tick that to draw the rec-error axis on a log scale (useful once the
-    curve has decayed enough that a linear axis flattens it out). It's hidden
-    (and cleared) whenever *plot rec error* is off, since it has no effect there.
-
-    Tick *smooth* to draw every curve as a centered rolling average instead of the
-    raw series — handy for noisy semantic scores. It's off by default; ticking it
-    reveals a *window* box (in iterations, default 5) next to it. The window is
-    applied to all curves on screen, iteration time included, and the ends of each
-    curve average over fewer points rather than being dropped, so the x-range is
-    unchanged.
-
-    When comparing two runs of unequal length, tick *clip to common iters* to cap
-    the x-axis at the shorter run's final iteration (e.g. 250 vs 2000 → x stops at
-    250), so the shared range is compared head-to-head rather than squashed.
-
-    The current plot can be exported two ways: type a path in the *save as* box
-    and hit *Save* to write it to disk, or grab the live Figure object via
-    ``browser.get_figure()`` (returns ``None`` until the first plot is drawn).
-
-    Returns the displayed ``VBox`` so callers can keep a reference alive.
+    Save the figure via the *save as* box or ``browser.get_figure()``.
+    Returns the displayed ``VBox``.
     """
     try:
         import ipywidgets as widgets
@@ -1771,33 +1689,17 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
                     default_metric="dim_consistency"):
     """Faceted widget front-end for :func:`find_best`.
 
-    Requires ``ipywidgets`` and an IPython kernel. Shares its whole scoring and
-    ranking core with :func:`find_best` — the same facet filters, metric
-    thresholds and best-ever ranking, driven from widgets rather than arguments.
+    Requires ``ipywidgets`` and an IPython kernel. Same filters, thresholds and
+    ranking as :func:`find_best`, driven from widgets.
 
-    Dataset checkboxes and facet drop-downs behave as in
-    :func:`make_run_browser`. Beyond them:
+    * **metric** — tick one to rank by it; tick several to rank by the mean of
+      their sign-normalized best values (``combined_mean``, see
+      :func:`_combined_score`).
+    * **thresholds** — e.g. ``rec_error < 0.5, simlex_all_rho > 0.3``.
+    * **after** / **top N** — date cutoff / keep the N best (0 = all).
 
-    * **metric** — a collapsible checklist (click to expand), one checkbox per
-      metric found in the logs of the checked datasets — the same "check
-      none/one/several" control as ``sem_keys`` in :func:`make_run_browser`.
-      Tick exactly one to rank by that metric directly (error-like keys rank
-      ascending). Tick several to rank by the mean of their sign-normalized
-      best-ever values instead (lower-is-better ones flipped so higher is
-      always better — see :func:`_combined_score`), averaged row-wise into a
-      synthetic ``combined_mean`` column, sorted best-first. *Plot top* then
-      overlays each ticked metric's own curve (a composite score has no
-      per-iteration series of its own — see :func:`plot_top`).
-    * **thresholds** — free-text criteria, e.g.
-      ``rec_error < 0.5, simlex_all_rho > 0.3`` (comma/``and`` separated).
-    * **after** — drop runs whose snapshot predates the date.
-    * **top N** — keep only the N best (0 = all).
-
-    Changing the datasets or the stitch toggle rescans and re-scores; every
-    other control just re-filters and re-ranks the frame already in hand. The
-    ranked table renders below the controls; *Plot top* overlays its first few
-    rows via :func:`plot_top`, and the figure can be saved or fetched with
-    ``ranker.get_figure()`` / ``ranker.get_ranking()``.
+    *Plot top* overlays the first rows via :func:`plot_top`; results are
+    available as ``ranker.get_figure()`` / ``ranker.get_ranking()``.
     """
     try:
         import ipywidgets as widgets
