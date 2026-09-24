@@ -3,6 +3,7 @@ from tensormet.utils import (select_gpu,
                              compute_num_threads,
                              DATA_DIR,
                              write_json,
+                             write_best_record,
                              append_jsonl,
                              utc_now_iso,
                              tee_output,
@@ -389,6 +390,12 @@ def launch_nnt_decomposition(cfg):
             tucker_decomp_torch = TuckerTensor((tl.tensor(_as_host(core)), factors_t))
 
         torch.save(tucker_decomp_torch, paths["model"])
+        # which state that file holds; no best iteration = no semantic improvement, the final state
+        _best_it = tucker_decomp_info.get("best_iteration")
+        write_best_record(paths["best_json"],
+                          _best_it if _best_it is not None else tucker_decomp_info.get("last_iteration"),
+                          tucker_decomp_info.get("best_sem_score"), tucker_decomp_info.get("sem_primary_key"),
+                          final=True)
         np.save(paths["errors"], np.array([e.get() if hasattr(e, "get") else float(e) for e in errors], dtype=float))
 
         if fitness_scores:
@@ -434,7 +441,10 @@ def launch_nnt_decomposition(cfg):
                 "run_id": cfg.run_id(),
                 "cfg": asdict(cfg),
                 "results": {
-                    "iterations": int(tucker_decomp_info["iterations"]),
+                    "iterations": int(tucker_decomp_info["iterations"]),  # the saved state's iteration
+                    "best_iteration": tucker_decomp_info.get("best_iteration"),
+                    "best_sem_score": tucker_decomp_info.get("best_sem_score"),
+                    "last_iteration": tucker_decomp_info.get("last_iteration"),
                     "final_error": float(tucker_decomp_info["final_error"]) if tucker_decomp_info["final_error"] is not None else None,
                     "final_fitness": final_fitness,
                     "final_fitness_full": final_fitness_full,

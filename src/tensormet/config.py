@@ -297,6 +297,8 @@ class RunConfig:
             "fitness_json": model.with_name(model.stem + "_fitness.json"),
 
             "timing_json": model.with_name(model.stem + "_timing.json"),
+            # which iteration the model file holds (utils.write_best_record)
+            "best_json": model.with_name(model.stem + "_best.json"),
 
             "config": model.with_name(model.stem + "_config.json"),
             "runs_jsonl": out_dir / "runs.jsonl",
@@ -467,6 +469,8 @@ class RunConfig:
                             latest_iter = max_i
                             # Map the paths to the old run so we load its history perfectly
                             best_candidate_paths = {
+                                "model": out_dir / f"{stem}.pt",
+                                "best_json": out_dir / f"{stem}_best.json",
                                 "errors": out_dir / f"{stem}_errors.npy",
                                 "fitness": out_dir / f"{stem}_fitness.npy",
                                 "fitness_json": out_dir / f"{stem}_fitness.json",
@@ -499,6 +503,9 @@ class RunConfig:
                 fitness_scores = json.load(f)
         elif best_candidate_paths.get("fitness") and best_candidate_paths["fitness"].exists():
             fitness_scores = np.load(best_candidate_paths["fitness"]).tolist()
+        # the log can run ahead of the checkpoint: keep the checks up to latest_iter
+        if self.eval.sem_check_every:
+            fitness_scores = fitness_scores[:latest_iter // self.eval.sem_check_every]
 
         # 5. Reconstruct the best semantic score
         best_sem_score = 0.0
@@ -535,15 +542,29 @@ class RunConfig:
         # 6. Load the model weights
         checkpoint_tensor = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
+        # 7. The best-semantic state itself, when the old run recorded it and it is the one scoring
+        # best_sem_score; otherwise the loop starts its "best" from the checkpoint (and says so).
+        from tensormet.utils import read_best_record
+        best_tensor, best_iteration = None, None
+        rec = read_best_record(best_candidate_paths["best_json"])
+        if (rec and rec.get("score") is not None and rec.get("iteration") is not None
+                and float(rec["score"]) >= best_sem_score - 1e-12 and best_candidate_paths["model"].exists()):
+            best_tensor = torch.load(best_candidate_paths["model"], map_location="cpu", weights_only=False)
+            best_iteration = int(rec["iteration"])
+            best_sem_score = max(best_sem_score, float(rec["score"]))  # may be past the checkpoint
+
         print(
-            f"Resuming from compatible run! Loaded iteration {latest_iter} with best semantic score {best_sem_score:.4f}")
+            f"Resuming from compatible run! Loaded iteration {latest_iter} with best semantic score {best_sem_score:.4f}"
+            + (f" (best state: iteration {best_iteration})" if best_tensor is not None else ""))
 
         return {
             "start_iteration": latest_iter,
             "best_sem_score": best_sem_score,
             "rec_errors": rec_errors,
             "fitness_scores": fitness_scores,
-            "checkpoint_tensor": checkpoint_tensor
+            "checkpoint_tensor": checkpoint_tensor,
+            "best_tensor": best_tensor,
+            "best_iteration": best_iteration,
         }
 
 

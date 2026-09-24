@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 # Keys in an artifact_paths() dict that are single files (not the checkpoint dir).
-_FILE_KEYS = ("model", "errors", "fitness", "fitness_json", "timing_json", "config", "log")
+_FILE_KEYS = ("model", "best_json", "errors", "fitness", "fitness_json", "timing_json", "config", "log")
 
 
 def copy_artifact(src, dst) -> bool:
