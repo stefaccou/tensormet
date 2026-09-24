@@ -502,6 +502,29 @@ def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(obj, default=str) + "\n")
+
+
+def write_best_record(path: Path, iteration: Optional[int], score: Optional[float],
+                      key: Optional[str], final: bool = False) -> None:
+    """{stem}_best.json: the iteration the model file holds, written (atomically) at every model-file save.
+
+    ``iteration`` counts like checkpoint names (k = the state after k iterations). ``score`` is the
+    primary semantic score; None means no check ever improved, so the file holds the final state.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"iteration": iteration, "score": score, "key": key, "final": final,
+                               "time": utc_now_iso()}, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_best_record(path: Path) -> Optional[Dict[str, Any]]:
+    """The record write_best_record left, or None (no file, or unreadable)."""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 def utc_now_iso() -> str:
     """Returns the current UTC time in ISO 8601 format."""
     return datetime.now(UTC).isoformat()
