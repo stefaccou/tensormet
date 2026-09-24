@@ -22,6 +22,7 @@ from tensormet.config import RunConfig, infer_ngram_order
 from pathlib import Path
 from tensormet.utils import (DATA_DIR,
                             date_run,
+                            write_best_record,
                             torch_or_pickle_load,
                             readonly_dispatch,
                             tree_to_device,
@@ -1930,20 +1931,31 @@ class SparseTupleTensor:
         sem_no_rec_improve_steps = 0
 
         # Ensure 'best' variables are initialized safely so returning them at the end doesn't fail.
-        # NOTE: on resume, best_core/best_factors start as the *checkpoint* tensors, not
-        # necessarily the historical best-scoring model on disk — they are only replaced
-        # below if semantics improve past the resumed best_sem_score. If semantics never
-        # improve during this run, the "best" tensor returned is just the latest checkpoint,
-        # labeled with the resumed score.
-        if _is_sgd:
-            # Host-numpy snapshots (the SGD path never holds CuPy arrays); the
-            # save sites below handle numpy transparently via _as_host.
-            best_core, best_factors = _sgd_trainer.materialize()
+        # best_sem_iteration is 0-based: the state after iteration k (checkpoint k) is k - 1.
+        best_tensor = resume_state.get("best_tensor")
+        if best_tensor is not None:
+            # Resume: the old run's best-semantic model file (config.get_resume_state checked
+            # that its {stem}_best.json matches best_sem_score). Host arrays; saves use _as_host.
+            best_core, best_factors = (best_tensor.core, best_tensor.factors) if hasattr(best_tensor, "core") \
+                else best_tensor
+            best_core = _as_host(best_core)
+            best_factors = [_as_host(f) for f in best_factors]
+            best_sem_iteration = resume_state["best_iteration"] - 1
         else:
-            # TT: `core` is a list of cores, so copy element-wise (list.copy is shallow).
-            best_core = [C.copy() for C in core] if _is_tt else core.copy()
-            best_factors = [f.copy() for f in factors]
-        best_sem_iteration = start_iteration if start_iteration > 0 else None
+            if start_iteration > 0:
+                print("Resume: the old run left no best-state record; the checkpoint stands in as the best "
+                      "state until semantics improve.")
+            if _is_sgd:
+                # Host-numpy snapshots (the SGD path never holds CuPy arrays); the
+                # save sites below handle numpy transparently via _as_host.
+                best_core, best_factors = _sgd_trainer.materialize()
+            else:
+                # TT: `core` is a list of cores, so copy element-wise (list.copy is shallow).
+                best_core = [C.copy() for C in core] if _is_tt else core.copy()
+                best_factors = [f.copy() for f in factors]
+            best_sem_iteration = start_iteration - 1 if start_iteration > 0 else None
+        # the checkpoint standing in for an unrecorded best: best_sem_score is not its score
+        best_is_stand_in = best_tensor is None and start_iteration > 0
 
         # Decide once which semantic metric drives patience/diff.
         # cfg.eval.sem_primary_key can override the auto-derived default.
@@ -2460,6 +2472,12 @@ class SparseTupleTensor:
                         print(f"Warning: dimension-consistency scoring failed ({_dim_err}); skipping.")
 
                 fitness_scores.append(sem_out)
+                if save_intermediate:  # every check, so the log is complete while the run is going
+                    if isinstance(sem_out, dict):
+                        with open(paths["fitness_json"], "w") as f:
+                            json.dump(fitness_scores, f, indent=2)
+                    else:
+                        np.save(paths["fitness"], np.array(fitness_scores, dtype=float))
                 # Primary value used for early stopping / diff
                 _sem_value_available = True
                 if isinstance(sem_out, dict):
@@ -2519,6 +2537,7 @@ class SparseTupleTensor:
                             best_core = [C.copy() for C in core] if _is_tt else core.copy()
                             best_factors = [factor.copy() for factor in factors]
                         best_sem_iteration = iteration
+                        best_is_stand_in = False
                         if verbose:
                             print("New best semantic score; saving current best core and factors.")
                         if save_intermediate:
@@ -2542,17 +2561,10 @@ class SparseTupleTensor:
                                      [_as_host(factor) for factor in best_factors])
                                 )
                             torch.save(temp_tensor, paths["model"])
+                            write_best_record(paths["best_json"], iteration + 1, sem_value, sem_primary_key)
                             print("saving temp model to", paths["model"])
 
                             np.save(paths["errors"], np.array([_as_host(e) for e in rec_errors]))
-
-                            # Save semantic scores more robustly
-                            if isinstance(sem_out, dict):
-                                # save as JSON alongside the provided fitness path
-                                with open(paths["fitness_json"], "w") as f:
-                                    json.dump(fitness_scores, f, indent=2)
-                            else:
-                                np.save(paths["fitness"], np.array(fitness_scores, dtype=float))
 
                     # semantic patience (uses primary key only)
                     if diff < tol:
@@ -2687,6 +2699,7 @@ class SparseTupleTensor:
         if _sigint_installed:
             signal.signal(signal.SIGINT, _original_sigint)
 
+        last_iteration = iteration + 1  # iterations run (like checkpoint names); `iteration` is reused below
         if best_sem_iteration is not None:
             if _is_sgd:
                 # numpy snapshots + pytorch backend: see the temp-save note.
@@ -2714,7 +2727,12 @@ class SparseTupleTensor:
                 "errors": rec_errors,
                 "fitness_scores": fitness_scores,
                 "sem_primary_key": sem_primary_key,
-                "iterations": iteration + 1,
+                "iterations": iteration + 1,  # the returned state's iteration (kept for old readers)
+                # explicit: the best-semantic state returned (None: no check improved, the final
+                # state is returned) and how far the loop got
+                "best_iteration": None if best_sem_iteration is None else best_sem_iteration + 1,
+                "best_sem_score": None if best_sem_iteration is None or best_is_stand_in else float(best_sem_score),
+                "last_iteration": last_iteration,
                 "final_error": (
                     _sgd_exact_final_error if _sgd_exact_final_error is not None
                     else (rec_errors[-1] if len(rec_errors) > 0 else None)
