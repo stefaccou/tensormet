@@ -13,6 +13,13 @@
 
 # Allow everything inside those directories
 !src/**
+# except for the experimental part
+src/tensormet/experimental/
+# only a few files are ok from here
+!src/tensormet/experimental/tealeaves_human.py
+!src/tensormet/experimental/inspect_tucker.py
+!src/tensormet/experimental/contextual.py
+
 !sample_data/**
 
 # The COLING replication code and its results

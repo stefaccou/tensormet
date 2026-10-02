@@ -8,15 +8,15 @@
      & Sent. & TREC & Attr. & Comp. & Relig. & Sports & NP & WS-353 & Avg. & Intr. \\
     \midrule
     \multicolumn{11}{l}{\textit{Tucker-TT, 4-gram}} \\
-    Seed 1 & 0.666 & 0.910 & 0.532 & 0.598 & 0.728 & 0.634 & 0.768 & 0.483 & 0.665 & 0.830 \\
-    Seed 2 & 0.671 & 0.884 & 0.500 & 0.615 & 0.732 & 0.647 & 0.774 & 0.527 & 0.669 & 0.840 \\
-    Seed 3 & 0.659 & 0.890 & 0.537 & 0.598 & 0.669 & 0.629 & 0.774 & 0.429 & 0.648 & 0.890 \\
+    Seed 1 & 0.67 & 0.91 & 0.53 & 0.60 & 0.73 & 0.63 & 0.77 & 0.48 & 0.66 & 0.81 \\
+    Seed 2 & 0.66 & 0.89 & 0.50 & 0.54 & 0.71 & 0.62 & 0.77 & 0.53 & 0.65 & 0.81 \\
+    Seed 3 & 0.67 & 0.89 & 0.54 & 0.59 & 0.70 & 0.63 & 0.78 & 0.43 & 0.65 & 0.80 \\
     \midrule
-    SD over seeds & 0.006 & 0.014 & 0.020 & 0.010 & 0.035 & 0.009 & 0.003 & 0.049 & 0.011 & 0.032 \\
-    SD over settings & 0.020 & 0.040 & 0.020 & 0.027 & 0.032 & 0.022 & 0.010 & 0.057 & 0.021 & 0.031 \\
-    Ratio & 30\% & 34\% & 99\% & 35\% & 109\% & 41\% & 36\% & 85\% & 52\% & 103\% \\
+    SD over seeds & 0.007 & 0.013 & 0.020 & 0.031 & 0.015 & 0.008 & 0.005 & 0.049 & 0.007 & 0.006 \\
+    SD over settings & 0.019 & 0.039 & 0.020 & 0.024 & 0.032 & 0.021 & 0.010 & 0.057 & 0.021 & 0.031 \\
+    Ratio & 34\% & 33\% & 99\% & 129\% & 48\% & 35\% & 47\% & 85\% & 36\% & 18\% \\
     \bottomrule
   \end{tabular}
-  \caption{Effect of the random seed (initialisation and subsample windows) on the default model. SD over seeds: standard deviation over the seeds; SD over settings: standard deviation over all our seed-1 runs on the 10\,000-word vocabulary; Ratio: the former as a share of the latter. Sent.: sentiment; TREC: question classification; Attr.: discriminative attributes; Comp., Relig., Sports: 20 Newsgroups; NP: noun-phrase bracketing; WS-353: word similarity (Spearman's $\rho$; accuracy elsewhere); Avg.: mean over the downstream tasks; Intr.: word-intrusion accuracy of the LLM judge (chance 0.20).}
+  \caption{Effect of the random seed (initialisation and subsample windows) on the default model. SD over seeds: standard deviation over the seeds; SD over settings: standard deviation over all our seed-1 runs on the 10\,000-word vocabulary; Ratio: the former as a share of the latter. Sent.: sentiment classification; TREC: question classification; Attr.: discriminative attributes; Comp., Relig., Sports: 20 Newsgroups; NP: noun-phrase bracketing; WS-353: word similarity (Spearman's $\rho$; accuracy elsewhere); Avg.: mean over the downstream tasks; Intr.: word-intrusion accuracy of the LLM judge (chance 0.20).}
   \label{tab:seeds}
 \end{table*}
