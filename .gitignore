@@ -14,8 +14,9 @@
 # Allow everything inside those directories
 !src/**
 # except for the experimental part
-src/tensormet/experimental/
+src/tensormet/experimental/*
 # only a few files are ok from here
+!src/tensormet/experimental/__init__.py
 !src/tensormet/experimental/tealeaves_human.py
 !src/tensormet/experimental/inspect_tucker.py
 !src/tensormet/experimental/contextual.py
