@@ -1,0 +1,22 @@
+\begin{table*}[t]
+  \centering
+  \small
+  \begin{tabular}{lrrrrrrrrrr}
+    \toprule
+     & \multicolumn{9}{c}{Downstream tasks} & \multicolumn{1}{c}{Interp.} \\
+    \cmidrule(lr){2-10} \cmidrule(lr){11-11}
+     & Sent. & TREC & Attr. & Comp. & Relig. & Sports & NP & WS-353 & Avg. & Intr. \\
+    \midrule
+    \multicolumn{11}{l}{\textit{Tucker-TT, 4-gram}} \\
+    Seed 1 & 0.666 & 0.910 & 0.532 & 0.598 & 0.728 & 0.634 & 0.768 & 0.483 & 0.665 & 0.830 \\
+    Seed 2 & 0.671 & 0.884 & 0.500 & 0.615 & 0.732 & 0.647 & 0.774 & 0.527 & 0.669 & 0.840 \\
+    Seed 3 & 0.659 & 0.890 & 0.537 & 0.598 & 0.669 & 0.629 & 0.774 & 0.429 & 0.648 & 0.890 \\
+    \midrule
+    SD over seeds & 0.006 & 0.014 & 0.020 & 0.010 & 0.035 & 0.009 & 0.003 & 0.049 & 0.011 & 0.032 \\
+    SD over settings & 0.020 & 0.040 & 0.020 & 0.027 & 0.032 & 0.022 & 0.010 & 0.057 & 0.021 & 0.031 \\
+    Ratio & 30\% & 34\% & 99\% & 35\% & 109\% & 41\% & 36\% & 85\% & 52\% & 103\% \\
+    \bottomrule
+  \end{tabular}
+  \caption{Effect of the random seed (initialisation and subsample windows) on the default model. SD over seeds: standard deviation over the seeds; SD over settings: standard deviation over all our seed-1 runs on the 10\,000-word vocabulary; Ratio: the former as a share of the latter. Sent.: sentiment; TREC: question classification; Attr.: discriminative attributes; Comp., Relig., Sports: 20 Newsgroups; NP: noun-phrase bracketing; WS-353: word similarity (Spearman's $\rho$; accuracy elsewhere); Avg.: mean over the downstream tasks; Intr.: word-intrusion accuracy of the LLM judge (chance 0.20).}
+  \label{tab:seeds}
+\end{table*}

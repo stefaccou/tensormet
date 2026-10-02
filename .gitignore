@@ -19,3 +19,15 @@
 !src/**
 !sample_data/**
 
+# The COLING replication code and its results
+!5_evaluation/
+!5_evaluation/COLING/
+!5_evaluation/COLING/**
+# ... but not the upstream repositories (cloned by hand, see third_party/README.md), logs or caches
+5_evaluation/COLING/third_party/*
+!5_evaluation/COLING/third_party/README.md
+5_evaluation/COLING/**/*.log
+5_evaluation/COLING/**/*.backup-*
+5_evaluation/COLING/**/__pycache__/
+5_evaluation/COLING/**/.ipynb_checkpoints/
+

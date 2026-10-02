@@ -1,0 +1,1632 @@
+{
+ "model": "ibm-granite/granite-3.3-8b-instruct",
+ "prompt": "stammbach",
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are a helpful assistant evaluating the top words of a topic model output for a given topic. Select which word is the least related to all other words. If multiple words do not fit, choose the word that is most out of place."
+  },
+  {
+   "role": "user",
+   "content": "{listing}"
+  }
+ ],
+ "trial_sets": {
+  "8c664a227c76": {
+   "label": "4-gram_base",
+   "picks": {
+    "0": "improve",
+    "1": "least",
+    "2": "facilitates",
+    "3": "how",
+    "4": "hawaii",
+    "5": "regarding",
+    "6": "procurement",
+    "7": "<s>",
+    "8": "requires",
+    "9": "their",
+    "10": "access",
+    "11": "creativity",
+    "12": "se",
+    "13": "but",
+    "14": "outdoor",
+    "15": "best",
+    "16": "laughing",
+    "17": "determines",
+    "18": "taiwan",
+    "19": "beautiful",
+    "20": "free",
+    "21": "prove",
+    "22": "even",
+    "23": "microgaming",
+    "24": "experience",
+    "25": "affordability",
+    "26": "abc",
+    "27": "eaten",
+    "28": "significant",
+    "29": "intact",
+    "30": "rate",
+    "31": "n\u2019t",
+    "32": "email",
+    "33": "new",
+    "34": "have",
+    "35": "be",
+    "36": "last",
+    "37": "quality",
+    "38": "but",
+    "39": "decentralized",
+    "40": "country",
+    "41": "disclosed",
+    "42": "\u2019re",
+    "43": "wasted",
+    "44": "informed",
+    "45": "peel",
+    "46": "the",
+    "47": "bit",
+    "48": "tall",
+    "49": "bitter",
+    "50": "honestly",
+    "51": "in",
+    "52": "his",
+    "53": "oil",
+    "54": "magnesium",
+    "55": "music",
+    "56": "the",
+    "57": "closet",
+    "58": "brian",
+    "59": "it",
+    "60": "receives",
+    "61": "proves",
+    "62": "salvation",
+    "63": "alleged",
+    "64": "reasonable",
+    "65": "ban",
+    "66": "being",
+    "67": "happened",
+    "68": "goods",
+    "69": "rankings",
+    "70": "financial",
+    "71": "our",
+    "72": "an",
+    "73": "adverse",
+    "74": "threw",
+    "75": "institutional",
+    "76": "cannabis",
+    "77": "drones",
+    "78": "coil",
+    "79": "san",
+    "80": "information",
+    "81": "asthma",
+    "82": "potentially",
+    "83": "tattoos",
+    "84": "distinguish",
+    "85": "unhealthy",
+    "86": "its",
+    "87": "the",
+    "88": "so",
+    "89": "snack",
+    "90": "siding",
+    "91": "3",
+    "92": "artisans",
+    "93": "khan",
+    "94": "devoted",
+    "95": "i",
+    "96": "tsp",
+    "97": "mb",
+    "98": "substances",
+    "99": "homeowner"
+   },
+   "scores": {
+    "0": {
+     "ensure": -3.8844,
+     "enhance": -2.7289,
+     "reduce": -2.9547,
+     "improve": -1.8369,
+     "conversation": -10.9352
+    },
+    "1": {
+     "which": -5.4423,
+     "least": -1.6689,
+     "india": -3.5381,
+     "signifies": -2.1314,
+     "order": -5.9892
+    },
+    "2": {
+     "development": -2.1464,
+     "care": -2.9667,
+     "facilitates": -2.0571,
+     "support": -3.5682,
+     "health": -9.9276
+    },
+    "3": {
+     "want": -4.8646,
+     "how": -3.5755,
+     "able": -9.6107,
+     "need": -3.8568,
+     "properties": -7.7162
+    },
+    "4": {
+     "take": -5.6204,
+     "go": -6.0969,
+     "hawaii": -2.3653,
+     "have": -3.05,
+     "get": -2.7297
+    },
+    "5": {
+     "regarding": -3.4936,
+     "for": -6.6236,
+     "in": -3.7565,
+     "advice": -3.89,
+     "of": -4.4674
+    },
+    "6": {
+     "procurement": -1.816,
+     "at": -4.7137,
+     "without": -4.2528,
+     "with": -11.37,
+     "for": -6.2606
+    },
+    "7": {
+     "ticket": -4.8587,
+     "while": -11.7142,
+     "<s>": -0.0604,
+     "additionally": -5.9203,
+     "however": -7.4622
+    },
+    "8": {
+     "requires": -1.444,
+     "damage": -5.6315,
+     "pain": -7.6666,
+     "stress": -5.8033,
+     "anxiety": -2.133
+    },
+    "9": {
+     "my": -7.074,
+     "their": -4.6365,
+     "drove": -4.8949,
+     "your": -7.0818,
+     "our": -6.4958
+    },
+    "10": {
+     "performance": -8.293,
+     "access": -2.9258,
+     "shop": -4.4805,
+     "time": -4.1836,
+     "results": -9.5586
+    },
+    "11": {
+     "creativity": -1.3851,
+     "comfort": -1.9587,
+     "quality": -5.5658,
+     "visitor": -3.5971,
+     "strength": -5.3002
+    },
+    "12": {
+     "two": -7.8816,
+     "some": -12.2527,
+     "se": -1.5378,
+     "all": -4.7331,
+     "many": -10.8972
+    },
+    "13": {
+     "products": -4.1094,
+     "but": -2.4219,
+     "system": -5.7969,
+     "which": -11.6484,
+     "narrow": -4.6641
+    },
+    "14": {
+     "sorts": -2.3935,
+     "art": -2.9891,
+     "music": -2.3953,
+     "family": -3.6609,
+     "outdoor": -2.347
+    },
+    "15": {
+     "first": -4.6831,
+     "oh": -3.6284,
+     "best": -3.5269,
+     "own": -3.8394,
+     "same": -8.7222
+    },
+    "16": {
+     "in": -3.8302,
+     "and": -11.6037,
+     "or": -4.0802,
+     "through": -6.3381,
+     "laughing": -1.5349
+    },
+    "17": {
+     "would": -3.7561,
+     "may": -4.8342,
+     "can": -5.8264,
+     "will": -5.6233,
+     "determines": -3.219
+    },
+    "18": {
+     "as": -3.7587,
+     "more": -7.2978,
+     "so": -4.1806,
+     "how": -4.5868,
+     "taiwan": -1.8545
+    },
+    "19": {
+     "usage": -4.58,
+     "good": -3.2832,
+     "beautiful": -0.8726,
+     "simple": -4.7363,
+     "unique": -4.416
+    },
+    "20": {
+     "free": -0.7468,
+     "online": -6.2703,
+     "casino": -2.8383,
+     "video": -5.0749,
+     "operates": -2.1078
+    },
+    "21": {
+     "city": -7.0707,
+     "prove": -1.7151,
+     "school": -4.0629,
+     "state": -4.1489,
+     "term": -2.727
+    },
+    "22": {
+     "even": -1.9439,
+     "work": -5.3033,
+     "working": -6.4908,
+     "sir": -4.8814,
+     "look": -6.0611
+    },
+    "23": {
+     "cultural": -3.6014,
+     "microgaming": -0.447,
+     "natural": -10.2239,
+     "american": -4.0456,
+     "human": -10.0403
+    },
+    "24": {
+     "experience": -1.6632,
+     "area": -4.5225,
+     "events": -2.9757,
+     "folks": -2.25,
+     "room": -6.8741
+    },
+    "25": {
+     "way": -8.0826,
+     "role": -2.6373,
+     "focus": -4.1373,
+     "affordability": -0.9755,
+     "approach": -3.1546
+    },
+    "26": {
+     "abc": -5.4563,
+     "to": -6.3313,
+     "we": -9.2298,
+     "please": -7.9642,
+     "that": -6.1126
+    },
+    "27": {
+     "game": -11.4221,
+     "casinos": -7.368,
+     "games": -13.9124,
+     "eaten": -0.4025,
+     "casino": -6.8446
+    },
+    "28": {
+     "new": -1.7945,
+     "good": -5.5054,
+     "develop": -5.107,
+     "significant": -1.4928,
+     "great": -4.5445
+    },
+    "29": {
+     "out": -1.8898,
+     "intact": -1.4762,
+     "one": -7.0304,
+     "instead": -7.6164,
+     "because": -7.0539
+    },
+    "30": {
+     "combines": -4.0459,
+     "rate": -0.7401,
+     "system": -5.2636,
+     "program": -5.498,
+     "process": -6.7558
+    },
+    "31": {
+     "n't": -3.0951,
+     "preventing": -4.0637,
+     "not": -9.9356,
+     "n\u2019t": -3.053,
+     "also": -12.6837
+    },
+    "32": {
+     "standout": -3.3733,
+     "credit": -3.2231,
+     "tax": -3.1059,
+     "email": -0.8247,
+     "product": -7.1137
+    },
+    "33": {
+     "adviser": -2.469,
+     "south": -4.352,
+     "new": -2.3989,
+     "long": -3.6489,
+     "national": -3.227
+    },
+    "34": {
+     "with": -6.4946,
+     "have": -1.7524,
+     "offer": -4.4712,
+     "offers": -5.104,
+     "regulated": -2.5061
+    },
+    "35": {
+     "stairs": -1.8052,
+     "be": -1.0082,
+     "become": -1.6075,
+     "been": -9.5902,
+     "get": -4.9066
+    },
+    "36": {
+     "first": -4.8535,
+     "last": -1.2207,
+     "second": -7.6348,
+     "next": -7.6855,
+     "pathway": -2.5166
+    },
+    "37": {
+     "control": -6.4132,
+     "aspects": -3.7483,
+     "quality": -1.7648,
+     "friendly": -1.9757,
+     "management": -4.171
+    },
+    "38": {
+     "just": -2.2689,
+     "but": -1.3627,
+     "right": -3.183,
+     "intellectual": -1.5612,
+     "here": -5.5893
+    },
+    "39": {
+     "year": -4.9965,
+     "decentralized": -2.0171,
+     "time": -6.3246,
+     "day": -2.9262,
+     "week": -4.1059
+    },
+    "40": {
+     "trained": -5.2441,
+     "country": -1.8769,
+     "team": -4.541,
+     "world": -5.8769,
+     "company": -4.6816
+    },
+    "41": {
+     "had": -5.1999,
+     "who": -3.5436,
+     "have": -8.1764,
+     "has": -8.0905,
+     "disclosed": -3.1235
+    },
+    "42": {
+     "mechanic": -2.8184,
+     "have": -7.7831,
+     "is": -6.5096,
+     "has": -4.2675,
+     "\u2019re": -2.6823
+    },
+    "43": {
+     "amount": -5.7179,
+     "wasted": -1.1431,
+     "number": -6.9875,
+     "variety": -2.7654,
+     "range": -4.9289
+    },
+    "44": {
+     "over": -6.0944,
+     "years": -5.2037,
+     "$": -2.9928,
+     "10": -1.6765,
+     "informed": -1.4266
+    },
+    "45": {
+     "are": -6.1638,
+     "peel": -1.457,
+     "were": -3.7695,
+     "is": -5.6092,
+     "was": -8.4451
+    },
+    "46": {
+     "these": -7.8885,
+     "all": -2.9822,
+     "various": -3.8708,
+     "the": -2.8103,
+     "lenses": -3.206
+    },
+    "47": {
+     "bit": -1.8052,
+     "expected": -2.5083,
+     "lot": -2.7739,
+     "few": -1.9262,
+     "little": -3.938
+    },
+    "48": {
+     "tall": -2.4871,
+     "from": -2.9194,
+     "for": -5.8648,
+     "like": -4.4038,
+     "about": -7.3804
+    },
+    "49": {
+     "family": -12.5865,
+     "work": -1.7427,
+     "life": -9.0865,
+     "bitter": -0.3245,
+     "home": -12.3091
+    },
+    "50": {
+     "\u2019s": -2.1154,
+     "based": -5.3783,
+     "'s": -3.0501,
+     "honestly": -1.1921,
+     "whose": -2.2714
+    },
+    "51": {
+     "and": -6.5142,
+     "in": -2.5767,
+     "majestic": -3.0309,
+     "with": -6.6939,
+     "</s>": -2.8304
+    },
+    "52": {
+     "her": -4.3394,
+     "their": -6.4644,
+     "my": -6.8159,
+     "his": -3.6675,
+     "coral": -4.0019
+    },
+    "53": {
+     "red": -6.1984,
+     "oil": -0.7204,
+     "performed": -2.236,
+     "black": -3.6516,
+     "white": -4.0812
+    },
+    "54": {
+     "design": -9.2526,
+     "environment": -3.1744,
+     "magnesium": -1.8298,
+     "look": -8.9283,
+     "experience": -1.9713
+    },
+    "55": {
+     "tutorial": -4.3735,
+     "history": -2.0532,
+     "music": -1.3188,
+     "culture": -6.0297,
+     "life": -3.0219
+    },
+    "56": {
+     "the": -4.2353,
+     "every": -5.0088,
+     "each": -8.6689,
+     "this": -7.4072,
+     "trials": -4.9541
+    },
+    "57": {
+     "them": -9.7093,
+     "this": -8.9866,
+     "closet": -4.4,
+     "what": -10.7835,
+     "it": -7.8304
+    },
+    "58": {
+     "security": -8.473,
+     "marketing": -1.2113,
+     "brian": -0.9025,
+     "business": -5.2738,
+     "insurance": -1.7072
+    },
+    "59": {
+     "women": -5.051,
+     "today": -5.7856,
+     "it": -2.0356,
+     "god": -3.8246,
+     "formally": -5.3168
+    },
+    "60": {
+     "off": -3.4221,
+     "down": -4.219,
+     "up": -6.3128,
+     "receives": -1.7695,
+     "out": -3.5549
+    },
+    "61": {
+     "free": -2.1596,
+     "online": -3.8862,
+     "proves": -0.9705,
+     "on": -3.9956,
+     "live": -4.8706
+    },
+    "62": {
+     "salvation": -2.6498,
+     "on": -7.932,
+     "from": -4.2367,
+     "in": -5.2445,
+     "by": -6.0727
+    },
+    "63": {
+     "it": -7.1,
+     "us": -5.7954,
+     "them": -6.8579,
+     "alleged": -2.3274,
+     "you": -8.35
+    },
+    "64": {
+     "reasonable": -1.0888,
+     "been": -3.076,
+     "had": -2.4745,
+     "made": -2.7323,
+     "said": -1.9325
+    },
+    "65": {
+     "ban": -0.6875,
+     "different": -6.5859,
+     "other": -5.5625,
+     "key": -4.0937,
+     "new": -4.6797
+    },
+    "66": {
+     "being": -1.7591,
+     "well": -4.1575,
+     "often": -4.0007,
+     "fully": -5.5403,
+     "excess": -2.0789
+    },
+    "67": {
+     "all": -4.8507,
+     "using": -6.8663,
+     "having": -4.3741,
+     "happened": -2.3047,
+     "making": -4.2648
+    },
+    "68": {
+     "goods": -2.9107,
+     "designed": -4.5628,
+     "available": -5.9576,
+     "used": -5.4263,
+     "made": -4.1138
+    },
+    "69": {
+     "water": -6.1557,
+     "materials": -6.562,
+     "rankings": -0.3357,
+     "products": -5.8198,
+     "design": -9.1245
+    },
+    "70": {
+     "health": -7.9713,
+     "financial": -2.2135,
+     "justify": -5.9557,
+     "customer": -3.6432,
+     "social": -3.237
+    },
+    "71": {
+     "variable": -5.5731,
+     "our": -4.8152,
+     "young": -5.4637,
+     "other": -5.6121,
+     "many": -7.7527
+    },
+    "72": {
+     "an": -3.1935,
+     "the": -4.545,
+     "another": -12.4825,
+     "a": -6.5763,
+     "templates": -8.0294
+    },
+    "73": {
+     "the": -6.8944,
+     "adverse": -2.9706,
+     "our": -8.6756,
+     "in": -5.285,
+     "and": -11.1991
+    },
+    "74": {
+     "march": -5.5396,
+     "april": -5.6519,
+     "may": -9.6983,
+     "threw": -0.3023,
+     "june": -3.7533
+    },
+    "75": {
+     "institutional": -2.1973,
+     "along": -4.9881,
+     "associated": -3.4022,
+     "perfect": -3.5272,
+     "looking": -3.1288
+    },
+    "76": {
+     "such": -4.344,
+     "well": -5.4143,
+     "than": -2.0627,
+     "much": -2.1995,
+     "cannabis": -1.1078
+    },
+    "77": {
+     "know": -2.7575,
+     "think": -4.1247,
+     "but": -6.4762,
+     "drones": -0.4819,
+     "even": -4.3903
+    },
+    "78": {
+     "education": -6.5739,
+     "research": -9.152,
+     "technology": -6.7223,
+     "course": -4.1989,
+     "coil": -0.5331
+    },
+    "79": {
+     "john": -4.3187,
+     "san": -0.9749,
+     "president": -1.425,
+     "said": -3.1947,
+     "damage": -4.928
+    },
+    "80": {
+     "things": -6.4117,
+     "information": -3.8414,
+     "discuss": -4.3643,
+     "areas": -5.6851,
+     "questions": -6.0679
+    },
+    "81": {
+     "same": -7.6314,
+     "asthma": -0.8329,
+     "most": -3.0377,
+     "way": -5.1549,
+     "ability": -1.6939
+    },
+    "82": {
+     "make": -5.0383,
+     "making": -6.7023,
+     "makes": -3.9137,
+     "help": -1.5851,
+     "potentially": -1.359
+    },
+    "83": {
+     "tattoos": -0.093,
+     "solutions": -5.8884,
+     "systems": -9.1969,
+     "services": -9.3219,
+     "options": -6.5915
+    },
+    "84": {
+     "distinguish": -1.576,
+     "or": -4.991,
+     "and": -6.1785,
+     "while": -7.616,
+     "but": -2.6942
+    },
+    "85": {
+     "and": -11.529,
+     "in": -5.1891,
+     "that": -4.7907,
+     "unhealthy": -0.6104,
+     "</s>": -2.7001
+    },
+    "86": {
+     "its": -1.0721,
+     "increased": -3.1495,
+     "more": -7.5096,
+     "vegetarian": -1.1803,
+     "better": -9.8573
+    },
+    "87": {
+     "our": -7.2757,
+     "its": -5.8617,
+     "the": -3.8148,
+     "identification": -6.4867,
+     "your": -6.557
+    },
+    "88": {
+     "most": -7.3124,
+     "very": -4.8944,
+     "flower": -7.7304,
+     "more": -5.6366,
+     "so": -4.4569
+    },
+    "89": {
+     "companies": -10.299,
+     "snack": -0.3063,
+     "people": -8.2795,
+     "students": -8.7678,
+     "businesses": -3.6222
+    },
+    "90": {
+     "based": -4.4514,
+     "siding": -1.1398,
+     "comes": -4.4525,
+     "due": -6.6311,
+     "according": -2.7336
+    },
+    "91": {
+     "1": -2.8097,
+     "|": -4.4347,
+     "3": -2.0987,
+     "2": -3.2393,
+     "maintain": -3.8633
+    },
+    "92": {
+     "ai": -3.2687,
+     "software": -7.6827,
+     "artisans": -0.4154,
+     "management": -5.9874,
+     "data": -11.2335
+    },
+    "93": {
+     "that": -7.4619,
+     "when": -8.0869,
+     "if": -12.4658,
+     "khan": -1.4224,
+     "but": -4.7041
+    },
+    "94": {
+     "large": -5.4489,
+     "metal": -4.8552,
+     "devoted": -0.5956,
+     "custom": -3.7692,
+     "electric": -7.4567
+    },
+    "95": {
+     "i": -5.5432,
+     "you": -13.1409,
+     "domains": -8.637,
+     "we": -8.2854,
+     "that": -7.9651
+    },
+    "96": {
+     "tsp": -1.713,
+     "water": -4.0744,
+     "low": -4.2072,
+     "energy": -2.0275,
+     "high": -6.9729
+    },
+    "97": {
+     "mb": -3.2897,
+     "by": -5.7819,
+     "without": -4.4616,
+     "while": -8.7624,
+     "help": -7.1726
+    },
+    "98": {
+     "digital": -4.7776,
+     "substances": -2.2917,
+     "local": -4.1995,
+     "non": -3.6917,
+     "real": -4.9104
+    },
+    "99": {
+     "see": -7.8068,
+     "homeowner": -0.8585,
+     "find": -3.5138,
+     "make": -5.9591,
+     "use": -4.2326
+    }
+   },
+   "n_nan_scores": 0
+  },
+  "a5333a24f2cd": {
+   "label": "4-gram_tt",
+   "picks": {
+    "0": "constructed",
+    "1": "shipments",
+    "2": "evenings",
+    "3": "city",
+    "4": "lot",
+    "5": "in",
+    "6": "proceed",
+    "7": "thermostat",
+    "8": "republic",
+    "9": "earliest",
+    "10": "sex",
+    "11": "the",
+    "12": "scheduling",
+    "13": "n't",
+    "14": "soothing",
+    "15": "murder",
+    "16": "kinds",
+    "17": "million",
+    "18": "teen",
+    "19": "from",
+    "20": "n\u2019t",
+    "21": "financial",
+    "22": "singh",
+    "23": "new",
+    "24": "feasible",
+    "25": "aggression",
+    "26": "those",
+    "27": "email",
+    "28": "defendant",
+    "29": "red",
+    "30": "closed",
+    "31": "polished",
+    "32": "stamp",
+    "33": "admissions",
+    "34": "ranks",
+    "35": "sticking",
+    "36": "pays",
+    "37": "recently",
+    "38": "government",
+    "39": "dealers",
+    "40": "amount",
+    "41": "blood",
+    "42": "|",
+    "43": "want",
+    "44": "marketing",
+    "45": "will",
+    "46": "lime",
+    "47": "app",
+    "48": "sunscreen",
+    "49": "bustling",
+    "50": "how",
+    "51": "mechanism",
+    "52": "city",
+    "53": "playstation",
+    "54": "a",
+    "55": "10",
+    "56": "travelling",
+    "57": "civil",
+    "58": "least",
+    "59": "gas",
+    "60": "made",
+    "61": "rays",
+    "62": "cleaning",
+    "63": "allure",
+    "64": "in",
+    "65": "ashley",
+    "66": "let",
+    "67": "air",
+    "68": "estate",
+    "69": "reduced",
+    "70": "<s>",
+    "71": "utilities",
+    "72": "television",
+    "73": "media",
+    "74": "low",
+    "75": "impressed",
+    "76": "much",
+    "77": "it",
+    "78": "non",
+    "79": "be",
+    "80": "advanced",
+    "81": "athletics",
+    "82": "among",
+    "83": "switched",
+    "84": "direction",
+    "85": "the",
+    "86": "vacation",
+    "87": "illustrate",
+    "88": "significant",
+    "89": "sodium",
+    "90": "creativity",
+    "91": "manhattan",
+    "92": "businesses",
+    "93": "experience",
+    "94": "determining",
+    "95": "drive",
+    "96": "undergone",
+    "97": "than",
+    "98": "structural",
+    "99": "is"
+   },
+   "scores": {
+    "0": {
+     "most": -7.8498,
+     "as": -5.5842,
+     "very": -5.6935,
+     "more": -5.6935,
+     "constructed": -2.1984
+    },
+    "1": {
+     "is": -2.5495,
+     "was": -4.6745,
+     "has": -3.8776,
+     "shipments": -2.0914,
+     "said": -3.8451
+    },
+    "2": {
+     "also": -4.8532,
+     "not": -5.0173,
+     "evenings": -1.3486,
+     "just": -3.3063,
+     "been": -4.0563
+    },
+    "3": {
+     "paul": -2.4343,
+     "john": -4.6843,
+     "city": -1.3093,
+     "york": -2.6472,
+     "quickly": -3.4908
+    },
+    "4": {
+     "bit": -1.8598,
+     "little": -3.6958,
+     "heated": -2.5237,
+     "few": -2.5316,
+     "lot": -1.4692
+    },
+    "5": {
+     "in": -3.1009,
+     "as": -5.2493,
+     "on": -5.0618,
+     "admin": -5.3431,
+     "to": -6.6478
+    },
+    "6": {
+     "proceed": -2.0692,
+     "small": -4.4363,
+     "white": -6.202,
+     "natural": -4.1629,
+     "beautiful": -3.9447
+    },
+    "7": {
+     "thermostat": -1.8204,
+     "time": -5.2572,
+     "year": -2.1087,
+     "week": -3.554,
+     "day": -3.3978
+    },
+    "8": {
+     "republic": -2.4272,
+     "features": -5.6579,
+     "information": -5.8845,
+     "things": -6.6892,
+     "issues": -3.4392
+    },
+    "9": {
+     "having": -6.1497,
+     "all": -3.5481,
+     "earliest": -1.821,
+     "using": -6.0559,
+     "making": -4.1887
+    },
+    "10": {
+     "system": -7.1068,
+     "systems": -12.4622,
+     "sex": -0.4193,
+     "design": -8.3489,
+     "doors": -7.5115
+    },
+    "11": {
+     "our": -6.4117,
+     "the": -3.1461,
+     "its": -3.1774,
+     "visitor": -7.9664,
+     "any": -5.982
+    },
+    "12": {
+     "students": -7.866,
+     "people": -4.8894,
+     "scheduling": -4.241,
+     "members": -5.1785,
+     "companies": -5.5847
+    },
+    "13": {
+     "best": -3.5667,
+     "first": -5.8948,
+     "same": -12.0979,
+     "most": -8.6292,
+     "n't": -2.6234
+    },
+    "14": {
+     "soothing": -1.9783,
+     "way": -4.4171,
+     "thing": -3.4249,
+     "time": -3.9796,
+     "one": -2.8311
+    },
+    "15": {
+     "information": -5.6068,
+     "murder": -1.4011,
+     "support": -3.4584,
+     "access": -2.388,
+     "results": -9.5091
+    },
+    "16": {
+     "aspects": -3.5227,
+     "types": -8.5482,
+     "kinds": -2.7182,
+     "years": -2.806,
+     "joint": -3.8294
+    },
+    "17": {
+     "months": -5.732,
+     "million": -1.7176,
+     "years": -3.7554,
+     "days": -3.5601,
+     "drainage": -2.0262
+    },
+    "18": {
+     "management": -7.5759,
+     "control": -9.3845,
+     "analysis": -5.6306,
+     "based": -7.4587,
+     "teen": -1.6149
+    },
+    "19": {
+     "verse": -11.7786,
+     "in": -4.5247,
+     "on": -7.0169,
+     "like": -7.595,
+     "from": -3.7435
+    },
+    "20": {
+     "n\u2019t": -2.4056,
+     "be": -2.7265,
+     "also": -6.0077,
+     "not": -4.7968,
+     "operation": -8.8984
+    },
+    "21": {
+     "customer": -7.1162,
+     "pulls": -8.2139,
+     "financial": -2.7803,
+     "personal": -3.4521,
+     "social": -3.7256
+    },
+    "22": {
+     "online": -9.7084,
+     "casino": -2.9499,
+     "free": -3.1029,
+     "singh": -0.2624,
+     "live": -11.3099
+    },
+    "23": {
+     "key": -4.6885,
+     "matters": -1.8052,
+     "different": -6.8916,
+     "other": -6.4228,
+     "new": -1.0947
+    },
+    "24": {
+     "colors": -3.2779,
+     "products": -7.1451,
+     "water": -7.4263,
+     "feasible": -2.0303,
+     "food": -6.8326
+    },
+    "25": {
+     "every": -7.1876,
+     "each": -7.7266,
+     "one": -6.961,
+     "aggression": -0.9181,
+     "this": -11.0469
+    },
+    "26": {
+     "6": -3.0774,
+     "those": -2.2202,
+     "what": -6.4367,
+     "example": -4.2883,
+     "others": -5.8586
+    },
+    "27": {
+     "mobile": -7.957,
+     "google": -6.7968,
+     "web": -2.6327,
+     "efficient": -4.6171,
+     "email": -1.4531
+    },
+    "28": {
+     "last": -4.5291,
+     "next": -8.0448,
+     "defendant": -2.5107,
+     "first": -5.9666,
+     "per": -2.9197
+    },
+    "29": {
+     "white": -5.6058,
+     "insurers": -1.6981,
+     "red": -0.6137,
+     "black": -3.4965,
+     "green": -5.1371
+    },
+    "30": {
+     "closed": -2.3656,
+     "because": -3.7953,
+     "one": -4.6,
+     "instead": -5.6781,
+     "out": -2.4906
+    },
+    "31": {
+     "levels": -5.5138,
+     "polished": -1.2183,
+     "health": -5.0294,
+     "loss": -4.2716,
+     "damage": -4.5138
+    },
+    "32": {
+     "stamp": -2.1144,
+     "provide": -5.0519,
+     "offers": -2.216,
+     "offer": -2.3566,
+     "provides": -4.8253
+    },
+    "33": {
+     "admissions": -2.6977,
+     "about": -5.4185,
+     "$": -4.1607,
+     "over": -5.5435,
+     "at": -3.6998
+    },
+    "34": {
+     "they": -8.7059,
+     "you": -7.4716,
+     "we": -12.0731,
+     "i": -8.2528,
+     "ranks": -4.7841
+    },
+    "35": {
+     "sticking": -1.4423,
+     "national": -7.4078,
+     "international": -3.4781,
+     "state": -6.9156,
+     "american": -3.9775
+    },
+    "36": {
+     "services": -5.69,
+     "system": -7.1196,
+     "process": -8.2603,
+     "systems": -10.7681,
+     "pays": -1.0012
+    },
+    "37": {
+     "recently": -2.667,
+     "bakery": -4.7861,
+     "been": -3.701,
+     "being": -3.3494,
+     "already": -3.4354
+    },
+    "38": {
+     "government": -0.9044,
+     "center": -3.4494,
+     "team": -5.1135,
+     "knit": -1.0529,
+     "school": -5.4026
+    },
+    "39": {
+     "great": -3.1387,
+     "dealers": -0.6553,
+     "good": -5.1621,
+     "new": -2.4981,
+     "strong": -3.9746
+    },
+    "40": {
+     "traveler": -2.8618,
+     "amount": -1.8407,
+     "variety": -2.9283,
+     "range": -4.3954,
+     "number": -5.0751
+    },
+    "41": {
+     "water": -11.6943,
+     "physical": -5.7958,
+     "skin": -3.4599,
+     "blood": -1.4365,
+     "disable": -1.5537
+    },
+    "42": {
+     "meat": -1.8637,
+     "3": -4.2508,
+     "2": -8.0789,
+     "1": -8.4304,
+     "|": -0.8836
+    },
+    "43": {
+     "due": -6.3599,
+     "want": -2.8599,
+     "such": -6.9146,
+     "comes": -4.5321,
+     "based": -4.6099
+    },
+    "44": {
+     "training": -3.5558,
+     "business": -3.962,
+     "marketing": -1.3917,
+     "security": -3.8761,
+     "iran": -9.4386
+    },
+    "45": {
+     "can": -6.2149,
+     "petition": -6.0118,
+     "may": -6.418,
+     "to": -11.2618,
+     "will": -5.8165
+    },
+    "46": {
+     "know": -8.4059,
+     "think": -9.0465,
+     "is": -7.0153,
+     "rather": -6.166,
+     "lime": -0.2418
+    },
+    "47": {
+     "app": -2.9957,
+     "exterior": -3.6754,
+     "page": -3.2222,
+     "content": -5.691,
+     "data": -3.8082
+    },
+    "48": {
+     "sunscreen": -0.1487,
+     "casino": -3.18,
+     "games": -8.9965,
+     "game": -5.7348,
+     "casinos": -5.2933
+    },
+    "49": {
+     "many": -8.67,
+     "all": -4.4786,
+     "these": -10.252,
+     "bustling": -1.1726,
+     "some": -7.6661
+    },
+    "50": {
+     "you": -9.347,
+     "which": -2.972,
+     "how": -2.8548,
+     "healthier": -3.7477,
+     "need": -8.0384
+    },
+    "51": {
+     "is": -2.7367,
+     "and": -8.5297,
+     "mechanism": -1.6539,
+     "in": -4.2055,
+     "</s>": -3.3374
+    },
+    "52": {
+     "york": -2.8982,
+     "county": -5.2327,
+     "city": -1.6234,
+     "states": -2.3968,
+     "counting": -2.3899
+    },
+    "53": {
+     "energy": -5.127,
+     "product": -3.5177,
+     "playstation": -1.025,
+     "ai": -3.6349,
+     "data": -7.0645
+    },
+    "54": {
+     "an": -6.9499,
+     "another": -13.4733,
+     "membrane": -5.9927,
+     "its": -12.9577,
+     "a": -4.5905
+    },
+    "55": {
+     "transitions": -3.2485,
+     "3": -3.8579,
+     "5": -5.4282,
+     "2": -5.686,
+     "10": -0.7588
+    },
+    "56": {
+     "to": -4.4346,
+     "but": -5.1612,
+     "or": -2.8877,
+     "and": -9.2705,
+     "travelling": -0.6605
+    },
+    "57": {
+     "when": -7.3079,
+     "as": -6.4876,
+     "civil": -3.0407,
+     "if": -9.2337,
+     "but": -4.222
+    },
+    "58": {
+     "which": -5.0023,
+     "least": -1.307,
+     "causing": -3.2791,
+     "india": -3.0327,
+     "order": -6.4242
+    },
+    "59": {
+     "associated": -3.7698,
+     "looking": -3.6682,
+     "along": -9.5002,
+     "designed": -4.1467,
+     "gas": -3.2307
+    },
+    "60": {
+     "found": -4.8378,
+     "available": -4.494,
+     "used": -4.0097,
+     "relatively": -2.634,
+     "made": -2.4628
+    },
+    "61": {
+     "new": -5.4539,
+     "south": -5.7117,
+     "rays": -2.7934,
+     "north": -4.032,
+     "united": -3.2624
+    },
+    "62": {
+     "rome": -8.4071,
+     "steel": -1.5141,
+     "cleaning": -1.1938,
+     "or": -4.7626,
+     "power": -3.0907
+    },
+    "63": {
+     "back": -5.7917,
+     "down": -6.1589,
+     "up": -5.6042,
+     "allure": -1.9427,
+     "out": -2.5807
+    },
+    "64": {
+     "relations": -5.1505,
+     "in": -3.1583,
+     "by": -4.7052,
+     "at": -4.502,
+     "while": -8.3145
+    },
+    "65": {
+     "ashley": -1.0677,
+     "company": -4.2424,
+     "world": -4.0705,
+     "game": -6.965,
+     "team": -6.9299
+    },
+    "66": {
+     "make": -5.7261,
+     "making": -6.7183,
+     "makes": -3.5838,
+     "let": -2.0777,
+     "examples": -8.5855
+    },
+    "67": {
+     "water": -9.0342,
+     "air": -2.1787,
+     "car": -4.6631,
+     "grant": -2.4443,
+     "electric": -4.1084
+    },
+    "68": {
+     "frames": -3.5114,
+     "life": -3.0114,
+     "term": -5.1755,
+     "time": -9.5661,
+     "estate": -1.3421
+    },
+    "69": {
+     "family": -8.5634,
+     "home": -5.2313,
+     "reduced": -1.9735,
+     "work": -3.7548,
+     "life": -6.3329
+    },
+    "70": {
+     "why": -15.8637,
+     "however": -6.7394,
+     "keyboard": -6.8236,
+     "additionally": -5.26,
+     "<s>": -0.1461
+    },
+    "71": {
+     "utilities": -0.7599,
+     "room": -7.1193,
+     "house": -7.5568,
+     "area": -6.213,
+     "design": -6.6505
+    },
+    "72": {
+     "costs": -10.0813,
+     "rate": -10.0657,
+     "fees": -5.2688,
+     "rates": -7.9485,
+     "television": -0.0681
+    },
+    "73": {
+     "media": -0.1823,
+     "accountable": -3.3841,
+     "health": -10.3542,
+     "service": -4.901,
+     "care": -9.0182
+    },
+    "74": {
+     "well": -3.6488,
+     "low": -1.8051,
+     "top": -4.5629,
+     "thick": -6.4457,
+     "high": -6.4692
+    },
+    "75": {
+     "impressed": -2.4955,
+     "it": -4.5142,
+     "them": -7.5611,
+     "us": -4.2252,
+     "you": -9.9009
+    },
+    "76": {
+     "well": -4.8767,
+     "more": -3.9314,
+     "much": -2.0438,
+     "like": -4.5408,
+     "captivate": -2.8496
+    },
+    "77": {
+     "it": -3.5677,
+     "women": -4.1785,
+     "today": -5.513,
+     "distinguish": -4.4663,
+     "company": -9.345
+    },
+    "78": {
+     "real": -5.4264,
+     "full": -3.1295,
+     "long": -5.7545,
+     "non": -2.567,
+     "checked": -4.3014
+    },
+    "79": {
+     "make": -6.5604,
+     "use": -4.8729,
+     "be": -3.2401,
+     "have": -3.4354,
+     "converted": -4.3104
+    },
+    "80": {
+     "advanced": -2.0195,
+     "our": -5.6523,
+     "edges": -2.332,
+     "other": -5.3554,
+     "new": -2.582
+    },
+    "81": {
+     "cash": -7.6174,
+     "athletics": -0.5756,
+     "tax": -4.8752,
+     "insurance": -1.422,
+     "credit": -7.3752
+    },
+    "82": {
+     "for": -7.8826,
+     "with": -7.5389,
+     "among": -1.5391,
+     "to": -5.8748,
+     "proxy": -2.8514
+    },
+    "83": {
+     "switched": -1.6518,
+     "level": -1.9753,
+     "friendly": -2.53,
+     "quality": -2.6784,
+     "school": -4.3191
+    },
+    "84": {
+     "direction": -3.2871,
+     "i": -3.7246,
+     "it": -6.2089,
+     "he": -5.3652,
+     "that": -6.9199
+    },
+    "85": {
+     "your": -10.2409,
+     "their": -4.2644,
+     "this": -9.0027,
+     "tutorial": -6.6941,
+     "the": -1.9988
+    },
+    "86": {
+     "in": -4.0934,
+     "where": -12.8708,
+     "of": -5.9919,
+     "vacation": -3.0742,
+     "between": -4.6091
+    },
+    "87": {
+     "their": -3.3646,
+     "my": -6.2474,
+     "your": -8.0364,
+     "illustrate": -2.5935,
+     "our": -7.6536
+    },
+    "88": {
+     "significant": -1.7134,
+     "better": -2.7581,
+     "folks": -2.5824,
+     "more": -6.9378,
+     "increased": -2.5942
+    },
+    "89": {
+     "growth": -4.301,
+     "sodium": -0.4669,
+     "experience": -2.2619,
+     "data": -7.2306,
+     "support": -9.1095
+    },
+    "90": {
+     "innovation": -3.1003,
+     "singapore": -2.7643,
+     "safety": -2.4334,
+     "creativity": -2.3106,
+     "comfort": -2.9081
+    },
+    "91": {
+     "'s": -2.9768,
+     "\u2019s": -3.3713,
+     "based": -6.1799,
+     "whose": -6.3051,
+     "manhattan": -1.2755
+    },
+    "92": {
+     "services": -4.1269,
+     "businesses": -2.009,
+     "attempted": -2.2687,
+     "products": -5.2988,
+     "technology": -2.8066
+    },
+    "93": {
+     "experience": -2.3776,
+     "approach": -2.4779,
+     "environment": -2.4557,
+     "keeps": -4.6675,
+     "way": -5.8932
+    },
+    "94": {
+     "work": -4.7553,
+     "go": -6.3334,
+     "determining": -1.5222,
+     "be": -3.5443,
+     "come": -4.4896
+    },
+    "95": {
+     "local": -4.1815,
+     "other": -3.5722,
+     "drive": -2.0331,
+     "many": -7.8847,
+     "young": -6.0878
+    },
+    "96": {
+     "undergone": -1.327,
+     "first": -5.3629,
+     "best": -1.8707,
+     "new": -2.9411,
+     "own": -1.9567
+    },
+    "97": {
+     "migrants": -2.3056,
+     "that": -7.5955,
+     "than": -2.2127,
+     "about": -7.1814,
+     "how": -5.1736
+    },
+    "98": {
+     "are": -5.085,
+     "structural": -3.7105,
+     "has": -4.3975,
+     "was": -6.7804,
+     "is": -4.8975
+    },
+    "99": {
+     "is": -2.9279,
+     "heat": -4.8498,
+     "especially": -6.8868,
+     "even": -9.7287,
+     "but": -3.9513
+    }
+   },
+   "n_nan_scores": 0
+  }
+ }
+}

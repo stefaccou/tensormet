@@ -1,0 +1,36 @@
+\begin{table*}[t]
+  \centering
+  \small
+  \setlength{\tabcolsep}{4.5pt}
+  \begin{tabular}{lrrrrrrrrrrr}
+    \toprule
+     &  & \multicolumn{9}{c}{Downstream tasks} & \multicolumn{1}{c}{Interp.} \\
+    \cmidrule(lr){3-11} \cmidrule(lr){12-12}
+    Model & Dim. & Sent. & TREC & Attr. & Comp. & Relig. & Sports & NP & WS-353 & Avg. & Intr. \\
+    \midrule
+    \multicolumn{12}{l}{\textit{Dense}} \\
+    GloVe & 100 & 0.754 & 0.772 & 0.588 & 0.685 & 0.831 & 0.822 & 0.745 & 0.496 & 0.712 & 0.440 \\
+    GloVe & 300 & 0.759 & 0.796 & 0.618 & 0.746 & \textbf{0.840} & 0.861 & 0.739 & 0.539 & 0.737 & 0.360 \\
+    word2vec & 300 & \textbf{0.784} & 0.816 & \underline{0.647} & 0.743 & \underline{0.838} & 0.863 & \textbf{0.778} & \textbf{0.677} & \underline{0.768} & 0.367 \\
+    \midrule
+    \multicolumn{12}{l}{\textit{Post-hoc interpretable}} \\
+    POLAR (GloVe) & 500 & 0.758 & 0.786 & 0.603 & 0.662 & 0.796 & 0.798 & 0.732 & 0.578 & 0.714 & 0.562 \\
+    POLAR (word2vec) & 500 & 0.772 & 0.812 & 0.598 & 0.721 & 0.835 & 0.864 & 0.740 & 0.517 & 0.732 & -- \\
+    SPINE (GloVe) & 1\,000 & 0.748 & 0.886 & 0.605 & 0.777 & 0.796 & 0.877 & 0.745 & 0.650 & 0.761 & 0.731 \\
+    SPINE (word2vec) & 1\,000 & 0.769 & \textbf{0.914} & \textbf{0.650} & 0.772 & 0.808 & \underline{0.888} & 0.756 & 0.635 & \textbf{0.774} & 0.795 \\
+    SPOWV (GloVe) & 1\,000 & 0.754 & 0.794 & 0.606 & 0.766 & 0.828 & 0.877 & 0.698 & \underline{0.675} & 0.750 & 0.394 \\
+    SPOWV (word2vec) & 1\,000 & \underline{0.783} & 0.800 & 0.626 & \textbf{0.816} & 0.821 & \textbf{0.893} & 0.713 & 0.604 & 0.757 & 0.467 \\
+    \midrule
+    \multicolumn{12}{l}{\textit{Interpretable by construction}} \\
+    NNSE & 300 & 0.705 & 0.814 & 0.557 & 0.710 & 0.816 & 0.862 & 0.696 & 0.340 & 0.688 & 0.827 \\
+    NNSE & 1\,000 & 0.740 & \textbf{0.914} & 0.588 & \underline{0.781} & 0.826 & 0.864 & 0.721 & 0.592 & 0.753 & \textbf{0.874} \\
+    SINr & 1\,431 & 0.726 & 0.786 & 0.646 & 0.752 & 0.816 & 0.809 & 0.709 & 0.550 & 0.724 & 0.475 \\
+    \midrule
+    \multicolumn{12}{l}{\textit{Ours}} \\
+    Tucker, 3-gram & 300 & 0.728 & \underline{0.908} & 0.545 & 0.595 & 0.780 & 0.653 & 0.768 & 0.517 & 0.687 & \underline{0.873} \\
+    Tucker-TT, 4-gram & 300 & 0.692 & 0.904 & 0.523 & 0.650 & 0.755 & 0.663 & \underline{0.769} & 0.541 & 0.687 & 0.847 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Downstream and interpretability results of our two models and the baselines, all restricted to our 10\,000-word vocabulary. Sent.: sentiment; TREC: question classification; Attr.: discriminative attributes; Comp., Relig., Sports: 20 Newsgroups; NP: noun-phrase bracketing; WS-353: word similarity (Spearman's $\rho$; accuracy elsewhere); Avg.: mean over the downstream tasks; Intr.: word-intrusion accuracy of the LLM judge (chance 0.20). Best score per column in bold, second best underlined.}
+  \label{tab:baselines}
+\end{table*}

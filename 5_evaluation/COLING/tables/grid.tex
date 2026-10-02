@@ -1,0 +1,62 @@
+\begin{table*}[t]
+  \centering
+  \small
+  \begin{tabular}{rlrrrrrrrr}
+    \toprule
+    $r$ & Population & Subs. & $|V|$ & $\rho$ & Seed & Iterations & s / iteration & Hours & Core \\
+    \midrule
+    \multicolumn{10}{l}{\textit{Tucker, 3-gram}} \\
+    100 & scSoftPlus & 2.5\% & 10k & -- & 1 & 500 & 0.38 & 0.1 & 1M \\
+    100 & scSoftPlus & 10\% & 10k & -- & 1 & 500 & 1.2 & 0.2 & 1M \\
+    100 & scSoftPlus & 100\% & 10k & -- & 1 & 500 & 7.8 & 1.1 & 1M \\
+    100 & countingLog & 2.5\% & 10k & -- & 1 & 500 & 0.17 & 0.0 & 1M \\
+    100 & countingLogEps & 2.5\% & 10k & -- & 1 & 500 & 0.38 & 0.1 & 1M \\
+    200 & scSoftPlus & 2.5\% & 10k & -- & 1 & 500 & 1.2 & 0.2 & 8M \\
+    300 & scSoftPlus & 2.5\% & 10k & -- & 1 & 500 & 3.0 & 0.4 & 27M \\
+    \midrule
+    \multicolumn{10}{l}{\textit{Tucker, 4-gram}} \\
+    100 & scSoftPlus & 2.5\% & 10k & -- & 1 & 500 & 75 & 10.5 & 100M \\
+    100 & scSoftPlus & 2.5\% & 10k & -- & 2 & 195$^\dagger$ & 69 & 3.8 & 100M \\
+    100 & scSoftPlus & 2.5\% & 10k & -- & 3 & 185$^\dagger$ & 69 & 3.6 & 100M \\
+    100 & scSoftPlus & 2.5\% & 20k & -- & 1 & 155$^\dagger$ & 86 & 3.7 & 100M \\
+    100 & countingLog & 2.5\% & 10k & -- & 1 & 500 & 12 & 1.7 & 100M \\
+    100 & countingLogEps & 2.5\% & 10k & -- & 1 & 200$^\dagger$ & 69 & 3.8 & 100M \\
+    \midrule
+    \multicolumn{10}{l}{\textit{Tucker-TT, 4-gram}} \\
+    100 & scSoftPlus & 2.5\% & 10k & 50 & 1 & 500 & 4.3 & 0.6 & 0.51M \\
+    100 & scSoftPlus & 2.5\% & 10k & 100 & 1 & 500 & 11 & 1.5 & 2.02M \\
+    100 & scSoftPlus & 2.5\% & 10k & 100 & 2 & 500 & 11 & 1.5 & 2.02M \\
+    100 & scSoftPlus & 2.5\% & 10k & 100 & 3 & 500 & 11 & 1.5 & 2.02M \\
+    100 & scSoftPlus & 2.5\% & 10k & 200 & 1 & 500 & 22 & 3.0 & 8.04M \\
+    100 & scSoftPlus & 2.5\% & 10k & 300 & 1 & 400$^\dagger$ & 33 & 3.7 & 18.06M \\
+    100 & scSoftPlus & 2.5\% & 20k & 100 & 1 & 500 & 14 & 1.9 & 2.02M \\
+    100 & scSoftPlus & 2.5\% & 200k & 100 & 1 & 500 & 17 & 2.4 & 2.02M \\
+    100 & scSoftPlus & 10\% & 10k & 100 & 1 & 300$^\dagger$ & 43 & 3.6 & 2.02M \\
+    100 & countingLog & 2.5\% & 10k & 100 & 1 & 500 & 1.9 & 0.3 & 2.02M \\
+    100 & countingLogEps & 2.5\% & 10k & 100 & 1 & 500 & 11 & 1.6 & 2.02M \\
+    200 & scSoftPlus & 2.5\% & 10k & 100 & 1 & 500 & 18 & 2.5 & 4.04M \\
+    300 & scSoftPlus & 2.5\% & 10k & 100 & 1 & 500 & 26 & 3.6 & 6.06M \\
+    1\,000 & scSoftPlus & 2.5\% & 10k & 100 & 1 & 305$^\dagger$ & 85 & 7.2 & 20.2M \\
+    \midrule
+    \multicolumn{10}{l}{\textit{Tucker-TT, 5-gram}} \\
+    100 & scSoftPlus & 2.5\% & 10k & 100 & 1 & 500 & 22 & 3.0 & 3.02M \\
+    100 & scSoftPlus & 2.5\% & 20k & 100 & 1 & 500 & 27 & 3.7 & 3.02M \\
+    100 & scSoftPlus & 10\% & 10k & 100 & 1 & 245$^\dagger$ & 86 & 5.9 & 3.02M \\
+    100 & countingLog & 2.5\% & 10k & 100 & 1 & 500 & 2.3 & 0.3 & 3.02M \\
+    100 & countingLogEps & 2.5\% & 10k & 100 & 1 & 500 & 22 & 3.0 & 3.02M \\
+    200 & scSoftPlus & 2.5\% & 10k & 100 & 1 & 500 & 35 & 4.9 & 6.04M \\
+    300 & scSoftPlus & 2.5\% & 10k & 100 & 1 & 400$^\dagger$ & 51 & 5.6 & 9.06M \\
+    \midrule
+    \multicolumn{10}{l}{\textit{Tucker-TT, 6-gram}} \\
+    100 & scSoftPlus & 2.5\% & 10k & 100 & 1 & 500 & 33 & 4.6 & 4.02M \\
+    100 & scSoftPlus & 2.5\% & 20k & 100 & 1 & 500 & 40 & 5.6 & 4.02M \\
+    100 & scSoftPlus & 10\% & 10k & 100 & 1 & 100$^\dagger$ & 130 & 3.6 & 4.02M \\
+    100 & countingLog & 2.5\% & 10k & 100 & 1 & 500 & 2.3 & 0.3 & 4.02M \\
+    100 & countingLogEps & 2.5\% & 10k & 100 & 1 & 415$^\dagger$ & 33 & 3.8 & 4.02M \\
+    200 & scSoftPlus & 2.5\% & 10k & 100 & 1 & 275$^\dagger$ & 49 & 3.7 & 8.04M \\
+    300 & scSoftPlus & 2.5\% & 10k & 100 & 1 & 205$^\dagger$ & 67 & 3.8 & 12.06M \\
+    \bottomrule
+  \end{tabular}
+  \caption{The runs of our grid and their cost. $r$: rank; Subs.: subsampling fraction; $|V|$: vocabulary size; $\rho$: TT bond; s / iteration: median time of one update; Hours: that time over all iterations, without the in-loop evaluation; Core: number of core parameters. $^\dagger$: stopped at its walltime before 500 iterations and left out of the downstream evaluation.}
+  \label{tab:grid}
+\end{table*}

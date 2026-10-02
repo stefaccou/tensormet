@@ -1,0 +1,37 @@
+\begin{table*}[t]
+  \centering
+  \small
+  \begin{tabular}{llrrrrrr}
+    \toprule
+     &  & \multicolumn{2}{c}{Correctness} & \multicolumn{2}{c}{Picked word} & \multicolumn{2}{c}{Accuracy} \\
+    \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
+    Judge & Prompt & $\phi$ & $\phi_j / \phi_h$ & Agreement & Ratio & Tucker & Tucker-TT \\
+    \midrule
+    Human annotators (3) &  & 0.422 & 1.000 & 0.876 & 1.000 & 0.86 & 0.89 \\
+    \midrule
+    Qwen3.5-9B & default & \textbf{0.332} & \textbf{0.787} & \textbf{0.831} & \textbf{0.948} & \textbf{0.82} & \textbf{0.88} \\
+    Qwen3.5-9B & few-shot & 0.330 & 0.783 & 0.790 & 0.902 & 0.78 & 0.81 \\
+    Qwen3.5-4B & default & 0.309 & 0.733 & 0.799 & 0.912 & \textbf{0.82} & 0.84 \\
+    Llama-3.1-8B-Instruct & few-shot & 0.274 & 0.650 & 0.699 & 0.798 & 0.69 & 0.71 \\
+    Qwen3.5-4B & few-shot & 0.258 & 0.613 & 0.716 & 0.817 & 0.74 & 0.73 \\
+    Llama-3.1-8B-Instruct & default & 0.244 & 0.578 & 0.675 & 0.771 & 0.68 & 0.69 \\
+    OLMo-2-1124-7B-Instruct & few-shot & 0.215 & 0.509 & 0.548 & 0.626 & 0.50 & 0.53 \\
+    Qwen3.5-2B & default & 0.214 & 0.508 & 0.547 & 0.624 & 0.58 & 0.51 \\
+    Phi-4-mini-instruct & default & 0.199 & 0.473 & 0.599 & 0.684 & 0.56 & 0.62 \\
+    Phi-4-mini-instruct & few-shot & 0.149 & 0.353 & 0.413 & 0.471 & 0.40 & 0.41 \\
+    granite-3.3-8b-instruct & default & 0.143 & 0.340 & 0.474 & 0.541 & 0.49 & 0.43 \\
+    Qwen3.5-2B & few-shot & 0.136 & 0.324 & 0.519 & 0.593 & 0.59 & 0.50 \\
+    granite-3.3-8b-instruct & few-shot & 0.135 & 0.321 & 0.480 & 0.549 & 0.47 & 0.47 \\
+    OLMo-2-1124-7B-Instruct & default & 0.111 & 0.263 & 0.467 & 0.533 & 0.51 & 0.43 \\
+    granite-3.3-8b-instruct & stammbach & 0.103 & 0.244 & 0.509 & 0.581 & 0.54 & 0.52 \\
+    Qwen3.5-9B & stammbach & 0.084 & 0.199 & 0.734 & 0.838 & 0.80 & 0.79 \\
+    Phi-4-mini-instruct & stammbach & 0.076 & 0.181 & 0.404 & 0.462 & 0.43 & 0.42 \\
+    Llama-3.1-8B-Instruct & stammbach & 0.052 & 0.124 & 0.604 & 0.689 & 0.71 & 0.59 \\
+    OLMo-2-1124-7B-Instruct & stammbach & 0.038 & 0.091 & 0.441 & 0.504 & 0.48 & 0.47 \\
+    Qwen3.5-4B & stammbach & 0.016 & 0.037 & 0.626 & 0.714 & 0.74 & 0.64 \\
+    Qwen3.5-2B & stammbach & -0.002 & -0.005 & 0.610 & 0.697 & 0.71 & 0.63 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Judge selection on the trial sets annotated by three humans (the two default 4-gram models, 100 dimensions each). $\phi$: mean correlation of the per-trial correctness with each human annotator (for the humans: with the other annotators); Agreement: mean share of trials with the same word picked as a human; $\phi_j / \phi_h$ and Ratio: relative to the human--human value. Accuracy: share of intruders found per trial set. Sorted by $\phi_j / \phi_h$; best judge per column in bold.}
+  \label{tab:judges}
+\end{table*}

@@ -1,0 +1,75 @@
+{
+  "stamp": "2026-09-23T17:31:23",
+  "status": "failed",
+  "argv": [
+    "polar_sweep.py",
+    "--dry-run"
+  ],
+  "host": "ampere.ccl.kuleuven.be",
+  "pid": 1205220,
+  "variants": [
+    "raw",
+    "std"
+  ],
+  "ngrams": [
+    3,
+    4,
+    5,
+    6
+  ],
+  "only": null,
+  "full_grid": false,
+  "base": {
+    "ngram": 4,
+    "rank": 100,
+    "method": "scSoftPlus",
+    "ss_frac": 0.025,
+    "decomposition": "tt",
+    "name": "h100",
+    "iters": 500
+  },
+  "sweep": {
+    "rank": [
+      100,
+      200,
+      300
+    ],
+    "method": [
+      "scSoftPlus",
+      "countingLog",
+      "countingLogEps"
+    ],
+    "ss_frac": [
+      0.025,
+      0.1,
+      1
+    ],
+    "decomposition": [
+      "tt",
+      "tucker"
+    ]
+  },
+  "fixed": {
+    "divergence": "kl",
+    "dims": 10000,
+    "shared_factors": "all",
+    "solver": "mu"
+  },
+  "glove_path": "/home/local/stefa/data/corpora/wiki_giga_2024_100_MFT20_vectors_seed_2024_alpha_0.75_eta_0.05.050_combined.txt",
+  "n_jobs": 100,
+  "random_state": null,
+  "svc_cache_mb": 1000,
+  "resume": true,
+  "resume_since": null,
+  "results_path": "/home/pricie/stefa/pc/5_evaluation/polar/results/tensormet_eval.jsonl",
+  "fit_times_log": "/home/pricie/stefa/pc/5_evaluation/polar/results/fit_times_2026-09-23T173123.log",
+  "versions": {
+    "python": "3.12.12",
+    "numpy": "2.3.5",
+    "scipy": "1.16.3",
+    "sklearn": "1.7.2",
+    "gensim": "4.4.0",
+    "joblib": "1.5.2"
+  },
+  "error": "KeyError('model')"
+}

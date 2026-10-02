@@ -1,0 +1,82 @@
+{
+  "stamp": "2026-09-24T18:41:36",
+  "status": "failed",
+  "argv": [
+    "judge_sweep.py"
+  ],
+  "host": "ampere.ccl.kuleuven.be",
+  "pid": 1286680,
+  "judge": "Qwen/Qwen3.5-9B",
+  "prompt": "default",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Which word does not belong with the others? {listing}. Answer with only the word."
+    }
+  ],
+  "k": 4,
+  "seeds": [
+    1
+  ],
+  "series": [
+    "latest",
+    "best"
+  ],
+  "groups": [
+    "table",
+    "baselines",
+    "methods",
+    "human"
+  ],
+  "only": null,
+  "ngrams": null,
+  "gpus": [
+    "0",
+    "1",
+    "2",
+    "3"
+  ],
+  "loaders": 4,
+  "chunk": 256,
+  "part_size": 256,
+  "rejudge": false,
+  "table_order": [
+    "tucker_3g_r100_scSoftPlus_ss0.025",
+    "tucker_3g_r100_scSoftPlus_ss0.1",
+    "tucker_3g_r100_scSoftPlus_ss1",
+    "tucker_3g_r100_countingLog_ss0.025",
+    "tucker_3g_r100_countingLogEps_ss0.025",
+    "tucker_3g_r200_scSoftPlus_ss0.025",
+    "tucker_3g_r300_scSoftPlus_ss0.025",
+    "tucker_3g_r100_scSoftPlus_ss0.025_d20000",
+    "tucker_4g_r100_scSoftPlus_ss0.025",
+    "tucker_4g_r100_countingLog_ss0.025",
+    "tucker_4g_r100_countingLogEps_ss0.025",
+    "tucker_4g_r100_countingLogPlusOne_ss0.025",
+    "tucker_4g_r100_scSoftPlus_ss0.025_d20000",
+    "tt_4g_r100_scSoftPlus_ss0.025",
+    "tt_4g_r100_scSoftPlus_ss0.1",
+    "tt_4g_r100_scSoftPlus_ss1",
+    "tt_4g_r100_countingLog_ss0.025",
+    "tt_4g_r100_countingLogEps_ss0.025",
+    "tt_4g_r200_scSoftPlus_ss0.025",
+    "tt_4g_r300_scSoftPlus_ss0.025",
+    "tt_4g_r100_scSoftPlus_ss0.025_d20000",
+    "tt_5g_r100_scSoftPlus_ss0.025",
+    "tt_5g_r100_scSoftPlus_ss0.1",
+    "tt_5g_r100_countingLog_ss0.025",
+    "tt_5g_r100_countingLogEps_ss0.025",
+    "tt_5g_r200_scSoftPlus_ss0.025",
+    "tt_5g_r300_scSoftPlus_ss0.025",
+    "tt_5g_r100_scSoftPlus_ss0.025_d20000",
+    "tt_6g_r100_scSoftPlus_ss0.025",
+    "tt_6g_r100_scSoftPlus_ss0.1",
+    "tt_6g_r100_countingLog_ss0.025",
+    "tt_6g_r100_countingLogEps_ss0.025",
+    "tt_6g_r200_scSoftPlus_ss0.025",
+    "tt_6g_r300_scSoftPlus_ss0.025",
+    "tt_6g_r100_scSoftPlus_ss0.025_d20000"
+  ],
+  "records": "/home/pricie/stefa/pc/5_evaluation/COLING/judge_results/records.jsonl",
+  "error": "RuntimeError('GPU 2 failed:\\nTraceback (most recent call last):\\n  File \"/home/pricie/stefa/pc/5_evaluation/COLING/judge_sweep.py\", line 200, in _gpu_worker\\n    judge.ensure_loaded()\\n  File \"/home/pricie/stefa/pc/src/tensormet/judge.py\", line 167, in ensure_loaded\\n    self._ensure_loaded()\\n  File \"/home/pricie/stefa/pc/src/tensormet/judge.py\", line 142, in _ensure_loaded\\n    self._load_on(target)\\n  File \"/home/pricie/stefa/pc/src/tensormet/judge.py\", line 107, in _load_on\\n    self.model = AutoModelForCausalLM.from_pretrained(\\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \"/home/pricie/stefa/.conda/envs/ccl/lib/python3.12/site-packages/transformers/models/auto/auto_factory.py\", line 402, in from_pretrained\\n    return model_class.from_pretrained(\\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \"/home/pricie/stefa/.conda/envs/ccl/lib/python3.12/site-packages/transformers/modeling_utils.py\", line 4267, in from_pretrained\\n    checkpoint_files, sharded_metadata = _get_resolved_checkpoint_files(\\n                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \"/home/pricie/stefa/.conda/envs/ccl/lib/python3.12/site-packages/transformers/modeling_utils.py\", line 801, in _get_resolved_checkpoint_files\\n    checkpoint_files, sharded_metadata = get_checkpoint_shard_files(\\n                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^\\n  File \"/home/pricie/stefa/.conda/envs/ccl/lib/python3.12/site-packages/transformers/utils/hub.py\", line 894, in get_checkpoint_shard_files\\n    cached_filenames = cached_files(\\n                       ^^^^^^^^^^^^^\\n  File \"/home/pricie/stefa/.conda/envs/ccl/lib/python3.12/site-packages/transformers/utils/hub.py\", line 543, in cached_files\\n    raise OSError(\\nOSError: Qwen/Qwen3.5-9B does not appear to have a file named model.safetensors-00003-of-00004.safetensors. Checkout \\'https://huggingface.co/Qwen/Qwen3.5-9B/tree/main\\' for available files.\\n')"
+}

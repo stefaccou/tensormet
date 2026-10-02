@@ -1,0 +1,73 @@
+{
+  "stamp": "2026-09-24T16:31:48",
+  "status": "failed",
+  "argv": [
+    "method_baselines.py"
+  ],
+  "host": "ampere.ccl.kuleuven.be",
+  "pid": 1268049,
+  "variants": [
+    "raw"
+  ],
+  "only": null,
+  "methods": "POLAR, SPINE, SPOWV, NNSE, SINr; vocabs: ours = the words of TuckerDecomposition.load_best(), own = the whole embedding (*_full)",
+  "vocabs": [
+    "ours",
+    "own"
+  ],
+  "polar_sources": [
+    "glove",
+    "w2v"
+  ],
+  "polar_dims": [
+    500
+  ],
+  "polar_seed": 42,
+  "spine_sources": [
+    "glove",
+    "w2v"
+  ],
+  "released": [
+    "spine",
+    "spowv",
+    "nnse",
+    "sinr"
+  ],
+  "spine_paths": {
+    "spine_glove": "/home/local/stefa/data/corpora/spine/SPINE_glove.txt",
+    "spine_w2v": "/home/local/stefa/data/corpora/spine/SPINE_word2vec.txt",
+    "spowv_glove": "/home/local/stefa/data/corpora/spine/SPOWV_glove.txt",
+    "spowv_w2v": "/home/local/stefa/data/corpora/spine/SPOWV_word2vec.txt"
+  },
+  "nnse_widths": [
+    300,
+    1000
+  ],
+  "nnse_paths": {
+    "nnse_300": "/home/local/stefa/data/corpora/nnse/depDocNNSE300.tab.zip",
+    "nnse_1000": "/home/local/stefa/data/corpora/nnse/depDocNNSE1000.tab.zip"
+  },
+  "sinr_path": "/home/pricie/stefa/pc/5_evaluation/third_party/sinr/notebooks/sinrvec_bnc.pk",
+  "antonym_files": [
+    "LenciBenotto.val",
+    "LenciBenotto.test",
+    "EVALution.val",
+    "EVALution.test"
+  ],
+  "n_jobs": 100,
+  "random_state": null,
+  "svc_cache_mb": 1000,
+  "resume": true,
+  "resume_since": null,
+  "results_path": "/home/pricie/stefa/pc/5_evaluation/polar/results/tensormet_eval.jsonl",
+  "fit_times_log": "/home/pricie/stefa/pc/5_evaluation/polar/results/fit_times_methods_2026-09-24T163148.log",
+  "versions": {
+    "python": "3.12.12",
+    "numpy": "2.3.5",
+    "scipy": "1.16.3",
+    "sklearn": "1.7.2",
+    "gensim": "4.4.0",
+    "joblib": "1.5.2"
+  },
+  "error": "ValueError(\"could not convert string to float: 'd1'\")"
+}

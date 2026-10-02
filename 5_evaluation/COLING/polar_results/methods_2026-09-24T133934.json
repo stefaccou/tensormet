@@ -1,0 +1,222 @@
+{
+  "stamp": "2026-09-24T13:39:34",
+  "status": "dry-run",
+  "argv": [
+    "method_baselines.py",
+    "--dry-run"
+  ],
+  "host": "ampere.ccl.kuleuven.be",
+  "pid": 1246552,
+  "variants": [
+    "raw",
+    "std"
+  ],
+  "only": null,
+  "methods": "POLAR and SPINE; vocabs: ours = the words of TuckerDecomposition.load_best(), own = the whole embedding (*_full)",
+  "vocabs": [
+    "ours",
+    "own"
+  ],
+  "polar_sources": [
+    "glove",
+    "w2v"
+  ],
+  "polar_dims": [
+    500
+  ],
+  "polar_seed": 42,
+  "spine_sources": [
+    "glove",
+    "w2v"
+  ],
+  "spine_paths": {
+    "glove": "/home/local/stefa/data/corpora/spine/SPINE_glove.txt",
+    "w2v": "/home/local/stefa/data/corpora/spine/SPINE_word2vec.txt"
+  },
+  "antonym_files": [
+    "LenciBenotto.val",
+    "LenciBenotto.test",
+    "EVALution.val",
+    "EVALution.test"
+  ],
+  "n_jobs": 100,
+  "random_state": null,
+  "svc_cache_mb": 1000,
+  "resume": true,
+  "resume_since": null,
+  "results_path": "/home/pricie/stefa/pc/5_evaluation/polar/results/tensormet_eval.jsonl",
+  "fit_times_log": "/home/pricie/stefa/pc/5_evaluation/polar/results/fit_times_methods_2026-09-24T133934.log",
+  "versions": {
+    "python": "3.12.12",
+    "numpy": "2.3.5",
+    "scipy": "1.16.3",
+    "sklearn": "1.7.2",
+    "gensim": "4.4.0",
+    "joblib": "1.5.2"
+  },
+  "backfilled": [],
+  "models": {
+    "polar_glove_k500": {
+      "path": "/home/local/stefa/data/corpora/wiki_giga_2024_100_MFT20_vectors_seed_2024_alpha_0.75_eta_0.05.050_combined.txt#polar_k500_seed42",
+      "config": {
+        "baseline": "polar_glove_k500",
+        "method": "POLAR",
+        "source": "/home/local/stefa/data/corpora/wiki_giga_2024_100_MFT20_vectors_seed_2024_alpha_0.75_eta_0.05.050_combined.txt",
+        "vocab": "ours",
+        "like": "/home/local/stefa/data/tensors/4-gram-raw-bos-eos-fineweb-en_1B/decomposition/h100_kl_scSoftPlus_TT100b4D_10000d_shared0123_100r_0p025ss_1000i.pt",
+        "dims_requested": 500,
+        "dims": 500,
+        "antonym_pairs": 1467,
+        "order": "random",
+        "seed": 42
+      },
+      "n_words": 9987,
+      "dim": 500,
+      "checkpoint": null
+    },
+    "polar_glove_k500_full": {
+      "path": "/home/local/stefa/data/corpora/wiki_giga_2024_100_MFT20_vectors_seed_2024_alpha_0.75_eta_0.05.050_combined.txt#polar_k500_seed42",
+      "config": {
+        "baseline": "polar_glove_k500_full",
+        "method": "POLAR",
+        "source": "/home/local/stefa/data/corpora/wiki_giga_2024_100_MFT20_vectors_seed_2024_alpha_0.75_eta_0.05.050_combined.txt",
+        "vocab": "own",
+        "dims_requested": 500,
+        "dims": 500,
+        "antonym_pairs": 1467,
+        "order": "random",
+        "seed": 42
+      },
+      "n_words": 1291147,
+      "dim": 500,
+      "checkpoint": null
+    },
+    "polar_w2v_k500": {
+      "path": "word2vec-google-news-300#polar_k500_seed42",
+      "config": {
+        "baseline": "polar_w2v_k500",
+        "method": "POLAR",
+        "source": "word2vec-google-news-300",
+        "vocab": "ours",
+        "like": "/home/local/stefa/data/tensors/4-gram-raw-bos-eos-fineweb-en_1B/decomposition/h100_kl_scSoftPlus_TT100b4D_10000d_shared0123_100r_0p025ss_1000i.pt",
+        "dims_requested": 500,
+        "dims": 500,
+        "antonym_pairs": 1465,
+        "order": "random",
+        "seed": 42
+      },
+      "n_words": 9789,
+      "dim": 500,
+      "checkpoint": null
+    },
+    "polar_w2v_k500_full": {
+      "path": "word2vec-google-news-300#polar_k500_seed42",
+      "config": {
+        "baseline": "polar_w2v_k500_full",
+        "method": "POLAR",
+        "source": "word2vec-google-news-300",
+        "vocab": "own",
+        "dims_requested": 500,
+        "dims": 500,
+        "antonym_pairs": 1465,
+        "order": "random",
+        "seed": 42
+      },
+      "n_words": 3000000,
+      "dim": 500,
+      "checkpoint": null
+    }
+  },
+  "missing": {
+    "spine_glove": "/home/local/stefa/data/corpora/spine/SPINE_glove.txt not found: download the released SPINE vectors (third_party/spine/README.md)",
+    "spine_glove_full": "/home/local/stefa/data/corpora/spine/SPINE_glove.txt not found: download the released SPINE vectors (third_party/spine/README.md)",
+    "spine_w2v": "/home/local/stefa/data/corpora/spine/SPINE_word2vec.txt not found: download the released SPINE vectors (third_party/spine/README.md)",
+    "spine_w2v_full": "/home/local/stefa/data/corpora/spine/SPINE_word2vec.txt not found: download the released SPINE vectors (third_party/spine/README.md)"
+  },
+  "skipped": {},
+  "runs": [
+    [
+      "polar_glove_k500",
+      "raw"
+    ],
+    [
+      "polar_glove_k500",
+      "std"
+    ],
+    [
+      "polar_glove_k500_full",
+      "raw"
+    ],
+    [
+      "polar_glove_k500_full",
+      "std"
+    ],
+    [
+      "polar_w2v_k500",
+      "raw"
+    ],
+    [
+      "polar_w2v_k500",
+      "std"
+    ],
+    [
+      "polar_w2v_k500_full",
+      "raw"
+    ],
+    [
+      "polar_w2v_k500_full",
+      "std"
+    ]
+  ],
+  "todo": [
+    [
+      "polar_glove_k500",
+      "std"
+    ],
+    [
+      "polar_glove_k500_full",
+      "raw"
+    ],
+    [
+      "polar_glove_k500_full",
+      "std"
+    ],
+    [
+      "polar_w2v_k500",
+      "std"
+    ],
+    [
+      "polar_w2v_k500_full",
+      "raw"
+    ],
+    [
+      "polar_w2v_k500_full",
+      "std"
+    ]
+  ],
+  "total_jobs": 1242,
+  "variant_tasks": {
+    "raw": [
+      "word_analogy",
+      "sentiment",
+      "TREC",
+      "news_computer",
+      "news_religion",
+      "news_sports",
+      "np_bracketing"
+    ],
+    "std": [
+      "word_analogy",
+      "sentiment",
+      "TREC",
+      "news_computer",
+      "news_religion",
+      "news_sports",
+      "np_bracketing"
+    ]
+  },
+  "jobs_per_run": {
+    "raw": 207,
+    "std": 207
+  }
+}

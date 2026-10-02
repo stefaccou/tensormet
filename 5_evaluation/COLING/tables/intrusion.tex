@@ -1,0 +1,64 @@
+\begin{table}[t]
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{lrrrr}
+    \toprule
+    Model & Dim. & Accuracy & 95\% CI & Diversity \\
+    \midrule
+    \multicolumn{5}{l}{\textit{Dense}} \\
+    GloVe & 100 & 0.440 & 0.347--0.538 & 0.925 \\
+    GloVe & 300 & 0.360 & 0.308--0.416 & 0.829 \\
+    word2vec & 300 & 0.367 & 0.314--0.423 & 0.736 \\
+    \midrule
+    \multicolumn{5}{l}{\textit{Post-hoc interpretable}} \\
+    POLAR (GloVe) & 500 & 0.562 & 0.518--0.605 & 0.917 \\
+    SPINE (GloVe) & 1\,000 & 0.731 & 0.703--0.758 & 0.689 \\
+    SPINE (word2vec) & 1\,000 & 0.795 & 0.769--0.819 & 0.742 \\
+    SPOWV (GloVe) & 1\,000 & 0.394 & 0.364--0.425 & 0.680 \\
+    SPOWV (word2vec) & 1\,000 & 0.467 & 0.436--0.498 & 0.681 \\
+    \midrule
+    \multicolumn{5}{l}{\textit{Interpretable by construction}} \\
+    NNSE & 300 & 0.827 & 0.780--0.865 & 0.978 \\
+    NNSE & 1\,000 & 0.874 & 0.852--0.893 & 0.924 \\
+    SINr & 1\,431 & 0.475 & 0.449--0.501 & 0.568 \\
+    \midrule
+    \multicolumn{5}{l}{\textit{Ours: Tucker, 3-gram}} \\
+    default settings & 100 & 0.900 & 0.826--0.945 & 0.797 \\
+    10\% subsampling & 100 & 0.880 & 0.802--0.930 & 0.805 \\
+    100\% subsampling & 100 & 0.880 & 0.802--0.930 & 0.785 \\
+    countingLog & 100 & 0.910 & 0.838--0.952 & 0.665 \\
+    countingLogEps & 100 & 0.850 & 0.767--0.907 & 0.670 \\
+    $r{=}200$ & 200 & 0.885 & 0.833--0.922 & 0.728 \\
+    $r{=}300$ & 300 & 0.873 & 0.831--0.906 & 0.701 \\
+    \midrule
+    \multicolumn{5}{l}{\textit{Ours: Tucker, 4-gram}} \\
+    default settings & 100 & 0.810 & 0.722--0.875 & 0.772 \\
+    countingLog & 100 & \textbf{0.930} & 0.863--0.966 & 0.745 \\
+    \midrule
+    \multicolumn{5}{l}{\textit{Ours: Tucker-TT, 4-gram}} \\
+    $\rho{=}50$ & 100 & 0.840 & 0.756--0.899 & 0.703 \\
+    default settings & 100 & 0.830 & 0.745--0.891 & 0.772 \\
+    $\rho{=}200$ & 100 & 0.850 & 0.767--0.907 & 0.755 \\
+    20k words & 100 & 0.860 & 0.779--0.915 & 0.772 \\
+    countingLog & 100 & 0.910 & 0.838--0.952 & 0.670 \\
+    countingLogEps & 100 & 0.890 & 0.814--0.937 & 0.627 \\
+    $r{=}200$ & 200 & 0.890 & 0.839--0.926 & 0.661 \\
+    $r{=}300$ & 300 & 0.847 & 0.802--0.883 & 0.567 \\
+    \midrule
+    \multicolumn{5}{l}{\textit{Ours: Tucker-TT, 5-gram}} \\
+    default settings & 100 & 0.920 & 0.850--0.959 & 0.725 \\
+    20k words & 100 & 0.870 & 0.790--0.922 & 0.715 \\
+    countingLog & 100 & 0.870 & 0.790--0.922 & 0.703 \\
+    countingLogEps & 100 & 0.840 & 0.756--0.899 & 0.713 \\
+    $r{=}200$ & 200 & 0.855 & 0.800--0.897 & 0.624 \\
+    \midrule
+    \multicolumn{5}{l}{\textit{Ours: Tucker-TT, 6-gram}} \\
+    default settings & 100 & 0.890 & 0.814--0.937 & 0.715 \\
+    20k words & 100 & 0.920 & 0.850--0.959 & 0.735 \\
+    countingLog & 100 & 0.890 & 0.814--0.937 & 0.705 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Word intrusion per model: accuracy of the LLM judge (chance 0.20) with its 95\% Wilson confidence interval over the trials (one per dimension), and the diversity of the top words (distinct top words over dimensions $\times$ 4). Our runs are named by what they change from the default settings.}
+  \label{tab:intrusion}
+\end{table}

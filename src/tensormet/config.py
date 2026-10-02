@@ -682,6 +682,11 @@ class VectorExperimentConfig:
     # left-pad each sentence with n-1 <s> tokens and right-pad with one </s>.
     pad_sentences: bool = True
 
+    # n-gram creation: drop spaCy stop words from each sentence before windowing.
+    content_only: bool = False
+    # n-gram creation: write to '{n}-gram-{ngram_label}' instead of the derived dir name.
+    ngram_label: Optional[str] = None
+
     # logging
     log_every_s: float = 30.0
 
@@ -724,7 +729,11 @@ class VectorRunConfig:
         When ``padded`` is set, a ``bos-eos`` tag is inserted so sentence-boundary
         padded vectors live in their own directory and never clobber unpadded ones.
         The tag is a path label only; the actual tokens written are ``<s>``/``</s>``.
+
+        ``exp.ngram_label`` replaces the whole derived tag: ``{n}-gram-{ngram_label}``.
         """
+        if self.exp.ngram_label:
+            return self.exp.output_dir / f"{n}-gram-{self.exp.ngram_label}"
         label = self._path_label()
         prefix = f"{n}-gram-raw" if raw else f"{n}-gram"
         if padded:

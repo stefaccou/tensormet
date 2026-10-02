@@ -1,0 +1,135 @@
+{
+  "stamp": "2026-09-24T13:31:09",
+  "status": "interrupted",
+  "argv": [
+    "polar_sweep.py",
+    "--dry-run"
+  ],
+  "host": "ampere.ccl.kuleuven.be",
+  "pid": 1243993,
+  "variants": [
+    "raw",
+    "std"
+  ],
+  "only": null,
+  "series": "latest",
+  "checkpoint": "latest",
+  "ngrams": null,
+  "base": {
+    "rank": 100,
+    "method": "scSoftPlus",
+    "ss_frac": 0.025,
+    "dims": 10000,
+    "name": "h100",
+    "iters": 500
+  },
+  "table": {
+    "tucker_3g": {
+      "ss_frac": [
+        0.1,
+        1
+      ],
+      "method": [
+        "countingLog",
+        "countingLogEps"
+      ],
+      "rank": [
+        200,
+        300
+      ],
+      "dims": [
+        20000
+      ]
+    },
+    "tucker_4g": {
+      "method": [
+        "countingLog",
+        "countingLogEps",
+        "countingLogPlusOne"
+      ],
+      "dims": [
+        20000
+      ]
+    },
+    "tt_4g": {
+      "ss_frac": [
+        0.1,
+        1
+      ],
+      "method": [
+        "countingLog",
+        "countingLogEps"
+      ],
+      "rank": [
+        200,
+        300
+      ],
+      "dims": [
+        20000
+      ]
+    },
+    "tt_5g": {
+      "ss_frac": [
+        0.1
+      ],
+      "method": [
+        "countingLog",
+        "countingLogEps"
+      ],
+      "rank": [
+        200,
+        300
+      ],
+      "dims": [
+        20000
+      ]
+    },
+    "tt_6g": {
+      "ss_frac": [
+        0.1
+      ],
+      "method": [
+        "countingLog",
+        "countingLogEps"
+      ],
+      "rank": [
+        200,
+        300
+      ],
+      "dims": [
+        20000
+      ]
+    }
+  },
+  "fixed": {
+    "divergence": "kl",
+    "shared_factors": "all",
+    "solver": "mu"
+  },
+  "glove_widths": [
+    100,
+    300
+  ],
+  "w2v": true,
+  "baseline_vocabs": [
+    "ours",
+    "own"
+  ],
+  "n_jobs": 100,
+  "random_state": null,
+  "svc_cache_mb": 1000,
+  "resume": true,
+  "resume_since": null,
+  "results_path": "/home/pricie/stefa/pc/5_evaluation/polar/results/tensormet_eval.jsonl",
+  "fit_times_log": "/home/pricie/stefa/pc/5_evaluation/polar/results/fit_times_2026-09-24T133109.log",
+  "versions": {
+    "python": "3.12.12",
+    "numpy": "2.3.5",
+    "scipy": "1.16.3",
+    "sklearn": "1.7.2",
+    "gensim": "4.4.0",
+    "joblib": "1.5.2"
+  },
+  "runs_finished": 0,
+  "hours": 0.001
+}

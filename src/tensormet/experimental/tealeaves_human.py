@@ -496,6 +496,31 @@ def run_terminal(session: TeaLeavesSession, feedback: bool = False) -> TeaLeaves
 
 
 # --- Comparison with the model judge ----------------------------------------
+def judge_session(judge, session: TeaLeavesSession) -> dict:
+    """``judge.score(..., return_details=True)`` on the trials stored in `session`.
+
+    Scores exactly what the annotator was shown, not trials rebuilt from the
+    decomposition, so it stays valid when the model has changed since annotation
+    (a rebuild would draw different intruders). Same output shape as ``score``.
+    """
+    judge.ensure_loaded()  # _evaluate_tasks, unlike score(), does not load the model
+    tasks = [dict(t) for t in session.tasks]  # _evaluate_tasks writes into them
+    correct = judge._evaluate_tasks(tasks, answer_key="random_word")
+
+    raw = correct / len(tasks)
+    out = {"dim_consistency": raw, "dim_consistency_raw": raw}
+    if judge.diversity_aware:
+        all_dim_words = {w for t in tasks for w in t["words"]}
+        mult = len(all_dim_words) / (len(tasks) * session.meta["num_dim_words"])
+        out["dim_consistency"] = raw * mult
+        out["dim_consistency_diversity"] = mult
+    out["details"] = [{"dim": t["dim"], "words": t["words"], "outlier": t["random_word"],
+                       "predicted": t["predicted"], "correct": t["correct"],
+                       "scores": {k: round(v, 3) for k, v in t["scores"].items()}}
+                      for t in tasks]
+    return out
+
+
 def compare_with_judge(session: TeaLeavesSession, judge_out: dict) -> dict:
     """Line up a session with ``DimConsistencyJudge.score(..., return_details=True)``.
 

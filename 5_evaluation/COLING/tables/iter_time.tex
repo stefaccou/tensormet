@@ -1,0 +1,14 @@
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lcccc}
+    \toprule
+     & $n=3$ & $n=4$ & $n=5$ & $n=6$ \\
+    \midrule
+    Tucker & 0.38 & 75 & -- & -- \\
+    Tucker-TT & -- & 11 & 22 & 33 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Seconds per iteration at the default settings ($r=100$). Tucker is infeasible for $n\geq5$ (core of 40\,GB and 4\,TB at $r=100$); the TT hybrid does not reduce parameters for $n\leq3$. Table~\ref{tab:grid} lists every run.}
+  \label{tab:iter-time}
+\end{table}

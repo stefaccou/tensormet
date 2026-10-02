@@ -1,0 +1,31 @@
+\begin{table*}[t]
+  \centering
+  \small
+  \begin{tabular}{lrrrrrrrr}
+    \toprule
+     & \multicolumn{4}{c}{Tucker, 3-gram, $r{=}300$} & \multicolumn{4}{c}{Tucker-TT, 4-gram, $r{=}300$} \\
+    \cmidrule(lr){2-5} \cmidrule(lr){6-9}
+     & \multicolumn{2}{c}{Downstream} & \multicolumn{2}{c}{Word intrusion} & \multicolumn{2}{c}{Downstream} & \multicolumn{2}{c}{Word intrusion} \\
+    \cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9}
+    Baseline & $\Delta$ & $p$ & $\Delta$ & $p$ & $\Delta$ & $p$ & $\Delta$ & $p$ \\
+    \midrule
+    \multicolumn{9}{l}{\textit{Same dimensionality}} \\
+    GloVe$_{300}$ & $-0.051$ & 0.391 & $+0.513$ & \textbf{$<$0.001} & $-0.050$ & 0.625 & $+0.487$ & \textbf{$<$0.001} \\
+    word2vec & $-0.082$ & 0.164 & $+0.507$ & \textbf{$<$0.001} & $-0.081$ & 0.117 & $+0.480$ & \textbf{$<$0.001} \\
+    NNSE$_{300}$ & $-0.001$ & 1.000 & $+0.047$ & 0.110 & $-0.001$ & 0.945 & $+0.020$ & 0.508 \\
+    \midrule
+    \multicolumn{9}{l}{\textit{Interpretable methods}} \\
+    POLAR (GloVe) & $-0.027$ & 1.000 & $+0.311$ & \textbf{$<$0.001} & $-0.027$ & 1.000 & $+0.285$ & \textbf{$<$0.001} \\
+    POLAR (word2vec) & $-0.046$ & 1.000 & -- & -- & $-0.045$ & 1.000 & -- & -- \\
+    SPINE (GloVe) & $-0.074$ & 1.000 & $+0.142$ & \textbf{$<$0.001} & $-0.074$ & 0.312 & $+0.116$ & \textbf{$<$0.001} \\
+    SPINE (word2vec) & $-0.087$ & 0.211 & $+0.078$ & \textbf{0.007} & $-0.087$ & 0.211 & $+0.052$ & 0.141 \\
+    SPOWV (GloVe) & $-0.063$ & 1.000 & $+0.479$ & \textbf{$<$0.001} & $-0.063$ & 0.891 & $+0.453$ & \textbf{$<$0.001} \\
+    SPOWV (word2vec) & $-0.070$ & 1.000 & $+0.406$ & \textbf{$<$0.001} & $-0.070$ & 0.891 & $+0.380$ & \textbf{$<$0.001} \\
+    NNSE$_{300}$ & $-0.001$ & 1.000 & $+0.047$ & 0.219 & $-0.001$ & 1.000 & $+0.020$ & 0.508 \\
+    NNSE$_{1000}$ & $-0.066$ & 0.625 & $-0.001$ & 0.976 & $-0.066$ & 0.312 & $-0.027$ & 0.441 \\
+    SINr & $-0.037$ & 1.000 & $+0.398$ & \textbf{$<$0.001} & $-0.037$ & 1.000 & $+0.371$ & \textbf{$<$0.001} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Our models against each baseline, on our vocabulary. $\Delta$ = ours $-$ baseline: the mean difference over the 8 downstream tasks, and the difference in word-intrusion accuracy. Downstream: Wilcoxon signed-rank test over the tasks; word intrusion: $\chi^2$ test over the judge's trials. All $p$ two-sided, Holm-corrected over the baselines of a block; bold: $p < 0.05$.}
+  \label{tab:baseline-tests}
+\end{table*}
