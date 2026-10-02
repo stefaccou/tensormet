@@ -40,7 +40,7 @@ ALL_METHODS = [
     "counting", "countingLog", "countingLogEps", "countingLogPlusOne",
     "probLog", "probLogSoftPlus", "probLogShifted",
     "sii", "siiSoftPlus", "siiShifted",
-    "sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat",
+    "sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat", "scFW",
 ]
 
 # Default subset population builds when tensors_to_build is not given. Kept

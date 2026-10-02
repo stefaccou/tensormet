@@ -1,4 +1,4 @@
-"""The COLING evaluation summary: the POLAR suite and the word-intrusion judge, on our runs and the baselines.
+"""The COLING evaluation summary: the downstream tasks and the word-intrusion judge, on our runs and the baselines.
 
 Used by Coling_eval_summary.ipynb. Loading follows ../eval.ipynb (section 0), the matched-set tests its
 section 9, extended to every setting. The judge enters as its raw accuracy only.
@@ -27,14 +27,14 @@ import compare as pc
 import eval_utils as eu
 
 COLING_DIR = Path(__file__).resolve().parent
-ps = pc.ps
+ds = pc.ds
 JUDGE_DIR = COLING_DIR / 'judge_results'
 
 OUR_WORDS = 10000    # load_best()'s vocabulary: every baseline was restricted to it
 TOL = 0.005          # a difference counts only beyond this (classifier noise, GUIDE.md section 7)
 ALPHA = 0.05
 TEA = ['judge_acc']  # the judge's score columns: its accuracy on word intrusion (diversity: intrusion_table only)
-AVG = 'POLAR_average'  # mean over tasks(); NaN if a task is missing
+AVG = 'downstream_average'  # mean over tasks(); NaN if a task is missing
 OURS = ('tt', 'tucker')
 IGNORE = ('glove_nmf_*',)  # rows load() discards entirely (not listed in .dropped)
 # A matched set holds these equal, except the factor
@@ -45,7 +45,7 @@ LEVELS = {'family': ['tucker', 'tt'], 'method': ['countingLog', 'countingLogEps'
 CONTRASTS = {'family': [('tucker', 'tt')],
              'method': [('countingLog', 'scSoftPlus'), ('countingLogEps', 'scSoftPlus'),
                         ('countingLog', 'countingLogEps')]}
-# Expected direction per factor and suite ('POLAR', 'judge acc'): +1 the later level scores higher, −1 lower;
+# Expected direction per factor and suite ('downstream', 'judge acc'): +1 the later level scores higher, −1 lower;
 # the tests of that suite are then one-sided. Unlisted: two-sided. Empty: no direction was fixed before the
 # results were seen (eval.ipynb section 9 showed rank first), so every test is two-sided.
 EXPECTED = {}
@@ -70,19 +70,19 @@ FAMILY_MARKER = {'tt': 'o', 'tucker': 's'}
 
 
 def tasks():
-    """The POLAR columns of every table: all but pc.SKIP (NP once, as its 10-fold mean)."""
+    """The downstream-task columns of every table: all but pc.SKIP (NP once, as its 10-fold mean)."""
     return pc._tasks('all')
 
 
 def score_cols():
-    """The score columns of the tables: the POLAR tasks, their average, the judge's."""
+    """The score columns of the tables: the downstream tasks, their average, the judge's."""
     return [*tasks(), AVG, *TEA]
 
 
 # --- Loading -------------------------------------------------------------------------------
 @dataclass
 class Suite:
-    polar: pd.DataFrame     # rows kept, on our words, indexed (model, variant): what pc.* takes
+    rows: pd.DataFrame     # rows kept, on our words, indexed (model, variant): what pc.* takes
     full: pd.DataFrame      # baselines on their own whole vocabulary (*_full)
     loaded: pd.DataFrame    # every row loaded (raw variant), before the cuts
     dropped: pd.DataFrame   # rows left out, with the reason
@@ -95,14 +95,14 @@ class Suite:
     @property
     def df(self):
         """The rows kept, raw variant, indexed by model."""
-        return self.polar.xs('raw', level='variant')
+        return self.rows.xs('raw', level='variant')
 
 
 def _manifests(prefix):
     """Complete manifests of `prefix`, newest first (a dry run counts; --only runs and unfinished loads do not)."""
     out = []
-    for path in sorted(ps.RESULTS_DIR.glob(f'{prefix}_*.json'), reverse=True):
-        man = ps.load_manifest(path)
+    for path in sorted(ds.RESULTS_DIR.glob(f'{prefix}_*.json'), reverse=True):
+        man = ds.load_manifest(path)
         if 'models' in man and not man.get('only'):
             out.append(man)
     return out
@@ -114,17 +114,17 @@ def _subset(man, names):
 
 
 def load(series='latest', min_iters=None, exclude=(), skip=('word_analogy',), judge_csv=None):
-    """The POLAR rows of `series` (newest complete sweep + newest methods run) with the judge's columns.
+    """The downstream rows of `series` (newest complete sweep + newest methods run) with the judge's columns.
 
     Rows stopped before `min_iters` or matching a pattern of `exclude` are left out (`.dropped`). A GloVe /
     word2vec baseline the newest sweep lacks (a --no-glove run) comes from the newest sweep that has it.
-    Series 'same' (polar_sweep.py --series same): our runs only, each matched set at its common checkpoint
+    Series 'same' (downstream_sweep.py --series same): our runs only, each matched set at its common checkpoint
     (named <model>_<iteration> when not the table's); no baselines, and no judge scores (the judge has no such series)."""
     pc.SKIP = set(skip)
     prefix = {'latest': 'sweep', 'best': 'best', 'same': 'same'}[series]
     sweeps, methods = _manifests(prefix), _manifests('methods') if series != 'same' else []
     if not sweeps:
-        raise FileNotFoundError(f'no complete {prefix}_*.json in {ps.RESULTS_DIR}')
+        raise FileNotFoundError(f'no complete {prefix}_*.json in {ds.RESULTS_DIR}')
     newest, mans = sweeps[0], []
     print(f"{prefix}: {Path(newest['path']).name} ({newest.get('status')})")
     for name in eu.baseline_specs() if series != 'same' else ():
@@ -137,16 +137,16 @@ def load(series='latest', min_iters=None, exclude=(), skip=('word_analogy',), ju
     if methods:
         print(f"methods: {Path(methods[0]['path']).name} ({methods[0].get('status')})")
         mans.append(methods[0])
-    polar = pc.load(manifests=mans)
-    polar = polar[[not any(fnmatch.fnmatchcase(m, p) for p in IGNORE) for m in polar.index.get_level_values('model')]]
+    rows = pc.load(manifests=mans)
+    rows = rows[[not any(fnmatch.fnmatchcase(m, p) for p in IGNORE) for m in rows.index.get_level_values('model')]]
     files = {name: m['checkpoint']['model_file'] for man in mans for name, m in man['models'].items()
              if (m.get('checkpoint') or {}).get('model_file')}
 
     # TT bond dimension: '_tt<b>' in the run name, else BASE; 0 = Tucker
-    bond = pd.to_numeric(polar['run'].str.extract(r'_tt(\d+)$', expand=False)).fillna(eu.BASE['tt_rank'])
-    polar['tt_rank'] = bond.where(polar['family'].eq('tt'), 0).where(polar['family'].isin(OURS)).astype('Int64')
+    bond = pd.to_numeric(rows['run'].str.extract(r'_tt(\d+)$', expand=False)).fillna(eu.BASE['tt_rank'])
+    rows['tt_rank'] = bond.where(rows['family'].eq('tt'), 0).where(rows['family'].isin(OURS)).astype('Int64')
 
-    polar[AVG] = polar[tasks()].astype(float).mean(axis=1, skipna=False)
+    rows[AVG] = rows[tasks()].astype(float).mean(axis=1, skipna=False)
 
     judge_csv = Path(judge_csv) if judge_csv else sorted(JUDGE_DIR.glob('summary_*.csv'))[-1]
     judge = pd.read_csv(judge_csv)
@@ -154,32 +154,32 @@ def load(series='latest', min_iters=None, exclude=(), skip=('word_analogy',), ju
     tl = tl[~tl.index.duplicated(keep='last')]
     for col, src in [('judge_acc', 'accuracy'), ('diversity', 'diversity'), ('n_correct', 'n_correct'),
                      ('n_dims', 'n_dims'), ('fingerprint', 'fingerprint')]:
-        polar[col] = polar['run'].map(tl[src])
-    loaded = polar.xs('raw', level='variant').copy()
+        rows[col] = rows['run'].map(tl[src])
+    loaded = rows.xs('raw', level='variant').copy()
 
-    models = polar.index.get_level_values('model')
-    ours = polar['family'].isin(OURS).to_numpy()
-    why = np.full(len(polar), '', dtype=object)
+    models = rows.index.get_level_values('model')
+    ours = rows['family'].isin(OURS).to_numpy()
+    why = np.full(len(rows), '', dtype=object)
     if min_iters is not None:
-        why[ours & (polar['reached'] < min_iters).fillna(False).to_numpy(bool)] = f'reached < {min_iters}'
+        why[ours & (rows['reached'] < min_iters).fillna(False).to_numpy(bool)] = f'reached < {min_iters}'
     for pat in exclude:
         why[np.array([fnmatch.fnmatchcase(m, pat) for m in models]) & (why == '')] = f'EXCLUDE {pat!r}'
     # one run per setting: the training-seed replicates are compared apart (seed_report)
-    replicate = ours & polar['random_state'].fillna(1).ne(1).to_numpy(bool)
+    replicate = ours & rows['random_state'].fillna(1).ne(1).to_numpy(bool)
     why[replicate & (why == '')] = 'seed replicate (random_state != 1)'
     cut = why != ''
-    dropped = (polar[cut].reset_index(level='variant', drop=True)[['run', 'family', 'reached', 'checkpoint']]
+    dropped = (rows[cut].reset_index(level='variant', drop=True)[['run', 'family', 'reached', 'checkpoint']]
                .assign(reason=why[cut]))
-    polar = polar[~cut]
-    own = polar['vocab'].eq('own').to_numpy()
-    full, polar = polar[own].copy(), polar[~own].copy()
+    rows = rows[~cut]
+    own = rows['vocab'].eq('own').to_numpy()
+    full, rows = rows[own].copy(), rows[~own].copy()
 
-    trials = load_trials(judge_csv, polar['fingerprint'].dropna().unique())
-    kept = polar['family'].isin(OURS)
+    trials = load_trials(judge_csv, rows['fingerprint'].dropna().unique())
+    kept = rows['family'].isin(OURS)
     print(f'kept {kept.sum()} of our runs and {(~kept).sum()} baselines on our words (series {series}); '
           f'{len(dropped)} rows left out, {len(full)} *_full rows apart')
     print(f'judge: {judge_csv.name}; trials of {len(trials)} judged rows')
-    return Suite(polar, full, loaded, dropped, judge, judge_csv, series, files, trials)
+    return Suite(rows, full, loaded, dropped, judge, judge_csv, series, files, trials)
 
 
 _FP_RE = re.compile(r'"fingerprint":\s*"([^"]+)"')
@@ -213,11 +213,11 @@ def load_trials(judge_csv, fingerprints):
 
 
 def checks(S):
-    """Our runs whose POLAR and judge rows scored different states (empty = fine); warns if the judge's
+    """Our runs whose downstream and judge rows scored different states (empty = fine); warns if the judge's
     trial records do not reproduce its summary."""
     ours = _ours(S.df)
     j = S.judge[S.judge['group'].eq('table') & S.judge['series'].eq(S.series)].set_index('name')
-    if S.series == 'latest':  # POLAR keeps the checkpoint's file name, the judge its iteration
+    if S.series == 'latest':  # the downstream sweep keeps the checkpoint's file name, the judge its iteration
         state = j['iteration'].map(lambda i: f'{i:.0f}.pt' if pd.notna(i) else None)
     else:  # both keep the model file
         state = j['model_path'].map(lambda p: Path(p).name if isinstance(p, str) else None)
@@ -225,8 +225,8 @@ def checks(S):
            if fp in S.trials and S.trials[fp].sum() != S.df.at[m, 'n_correct']]
     if bad:
         print('WARNING: the judge records do not reproduce the summary for', ', '.join(bad))
-    out = pd.DataFrame({'run': ours['run'], 'POLAR': ours['checkpoint'], 'judge': ours['run'].map(state)})
-    return out[out['POLAR'].ne(out['judge'])]
+    out = pd.DataFrame({'run': ours['run'], 'downstream': ours['checkpoint'], 'judge': ours['run'].map(state)})
+    return out[out['downstream'].ne(out['judge'])]
 
 
 # --- Rows ----------------------------------------------------------------------------------
@@ -263,8 +263,8 @@ def foundations(S):
 
 
 def overview(S):
-    """Every row on our words: POLAR tasks and the judge's accuracy, sorted by AVG (best first); mean rank over
-    the POLAR tasks (1 = best), '+ judge' adds judge_acc to the ranked columns (– without a judge score)."""
+    """Every row on our words: downstream tasks and the judge's accuracy, sorted by AVG (best first); mean rank over
+    the downstream tasks (1 = best), '+ judge' adds judge_acc to the ranked columns (– without a judge score)."""
     T = tasks()
     data = S.df[score_cols()].astype(float)
     f = foundations(S)
@@ -275,7 +275,7 @@ def overview(S):
     return (pc._style_scores(out, score_cols()).format('{:.0f}', subset=['latent_rank'], na_rep='–')
             .format('{:.1f}', subset=['mean rank', 'mean rank, + judge'], na_rep='–')
             .set_caption(f'series {S.series}: scores, colour per column, best bold; sorted by {AVG} '
-                         f'(the {len(T)} POLAR tasks), best first'))
+                         f'(the {len(T)} downstream tasks), best first'))
 
 
 def _wilson(c, n, level=0.95):
@@ -488,10 +488,11 @@ def _holm(p):
     return out
 
 
-def _polar_row(d, stat, effect, p, p_up, p_down):
-    return {'POLAR tasks': int(d.notna().sum()), 'POLAR mean Δ': d.mean(),
-            'POLAR tasks better': int((d > TOL).sum()), 'POLAR tasks worse': int((d < -TOL).sum()),
-            'POLAR statistic': stat, 'POLAR effect': effect, 'POLAR p': p, 'POLAR p ↑': p_up, 'POLAR p ↓': p_down}
+def _downstream_row(d, stat, effect, p, p_up, p_down):
+    return {'downstream tasks': int(d.notna().sum()), 'downstream mean Δ': d.mean(),
+            'downstream tasks better': int((d > TOL).sum()), 'downstream tasks worse': int((d < -TOL).sum()),
+            'downstream statistic': stat, 'downstream effect': effect,
+            'downstream p': p, 'downstream p ↑': p_up, 'downstream p ↓': p_down}
 
 
 def _judge_counts(S, models):
@@ -527,10 +528,10 @@ def _reading(p, sign, pos, neg):
     return 'no evidence' if not p < ALPHA else pos if sign > 0 else neg
 
 
-# The suites, as column prefixes: POLAR/SPINE tasks, the judge's accuracy (judge_acc)
-POL, ACC = 'POLAR', 'judge acc'
-SUITES = [POL, ACC]
-SIGN = {POL: 'POLAR effect', ACC: 'judge acc z'}  # the column whose sign is the direction
+# The suites, as column prefixes: downstream tasks, the judge's accuracy (judge_acc)
+DOWN, ACC = 'downstream', 'judge acc'
+SUITES = [DOWN, ACC]
+SIGN = {DOWN: 'downstream effect', ACC: 'judge acc z'}  # the column whose sign is the direction
 
 
 def _h1(factor):
@@ -558,12 +559,12 @@ class Factor:
     levels: list
     contrasts: list      # (from, to, [(set, model at from, model at to)])
     trend: tuple | None  # (levels, set labels) of the trend test
-    tests: pd.DataFrame  # one row per test: POLAR and judge columns
+    tests: pd.DataFrame  # one row per test: downstream and judge columns
 
 
 def analyse(S, factor):
     """Matched sets of `factor`, and per test (trend over the most shared levels, then each contrast):
-    POLAR/SPINE with the tasks as units (Page's L / Wilcoxon), the judge's accuracy with its trials as units
+    the downstream tasks as units (Page's L / Wilcoxon), the judge's accuracy with its trials as units
     (Cochran-Armitage / CMH). Holm per suite within the factor."""
     sets = matched_sets(S, factor)
     levels = _order(factor, [v for s in sets.values() for v in s.index])
@@ -573,14 +574,14 @@ def analyse(S, factor):
     if trend:
         lv, labels = trend
         M = level_means(S, sets, lv, labels, T)
-        rows.append({'test': 'trend', 'levels': ' < '.join(_lv(factor, v) for v in lv), 'POLAR sets': len(labels),
-                     **_polar_row(M[lv[-1]] - M[lv[0]], *_page(M)),
+        rows.append({'test': 'trend', 'levels': ' < '.join(_lv(factor, v) for v in lv), 'downstream sets': len(labels),
+                     **_downstream_row(M[lv[-1]] - M[lv[0]], *_page(M)),
                      **_tea_row(S, [[sets[label][v] for v in lv] for label in labels]),
                      '_pos': 'better with more', '_neg': 'worse with more'})
     for a, b, pairs in cons:
         d = step_deltas(S, pairs, T).mean()
         rows.append({'test': 'step' if factor in ORDERED else 'contrast', 'levels': _step_label(factor, a, b),
-                     'POLAR sets': len(pairs), **_polar_row(d, *_wilcoxon(d)),
+                     'downstream sets': len(pairs), **_downstream_row(d, *_wilcoxon(d)),
                      **_tea_row(S, [[ma, mb] for _, ma, mb in pairs]),
                      '_pos': f'{_lv(factor, b)} better', '_neg': f'{_lv(factor, a)} better'})
     t = pd.DataFrame(rows)
@@ -594,11 +595,12 @@ def _step_label(factor, a, b):
     return f'{_lv(factor, a)} → {_lv(factor, b)}'
 
 
-POLAR_COLS = ['POLAR sets', 'POLAR tasks', 'POLAR mean Δ', 'POLAR tasks better', 'POLAR tasks worse',
-              'POLAR statistic', 'POLAR effect', 'POLAR p (Holm)', 'POLAR reading', 'H1']
+DOWNSTREAM_COLS = ['downstream sets', 'downstream tasks', 'downstream mean Δ', 'downstream tasks better',
+                   'downstream tasks worse', 'downstream statistic', 'downstream effect', 'downstream p (Holm)',
+                   'downstream reading', 'H1']
 TEA_COLS = ['judge acc sets', 'judge acc trials', 'judge acc by level', 'judge acc Δ', 'judge acc z',
             'judge acc p (Holm)', 'judge acc reading', 'H1']
-SUMMARY_COLS = ['POLAR sets', 'POLAR mean Δ', 'POLAR effect', 'POLAR p (Holm)', 'POLAR reading',
+SUMMARY_COLS = ['downstream sets', 'downstream mean Δ', 'downstream effect', 'downstream p (Holm)', 'downstream reading',
                 'judge acc Δ', 'judge acc p (Holm)', 'judge acc reading', 'H1']
 
 
@@ -664,7 +666,7 @@ def report(S, factor, plots=True):
         return R
     display(scores(S, R))
     h1 = f'; H1 {R.tests["H1"].iloc[0]} (one-sided there)' if R.tests['H1'].iloc[0] != 'two-sided' else '; two-sided'
-    display(style_tests(R.tests, POLAR_COLS, f'POLAR/SPINE, {len(tasks())} tasks as the units: mean Δ = later − '
+    display(style_tests(R.tests, DOWNSTREAM_COLS, f'downstream, {len(tasks())} tasks as the units: mean Δ = later − '
                                               f'earlier level; effect = ρ (trend) or rank-biserial r{h1}'))
     display(style_tests(R.tests, TEA_COLS, f"judge (series {S.series}): acc = accuracy on word intrusion "
                                            f'(judge_acc), its trials as the units{h1}'))
@@ -682,7 +684,7 @@ def with_seeds(S):
     reps = S.dropped.index[S.dropped['reason'].str.startswith('seed replicate')]
     rows = S.loaded.loc[reps].assign(variant='raw').set_index('variant', append=True)
     fps = set(rows['fingerprint'].dropna()) - set(S.trials)
-    return replace(S, polar=pd.concat([S.polar, rows]),
+    return replace(S, rows=pd.concat([S.rows, rows]),
                    trials={**S.trials, **(load_trials(S.judge_csv, fps) if fps else {})})
 
 
@@ -855,13 +857,13 @@ def directions(S, R):
 
 
 def order_free(S, R):
-    """Do the trend's levels differ at all, in any pattern (not only monotone)? POLAR: Friedman (tasks as
+    """Do the trend's levels differ at all, in any pattern (not only monotone)? Downstream tasks: Friedman (tasks as
     blocks, level scores = means over the sets; effect Kendall's W); judge accuracy: generalised CMH."""
     levels, labels = R.trend
     models = [[R.sets[label][v] for v in levels] for label in labels]
     M = level_means(S, R.sets, levels, labels, tasks()).dropna()
     chi2, p = stats.friedmanchisquare(*M.to_numpy(float).T)
-    rows = [{'suite': POL, 'test': 'Friedman', 'units': f'{len(M)} tasks', 'statistic': chi2,
+    rows = [{'suite': DOWN, 'test': 'Friedman', 'units': f'{len(M)} tasks', 'statistic': chi2,
              'df': len(levels) - 1, "Kendall's W": chi2 / (len(M) * (len(levels) - 1)), 'p': p}]
     c, n, ok = _judge_counts(S, models)
     if ok.any():
@@ -878,7 +880,7 @@ def order_free(S, R):
 
 def plot_steps(S, R):
     """Per contrast, each matched set's difference (to − from) per column, the ink tick their mean;
-    POLAR tasks left, the judge's accuracy right, each on its own scale."""
+    downstream tasks left, the judge's accuracy right, each on its own scale."""
     if not R.contrasts:
         print(f'{R.name}: no matched pairs')
         return
@@ -902,7 +904,7 @@ def plot_steps(S, R):
         ax.set_xticklabels(cols, rotation=30, ha='right')
         ax.set_xlim(-0.6, len(cols) - 0.4)
     axes[0].set_ylabel('Δ score (to − from)', color=INK2, fontsize=9)
-    axes[0].set_title('POLAR/SPINE tasks', loc='left', fontsize=9, color=INK)
+    axes[0].set_title('downstream tasks', loc='left', fontsize=9, color=INK)
     axes[1].set_title('word intrusion (judge)', loc='left', fontsize=9, color=INK)
     handles = []
     for i, (a, b, pairs) in enumerate(R.contrasts):
@@ -910,14 +912,14 @@ def plot_steps(S, R):
         handles.append(Line2D([], [], linestyle='', marker='o', markersize=7, color=SLOTS[i % len(SLOTS)],
                               markeredgecolor=SURFACE,
                               label=f'{lv}: {len(pairs)} set' + 's' * (len(pairs) > 1) + '\np (Holm): '
-                                    f'POLAR {_p_text(R, lv, POL)}, judge acc {_p_text(R, lv, ACC)}'))
+                                    f'downstream {_p_text(R, lv, DOWN)}, judge acc {_p_text(R, lv, ACC)}'))
     handles.append(Line2D([], [], color=INK, linewidth=2, label='mean over the sets'))
     axes[2].axis('off')
     _legend(axes[2], handles, loc='center left')
     title = f'{R.name}: paired differences'
     if R.trend:
         lv = ' < '.join(_lv(R.name, v) for v in R.trend[0])
-        title += f'; trend {lv}, p (Holm): POLAR {_p_text(R, lv, POL)}, judge acc {_p_text(R, lv, ACC)}'
+        title += f'; trend {lv}, p (Holm): downstream {_p_text(R, lv, DOWN)}, judge acc {_p_text(R, lv, ACC)}'
     fig.suptitle(title, x=0.01, ha='left', fontsize=11, color=INK)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     plt.show()
@@ -1056,7 +1058,7 @@ def plot_time(table, factor='ss_frac'):
 
 # --- Which run is best ---------------------------------------------------------------------
 def ranking(S, cols=None, alpha=ALPHA):
-    """Our runs sorted by AVG (best first), with the mean rank over `cols` (default the POLAR tasks; 1 = best, ties
+    """Our runs sorted by AVG (best first), with the mean rank over `cols` (default the downstream tasks; 1 = best, ties
     averaged), Friedman's test over the columns and Nemenyi's critical difference (Demšar 2006). Returns (table, CD)."""
     cols = tasks() if cols is None else cols
     ours = _ours(S.df)
@@ -1130,9 +1132,9 @@ def matched_baselines(S, headline, vocab_min=0.9):
 
 def versus(S, model, baselines, caption=''):
     """`model` against each baseline: scores side by side with Δ = model − baseline, then per baseline the tests
-    (Wilcoxon over the POLAR tasks, 2 x 2 chi-square on the judge's accuracy), Holm over the baselines; then
+    (Wilcoxon over the downstream tasks, 2 x 2 chi-square on the judge's accuracy), Holm over the baselines; then
     coverage. With 8 tasks the smallest Wilcoxon p is 2/2^8: when Holm over the baselines puts the smallest
-    attainable p at ALPHA or above, the POLAR reading says 'no power'."""
+    attainable p at ALPHA or above, the downstream reading says 'no power'."""
     cols = score_cols()
     data = S.df.loc[[model, *baselines], cols].astype(float).T
     delta = pd.DataFrame({f'Δ vs {b}': data[model] - data[b] for b in baselines})
@@ -1143,25 +1145,26 @@ def versus(S, model, baselines, caption=''):
     rows = []
     for b in baselines:
         d = S.df.loc[model, tasks()].astype(float) - S.df.loc[b, tasks()].astype(float)
-        rows.append({'factor': model, 'test': 'vs', 'levels': b, **_polar_row(d, *_wilcoxon(d)),
+        rows.append({'factor': model, 'test': 'vs', 'levels': b, **_downstream_row(d, *_wilcoxon(d)),
                      **_tea_row(S, [[b, model]]), '_pos': 'ours better', '_neg': f'{b} better'})
     t = _finish(pd.DataFrame(rows), None)
-    floor = min(1.0, len(baselines) * 2 / 2 ** len(tasks()))  # smallest attainable Holm p on the POLAR tasks
+    floor = min(1.0, len(baselines) * 2 / 2 ** len(tasks()))  # smallest attainable Holm p on the downstream tasks
     if floor >= ALPHA:
-        t['POLAR reading'] = f'no power (Holm floor {floor:.2f})'
-    display(style_tests(t, ['POLAR tasks', 'POLAR mean Δ', 'POLAR tasks better', 'POLAR tasks worse', 'POLAR effect',
-                            'POLAR p', 'POLAR p (Holm)', 'POLAR reading', 'judge acc by level', 'judge acc Δ',
+        t['downstream reading'] = f'no power (Holm floor {floor:.2f})'
+    display(style_tests(t, ['downstream tasks', 'downstream mean Δ', 'downstream tasks better',
+                            'downstream tasks worse', 'downstream effect', 'downstream p', 'downstream p (Holm)',
+                            'downstream reading', 'judge acc by level', 'judge acc Δ',
                             'judge acc p (Holm)', 'judge acc reading'],
-                        f'Δ = {model} − baseline; POLAR p: two-sided Wilcoxon before Holm (smallest attainable '
+                        f'Δ = {model} − baseline; downstream p: two-sided Wilcoxon before Holm (smallest attainable '
                         f'{2 / 2 ** len(tasks()):.4f}); bold = Holm p < {ALPHA} (Holm over the baselines); '
-                        f'judge acc by level: baseline → ours; smallest attainable POLAR Holm p here: {floor:.3f}'))
-    display(pc.coverage(S.polar, model, *baselines))
+                        f'judge acc by level: baseline → ours; smallest attainable downstream Holm p here: {floor:.3f}'))
+    display(pc.coverage(S.rows, model, *baselines))
     return t
 
 
 # --- Appendix B: the best series -----------------------------------------------------------
 def series_compare(S, S_other):
-    """Our runs scored in both suites, joined on the run: POLAR_average and judge_acc side by side, Δ = other − S,
+    """Our runs scored in both suites, joined on the run: downstream_average and judge_acc side by side, Δ = other − S,
     and the file each scored. The caption gives the mean Δ and a Wilcoxon signed-rank test over the runs."""
     a, b = _ours(S.df).set_index('run'), _ours(S_other.df).set_index('run')
     runs = a.index.intersection(b.index)

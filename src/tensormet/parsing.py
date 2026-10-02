@@ -566,6 +566,23 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
     )
 
     parser.add_argument(
+        "--content-only",
+        type=_parse_bool,
+        dest="content_only",
+        default=None,
+        help="N-grams only: drop spaCy stop words from each sentence before "
+             "extracting n-grams (default: false).",
+    )
+    parser.add_argument(
+        "--ngram-label",
+        type=str,
+        dest="ngram_label",
+        default=None,
+        help="N-grams only: write each order to '{n}-gram-{label}' instead of the "
+             "derived directory name, e.g. --ngram-label content -> 4-gram-content.",
+    )
+
+    parser.add_argument(
         "--name",
         type=str,
         default=None,
@@ -595,6 +612,8 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
         "cpu_frac",
         "log_every_s",
         "pad_sentences",
+        "content_only",
+        "ngram_label",
         "name",
     )
     for f in exp_fields:
@@ -708,7 +727,7 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
     parser.add_argument("--tensors-to-build", type=_parse_cols_to_build, dest="tensors_to_build", default=None,
                         help="Comma-separated list of tensor names to build. Omit for the default set "
                              "(countingLog,countingLogEps,scSoftPlus). "
-                             "Valid: counting,countingLog,countingLogEps,probLog,probLogSoftPlus,probLogShifted,sii,siiSoftPlus,siiShifted,sc,scSoftPlus,scShifted,scSoftPlusFlat. "
+                             "Valid: counting,countingLog,countingLogEps,probLog,probLogSoftPlus,probLogShifted,sii,siiSoftPlus,siiShifted,sc,scSoftPlus,scShifted,scSoftPlusFlat,scFW. "
                              "E.g. --tensors-to-build counting,countingLog,sc")
 
     parsed = parser.parse_args(args=argv)

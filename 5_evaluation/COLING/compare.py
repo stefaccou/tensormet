@@ -1,7 +1,7 @@
-"""Overviews and comparisons of the POLAR sweep's results (tensormet_eval.jsonl).
+"""Overviews and comparisons of the downstream sweep's results (tensormet_eval.jsonl).
 
-Rows are read through polar_sweep's own reader (same checkpoint and seed rules as
-polar_replication.ipynb): one row per (model, variant), with config columns, the task scores,
+Rows are read through downstream_sweep.finished_records (same checkpoint and seed rules as the sweep):
+one row per (model, variant), with config columns, the task scores,
 NP folds 0 and 1 (SPINE's two), and coverage. Every task is higher-is-better.
 
     import compare as pc
@@ -15,7 +15,8 @@ NP folds 0 and 1 (SPINE's two), and coverage. Every task is higher-is-better.
     pc.effect(df, 'rank')                                   # models that differ only in rank
     pc.effect(df, 'rank', detail=True)                      # every such pair
 
-Models are shell-style patterns on the run names. `tasks` is a list, or 'polar', 'spine', 'all'.
+Models are shell-style patterns on the run names. `tasks` is a list, or 'all', or the task set of one paper:
+'polar' (Mathew et al., 2020) or 'spine' (Subramanian et al., 2018).
 Tasks in `SKIP` are left out of every table, whatever `tasks` says (e.g. pc.SKIP = {'word_analogy'}).
 MLP and RandomForest fits are unseeded unless the sweep had --random-state, so a difference of
 about 0.01 on a classifier task can be noise: `tol` in wins/effect counts those as ties.
@@ -28,17 +29,17 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
 
-import polar_sweep as ps
+import downstream_sweep as ds
 
 TASKS = {
-    'all': list(ps.COLUMNS),  # NP once, as the 10-fold mean; folds 0/1 only in 'spine'
-    'polar': [c for c in ps.COLUMNS if c != 'wordsim353'],
+    'all': list(ds.COLUMNS),  # NP once, as the 10-fold mean; folds 0/1 only in 'spine'
+    'polar': [c for c in ds.COLUMNS if c != 'wordsim353'],
     # the columns of spine_eval.results_table; NP is SPINE's folds 0 and 1, not the 10-fold mean
     'spine': ['wordsim353', 'news_computer', 'news_religion', 'news_sports', 'TREC', 'np_f0', 'np_f1'],
 }
 CONFIG = ['family', 'ngram', 'rank', 'method', 'ss_frac', 'dims', 'random_state', 'variant']  # what effect() varies
 SKIP = set()  # tasks left out everywhere, set from the notebook
-DEFAULT_BASE = {'variant': 'raw', 'family': 'tucker', **ps.BASE}  # effect()'s reference value
+DEFAULT_BASE = {'variant': 'raw', 'family': 'tucker', **ds.BASE}  # effect()'s reference value
 
 # Palette: one-hue blue for scores; red <-> grey <-> blue for differences (worse <-> better)
 SEQ = LinearSegmentedColormap.from_list('seq', ['#cde2fb', '#86b6ef', '#3987e5', '#1c5cab'])
@@ -72,7 +73,7 @@ def _row(r, ck=None):
         # training seed; records written before it was varied are seed 1
         'random_state': None if 'baseline' in cfg or not cfg else cfg.get('random_state', 1),
         'checkpoint': r['model_path'].rsplit('/', 1)[-1],
-        **{c: r['scores'].get(c) for c in ps.COLUMNS},
+        **{c: r['scores'].get(c) for c in ds.COLUMNS},
         'np_f0': folds[0], 'np_f1': folds[1],
         'time': r['time'],
     }
@@ -91,19 +92,19 @@ def load(manifests=None, prefixes=('sweep', 'methods'), min_iters=None):
     if manifests is None:
         manifests = []
         for prefix in prefixes:
-            for path in sorted(ps.RESULTS_DIR.glob(f'{prefix}_*.json'), reverse=True):
-                man = ps.load_manifest(path)
+            for path in sorted(ds.RESULTS_DIR.glob(f'{prefix}_*.json'), reverse=True):
+                man = ds.load_manifest(path)
                 if 'models' in man and not man.get('only'):
                     print(f'{prefix}: {path.name} ({man["status"]})')
                     manifests.append(man)
                     break
     rows = {}
     for man in manifests:
-        man = man if isinstance(man, dict) else ps.load_manifest(man)
+        man = man if isinstance(man, dict) else ds.load_manifest(man)
         if 'models' not in man:
             continue
         paths = {name: m['path'] for name, m in man['models'].items()}
-        records = ps.finished_records(paths, man['random_state'], man.get('resume_since'))
+        records = ds.finished_records(paths, man['random_state'], man.get('resume_since'))
         for run in man['runs']:
             if run in records:
                 rows[run] = _row(records[run], (man['models'].get(run[0]) or {}).get('checkpoint'))

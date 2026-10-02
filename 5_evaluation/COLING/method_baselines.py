@@ -1,4 +1,4 @@
-"""The POLAR evaluation of polar_sweep.py, run on interpretable embedding methods instead of tensormet models.
+"""The downstream tasks of downstream_sweep.py, run on interpretable embedding methods instead of tensormet models.
 
     polar_<src>_k<K>   POLAR (Mathew et al., 2020): main.ipynb's transform, ported (antonym sets,
                        closest-antonym selection, random dimension order, pinv projection, unit rows),
@@ -16,15 +16,15 @@
 Memory: polar_w2v_k500_full is 3M x 500 (6 GB); polar_glove_k500_full
 1.29M x 500. Leave them out with --only or --vocabs ours when the machine is busy.
 
-<src> is glove (GloVe 2024 100d, the file of polar_sweep's glove_100 rows) or w2v (Google News word2vec,
+<src> is glove (GloVe 2024 100d, the file of downstream_sweep's glove_100 rows) or w2v (Google News word2vec,
 POLAR's paper input). Without _full, a method keeps only the words of TuckerDecomposition.load_best(),
 the vocabulary the glove_<w> / glove_nmf_<w> / w2v rows use; either way it then goes through
-polar_sweep's pipeline unchanged: same variants, tasks, grids, selection, results log
+downstream_sweep's pipeline unchanged: same variants, tasks, grids, selection, results log
 (tensormet_eval.jsonl) and resume. The POLAR transform is always fit on the whole source vocabulary
 (antonyms outside our vocabulary count); only the rows evaluated differ.
 
-Outputs in polar_results/: methods_<stamp>.json (manifest), methods_<stamp>.log, fit_times_methods_<stamp>.log.
-Read them with  man = ps.load_manifest(prefix='methods').
+Outputs in downstream_results/: methods_<stamp>.json (manifest), methods_<stamp>.log, fit_times_methods_<stamp>.log.
+Read them with  man = ds.load_manifest(prefix='methods').
 
 On ampere, inside screen:
     cd 5_evaluation/COLING
@@ -45,14 +45,14 @@ from pathlib import Path
 
 import numpy as np
 
-import polar_sweep as ps
+import downstream_sweep as ds
 from eval_utils import GLOVE_PATH, selected
 from glove_baseline import _as_baseline, read_glove
 
 from tensormet.tucker_tensor import TuckerDecomposition
 from tensormet.utils import DATA_DIR
 
-ANTONYM_DIR = ps.THIRD_PARTY_DIR / 'POLAR/Antonym_sets'
+ANTONYM_DIR = ds.THIRD_PARTY_DIR / 'POLAR/Antonym_sets'
 ANTONYM_FILES = ['LenciBenotto.val', 'LenciBenotto.test', 'EVALution.val', 'EVALution.test']  # main.ipynb's order
 W2V_NAME = 'word2vec-google-news-300'
 POLAR_SOURCES = ['glove', 'w2v']
@@ -71,10 +71,10 @@ NNSE_URL = 'https://www.cs.cmu.edu/~bmurphy/NNSE/'
 NNSE_FILE = 'depDocNNSE{}.tab.zip'
 NNSE_WIDTHS = [300, 1000]  # 300: the width of r300, glove_300, w2v; 1000: the width later papers use
 # SINr has no English release besides the example model in its repo (notebooks/sinrvec_en.ipynb there)
-SINR_PATH = ps.THIRD_PARTY_DIR / 'sinr/notebooks/sinrvec_bnc.pk'
+SINR_PATH = ds.THIRD_PARTY_DIR / 'sinr/notebooks/sinrvec_bnc.pk'
 RELEASED = ['spine', 'spowv', 'nnse', 'sinr']
 # --export-txt only: the SPINE harness, which is not part of COLING/
-SPINE_SUITE_DIR = ps.COLING_DIR.parent / 'spine'
+SPINE_SUITE_DIR = ds.COLING_DIR.parent / 'spine'
 TXT_DIR = SPINE_SUITE_DIR / 'out' / 'methods'
 EXPORT_MAX_WORDS = 200_000  # --export-txt skips larger embeddings (the full-vocabulary POLAR ones)
 VOCABS = ('ours', 'own')
@@ -365,7 +365,7 @@ def spec(args):
 
 
 def build_parser():
-    p = ps.build_parser('POLAR downstream evaluation of interpretable embedding methods.', table=False)
+    p = ds.build_parser('Downstream-task evaluation of interpretable embedding methods.', table=False)
     p.add_argument('--polar-sources', nargs='*', default=POLAR_SOURCES, choices=POLAR_SOURCES)
     p.add_argument('--polar-dims', nargs='+', type=int, default=POLAR_DIMS, metavar='K')
     p.add_argument('--polar-seed', type=int, default=POLAR_SEED)
@@ -382,4 +382,4 @@ def build_parser():
 
 
 if __name__ == '__main__':
-    sys.exit(ps.main(parser=build_parser(), load=load_methods, spec=spec, prefix='methods'))
+    sys.exit(ds.main(parser=build_parser(), load=load_methods, spec=spec, prefix='methods'))

@@ -14,10 +14,10 @@ Nothing in them is edited.
 
 | Folder | What is read | Used by |
 |---|---|---|
-| `POLAR/Downstream Task/*/data/` | the datasets of the downstream tasks | `polar_sweep.py` |
+| `POLAR/Downstream Task/*/data/` | the datasets of the downstream tasks | `downstream_sweep.py` |
 | `POLAR/Antonym_sets/` | the antonym pairs of the POLAR transform | `method_baselines.py` |
-| `spine/code/evaluation/intrinsic/word_sim.tab` | WordSim-353 | `polar_sweep.py` |
+| `spine/code/evaluation/intrinsic/word_sim.tab` | WordSim-353 | `downstream_sweep.py` |
 | `sinr/notebooks/sinrvec_bnc.pk` | the SINr model (BNC) | `method_baselines.py` |
 
-The scripts that `polar_sweep.py` ports are in the same repositories: `POLAR/Downstream Task/*/classify*.py`,
+The scripts that `downstream_sweep.py` ports are in the same repositories: `POLAR/Downstream Task/*/classify*.py`,
 `POLAR/main.ipynb` and `spine/code/evaluation/intrinsic/evaluate_wordSim.py`.

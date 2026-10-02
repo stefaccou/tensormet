@@ -65,7 +65,7 @@ PROGRESS_EVERY = 60  # seconds
 
 def _tee(log_path):
     """This process's output to the terminal and the sweep log."""
-    from polar_sweep import _Tee
+    from downstream_sweep import _Tee
     fh = open(log_path, "a", buffering=1, encoding="utf-8")
     sys.stdout = _Tee(sys.__stdout__, fh)
     sys.stderr = _Tee(sys.__stderr__, fh)

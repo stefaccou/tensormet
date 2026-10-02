@@ -1,4 +1,4 @@
-"""Model loading shared by the evaluation suites (POLAR, SPINE, WiC, ...).
+"""Model loading shared by the evaluation scripts (downstream tasks, judge, WiC, ...).
 
 MODELS is the paper's model table: per (decomposition, n-gram) column, BASE plus the
 values that each replace one BASE key. Every suite that loads through here sees the same

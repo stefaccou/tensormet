@@ -1623,6 +1623,1622 @@
     }
    },
    "n_nan_scores": 0
+  },
+  "ff0264678351": {
+   "label": "glove_100",
+   "picks": {
+    "0": "breeds",
+    "1": "carbohydrates",
+    "2": "explored",
+    "3": "rare",
+    "4": "hobby",
+    "5": "measuring",
+    "6": "projections",
+    "7": "traditionally",
+    "8": "sacrifice",
+    "9": "fillers",
+    "10": "geographical",
+    "11": "vulnerabilities",
+    "12": "shut",
+    "13": "keynote",
+    "14": "equitable",
+    "15": "offer",
+    "16": "jonathan",
+    "17": "disability",
+    "18": "thai",
+    "19": "viewed",
+    "20": "puerto",
+    "21": "generative",
+    "22": "deceased",
+    "23": "mapping",
+    "24": "forums",
+    "25": "advocacy",
+    "26": "achievement",
+    "27": "lenses",
+    "28": "clever",
+    "29": "interventions",
+    "30": "illustration",
+    "31": "protein",
+    "32": "bedroom",
+    "33": "maria",
+    "34": "webinar",
+    "35": "straps",
+    "36": "dreaming",
+    "37": "alcohol",
+    "38": "facial",
+    "39": "puppies",
+    "40": "inc.",
+    "41": "composed",
+    "42": "minds",
+    "43": "du",
+    "44": "insightful",
+    "45": "plastics",
+    "46": "treaty",
+    "47": "fruits",
+    "48": "champion",
+    "49": "confidentiality",
+    "50": "mm",
+    "51": "mats",
+    "52": "von",
+    "53": "holistic",
+    "54": "meats",
+    "55": "tyre",
+    "56": "tsp",
+    "57": "principles",
+    "58": "caters",
+    "59": "tropical",
+    "60": "graduated",
+    "61": "herein",
+    "62": "mario",
+    "63": "korea",
+    "64": "portuguese",
+    "65": "disabilities",
+    "66": "fertilizer",
+    "67": "helpful",
+    "68": "fairness",
+    "69": "ali",
+    "70": "arrow",
+    "71": "varying",
+    "72": "stance",
+    "73": "afraid",
+    "74": "title",
+    "75": "generator",
+    "76": "charities",
+    "77": "curved",
+    "78": "charlotte",
+    "79": "allergic",
+    "80": "dots",
+    "81": "assortment",
+    "82": "preservation",
+    "83": "tackle",
+    "84": "antique",
+    "85": "lush",
+    "86": "prime",
+    "87": "alien",
+    "88": "freshness",
+    "89": "somewhat",
+    "90": "safeguard",
+    "91": "tightly",
+    "92": "austin",
+    "93": "simplify",
+    "94": "deliver",
+    "95": "distinction",
+    "96": "unlawful",
+    "97": "sweat",
+    "98": "sunscreen",
+    "99": "p.m."
+   },
+   "scores": {
+    "0": {
+     "robotics": -1.8235,
+     "statistical": -0.8154,
+     "breeds": -0.2137,
+     "cybersecurity": -1.3094,
+     "continuous": -2.8804
+    },
+    "1": {
+     "jewellery": -0.8711,
+     "swiss": -0.5107,
+     "carbohydrates": -0.3092,
+     "shine": -6.5055,
+     "euros": -9.4586
+    },
+    "2": {
+     "ham": -3.673,
+     "ah": -6.4855,
+     "explored": -0.0475,
+     "marine": -7.4152,
+     "uh": -4.6105
+    },
+    "3": {
+     "hearts": -1.0915,
+     "lens": -0.8653,
+     "elect": -1.5268,
+     "convey": -2.0382,
+     "rare": -0.8393
+    },
+    "4": {
+     "acres": -1.3849,
+     "par": -0.7695,
+     "hobby": -0.3937,
+     "trails": -3.066,
+     "lifts": -2.8866
+    },
+    "5": {
+     "hawaii": -0.6444,
+     "measuring": -0.2225,
+     "magnetic": -2.484,
+     "adequate": -1.4569,
+     "muscles": -2.4256
+    },
+    "6": {
+     "projections": -0.1662,
+     "respectful": -0.8144,
+     "loyal": -4.437,
+     "loyalty": -2.0151,
+     "conservative": -2.6348
+    },
+    "7": {
+     "traditionally": -0.4726,
+     "qatar": -0.8847,
+     "uh": -2.5494,
+     "shorts": -0.6344,
+     "ah": -4.2369
+    },
+    "8": {
+     "restaurants": -1.6442,
+     "protecting": -0.7597,
+     "diving": -2.3383,
+     "sacrifice": -0.4708,
+     "wasting": -0.9885
+    },
+    "9": {
+     "plaza": -0.7327,
+     "fillers": -0.3968,
+     "elder": -1.9338,
+     "testosterone": -1.0998,
+     "hormones": -1.2342
+    },
+    "10": {
+     "java": -2.3407,
+     "geographical": -0.4867,
+     "solely": -0.7095,
+     "disasters": -0.8739,
+     "islam": -3.2939
+    },
+    "11": {
+     "bucks": -1.1304,
+     "al": -4.0211,
+     "orlando": -1.9246,
+     "vulnerabilities": -0.1946,
+     "el": -4.3648
+    },
+    "12": {
+     "enterprises": -3.7405,
+     "mining": -2.5302,
+     "shut": -0.0144,
+     "sustainable": -2.1798,
+     "industrial": -3.1782
+    },
+    "13": {
+     "graduating": -2.056,
+     "college": -6.9708,
+     "school": -5.752,
+     "keynote": -0.1496,
+     "objects": -1.4864
+    },
+    "14": {
+     "stands": -3.8394,
+     "merger": -1.9439,
+     "bankruptcy": -2.4437,
+     "equitable": -0.0369,
+     "securities": -3.0841
+    },
+    "15": {
+     "quartz": -4.1219,
+     "offer": -0.1889,
+     "tin": -8.3529,
+     "uneven": -0.946,
+     "calcium": -3.8328
+    },
+    "16": {
+     "generative": -2.1765,
+     "android": -4.3671,
+     "samsung": -2.3322,
+     "ai": -9.1874,
+     "jonathan": -0.0276
+    },
+    "17": {
+     "ram": -2.8364,
+     "emperor": -0.5823,
+     "river": -4.477,
+     "pass": -4.6645,
+     "disability": -0.2698
+    },
+    "18": {
+     "bake": -2.7993,
+     "oven": -8.4103,
+     "arctic": -0.4239,
+     "microwave": -4.0216,
+     "thai": -0.2911
+    },
+    "19": {
+     "viewed": -0.2577,
+     "soviet": -1.6874,
+     "russian": -2.9065,
+     "vessels": -0.4222,
+     "md": -3.7652
+    },
+    "20": {
+     "puerto": -0.4581,
+     "spain": -1.6375,
+     "de": -2.0091,
+     "netherlands": -1.5546,
+     "oven": -1.1966
+    },
+    "21": {
+     "generative": -0.5509,
+     "pumps": -0.6499,
+     "scroll": -1.2997,
+     "computational": -3.3301,
+     "manually": -1.1499
+    },
+    "22": {
+     "herein": -1.335,
+     "deceased": -0.4596,
+     "satellite": -0.7654,
+     "stakeholders": -1.501,
+     "gods": -0.7247
+    },
+    "23": {
+     "darker": -1.0356,
+     "mapping": -0.29,
+     "coat": -3.8212,
+     "egg": -2.9462,
+     "grey": -6.3212
+    },
+    "24": {
+     "commander": -2.5676,
+     "petroleum": -1.6826,
+     "army": -4.9364,
+     "forums": -0.068,
+     "joint": -10.0758
+    },
+    "25": {
+     "game": -2.2712,
+     "monkey": -4.6931,
+     "greek": -0.8077,
+     "advocacy": -0.2153,
+     "marble": -1.0419
+    },
+    "26": {
+     "achievement": -0.6594,
+     "nt": -1.0344,
+     "server": -2.425,
+     "authentication": -6.6125,
+     "algorithm": -4.7813
+    },
+    "27": {
+     "rotary": -1.2527,
+     "alloy": -1.5869,
+     "lenses": -0.3343,
+     "ecosystem": -0.5652,
+     "plasma": -1.948
+    },
+    "28": {
+     "guy": -1.91,
+     "clever": -0.4803,
+     "declare": -0.5854,
+     "courier": -4.2345,
+     "nice": -4.3979
+    },
+    "29": {
+     "antioxidant": -0.8878,
+     "interventions": -0.3023,
+     "chocolate": -3.029,
+     "coating": -1.0009,
+     "cloud": -1.8701
+    },
+    "30": {
+     "competitive": -2.0051,
+     "poll": -1.6457,
+     "gp": -5.1613,
+     "illustration": -0.2683,
+     "teaspoon": -1.2269
+    },
+    "31": {
+     "storms": -1.4297,
+     "protein": -0.9922,
+     "earthquake": -1.9965,
+     "thyroid": -3.012,
+     "apr": -3.9453
+    },
+    "32": {
+     "span": -5.1869,
+     "tiles": -6.2651,
+     "porcelain": -5.5528,
+     "bedroom": -0.07,
+     "earrings": -0.7503
+    },
+    "33": {
+     "acceptable": -3.1624,
+     "maria": -0.0812,
+     "na": -4.5062,
+     "die": -4.4437,
+     "polish": -1.4641
+    },
+    "34": {
+     "webinars": -0.9032,
+     "webinar": -0.6532,
+     "nfts": -1.1923,
+     "\u2714": -2.1946,
+     "reform": -1.679
+    },
+    "35": {
+     "straps": -0.5617,
+     "physics": -0.7949,
+     "listened": -0.8353,
+     "ph.d.": -2.0194,
+     "nashville": -1.8223
+    },
+    "36": {
+     "butterfly": -1.4438,
+     "coral": -1.7829,
+     "dreaming": -0.1343,
+     "species": -3.8934,
+     "passport": -2.1434
+    },
+    "37": {
+     "carbohydrates": -0.4573,
+     "avenue": -1.0925,
+     "lifts": -2.7741,
+     "cabin": -1.733,
+     "alcohol": -0.2952
+    },
+    "38": {
+     "accreditation": -1.816,
+     "merit": -1.73,
+     "facial": -0.0581,
+     "jackson": -1.5897,
+     "chiropractic": -1.4711
+    },
+    "39": {
+     "puppies": -0.2512,
+     "dependence": -1.9543,
+     "tiktok": -3.278,
+     "randomly": -1.2203,
+     "advertisements": -1.0062
+    },
+    "40": {
+     "trash": -0.9451,
+     "subscription": -2.3826,
+     "suites": -1.9106,
+     "xbox": -1.9252,
+     "inc.": -0.9057
+    },
+    "41": {
+     "hindu": -1.0978,
+     "silk": -1.5887,
+     "indians": -1.23,
+     "composed": -0.7238,
+     "down": -1.6144
+    },
+    "42": {
+     "minds": -0.7504,
+     "organs": -1.4157,
+     "ira": -2.1568,
+     "composer": -1.1255,
+     "organ": -2.7818
+    },
+    "43": {
+     "du": -0.3344,
+     "warrior": -0.7689,
+     "herein": -1.7889,
+     "picturesque": -3.7876,
+     "scenic": -4.492
+    },
+    "44": {
+     "answers": -2.2288,
+     "starring": -0.6355,
+     "insightful": -0.6011,
+     "professor": -1.5911,
+     "iptv": -1.3566
+    },
+    "45": {
+     "injury": -0.7666,
+     "plastics": -0.4772,
+     "spain": -0.688,
+     "cup": -5.2038,
+     "cycling": -1.2818
+    },
+    "46": {
+     "herein": -1.0462,
+     "treaty": -0.4398,
+     "crude": -0.9125,
+     "offensive": -1.4673,
+     "lowest": -1.1218
+    },
+    "47": {
+     "wordpress": -3.7537,
+     "explores": -0.5878,
+     "pour": -4.1912,
+     "paste": -6.2459,
+     "fruits": -0.5644
+    },
+    "48": {
+     "symptoms": -0.7399,
+     "champion": -0.2633,
+     "beat": -4.5734,
+     "who": -1.9015,
+     "world": -4.964
+    },
+    "49": {
+     "confidentiality": -0.255,
+     "peer": -1.2954,
+     "del": -1.5297,
+     "c": -6.9047,
+     "de": -5.5454
+    },
+    "50": {
+     "fruits": -1.2689,
+     "mm": -0.6314,
+     "creamy": -1.3158,
+     "indie": -0.722,
+     "grey": -3.4751
+    },
+    "51": {
+     "arabic": -1.3472,
+     "verse": -3.1676,
+     "mats": -0.1151,
+     "greek": -1.7794,
+     "meanings": -2.9277
+    },
+    "52": {
+     "armor": -3.5061,
+     "von": -0.2248,
+     "defensive": -2.4028,
+     "offensive": -3.6761,
+     "consumed": -1.0109
+    },
+    "53": {
+     "jesus": -1.6462,
+     "holistic": -0.1771,
+     "portion": -2.0102,
+     "divine": -2.9663,
+     "nhs": -1.3177
+    },
+    "54": {
+     "du": -2.289,
+     "des": -3.5702,
+     "meats": -0.4496,
+     "jim": -2.3359,
+     "creator": -1.1952
+    },
+    "55": {
+     "uber": -2.0908,
+     "mph": -2.8408,
+     "tyre": -0.4127,
+     "rugged": -0.6393,
+     "lb": -9.2861
+    },
+    "56": {
+     "gene": -0.7016,
+     "disorders": -1.0649,
+     "abnormal": -1.1869,
+     "disorder": -3.6664,
+     "tsp": -0.687
+    },
+    "57": {
+     "lego": -0.7065,
+     "principles": -0.4431,
+     "changing": -1.3971,
+     "islam": -4.0065,
+     "bin": -3.6628
+    },
+    "58": {
+     "al": -1.1698,
+     "eco": -2.5917,
+     "caters": -0.4761,
+     "islamic": -3.5736,
+     "hamas": -1.0773
+    },
+    "59": {
+     "membrane": -0.9925,
+     "tropical": -0.1327,
+     "proteins": -1.0052,
+     "storms": -4.4209,
+     "foreign": -3.874
+    },
+    "60": {
+     "graduated": -0.8586,
+     "boy": -1.5296,
+     "doctor": -2.5296,
+     "researchers": -1.1406,
+     "median": -1.0921
+    },
+    "61": {
+     "herein": -0.8289,
+     "quarterback": -0.875,
+     "proxy": -7.1557,
+     "zip": -1.0151,
+     "ben": -1.6714
+    },
+    "62": {
+     "scene": -1.0004,
+     "mario": -0.8444,
+     "tray": -2.4612,
+     "ergonomic": -0.8989,
+     "coach": -1.8129
+    },
+    "63": {
+     "dirty": -1.7629,
+     "indoors": -1.4521,
+     "arsenal": -1.4283,
+     "alloy": -2.72,
+     "korea": -0.5143
+    },
+    "64": {
+     "reverse": -0.893,
+     "portuguese": -0.454,
+     "crore": -1.6185,
+     "\u20b9": -4.5757,
+     "republic": -0.7773
+    },
+    "65": {
+     "belgium": -2.1535,
+     "disabilities": -0.1307,
+     "citizenship": -2.5529,
+     "sexually": -0.9973,
+     "defender": -1.4696
+    },
+    "66": {
+     "unlawful": -0.7829,
+     "constitution": -6.2639,
+     "violation": -4.3559,
+     "sec": -1.3421,
+     "fertilizer": -0.1557
+    },
+    "67": {
+     "\u00b0": -9.4409,
+     "u": -2.1128,
+     "shit": -1.4253,
+     "helpful": -0.2988,
+     "fc": -6.7534
+    },
+    "68": {
+     "hampshire": -0.5868,
+     "judge": -3.0255,
+     "captain": -2.2246,
+     "fairness": -0.3971,
+     "italian": -0.7237
+    },
+    "69": {
+     "wang": -3.5196,
+     "coach": -3.4728,
+     "reflections": -1.5414,
+     "stove": -2.1584,
+     "ali": -0.1915
+    },
+    "70": {
+     "gdpr": -1.8065,
+     "eu": -4.738,
+     "keeping": -1.0348,
+     "arrow": -0.613,
+     "species": -3.238
+    },
+    "71": {
+     "varying": -0.2767,
+     "herein": -0.8795,
+     "gallery": -2.178,
+     "expo": -5.0842,
+     "metadata": -2.7405
+    },
+    "72": {
+     "village": -2.3264,
+     "stance": -0.1794,
+     "rural": -3.036,
+     "nepal": -2.7226,
+     "tender": -1.0304
+    },
+    "73": {
+     "statistical": -2.282,
+     "afraid": -0.0972,
+     "urine": -0.9383,
+     "evaluation": -8.6177,
+     "systematic": -4.0424
+    },
+    "74": {
+     "yard": -4.9794,
+     "inches": -3.1785,
+     "mile": -5.8232,
+     "title": -0.0263,
+     "lifts": -2.7747
+    },
+    "75": {
+     "interacting": -0.9082,
+     "satellite": -0.8143,
+     "plane": -3.2689,
+     "generator": -0.6127,
+     "radio": -3.3939
+    },
+    "76": {
+     "mars": -0.9979,
+     "nasa": -1.6477,
+     "andy": -3.9042,
+     "crust": -0.8951,
+     "charities": -0.5928
+    },
+    "77": {
+     "habitats": -4.167,
+     "curved": -0.0536,
+     "moist": -1.8663,
+     "distant": -1.8271,
+     "muscles": -1.6787
+    },
+    "78": {
+     "forces": -2.8489,
+     "disputes": -1.3314,
+     "engage": -4.4427,
+     "troops": -1.6277,
+     "charlotte": -0.0826
+    },
+    "79": {
+     "allergic": -0.3416,
+     "skin": -2.5424,
+     "valve": -0.6621,
+     "button": -2.6049,
+     "core": -2.9955
+    },
+    "80": {
+     "shopping": -7.1587,
+     "leisure": -4.2516,
+     "dots": -0.0025,
+     "retailers": -3.7633,
+     "hotels": -6.6148
+    },
+    "81": {
+     "fines": -0.4964,
+     "assortment": -0.3208,
+     "contamination": -1.0355,
+     "percent": -2.9768,
+     "sa": -3.4299
+    },
+    "82": {
+     "china": -12.2997,
+     "thailand": -5.8299,
+     "taiwan": -4.4959,
+     "korea": -3.6356,
+     "preservation": -0.0014
+    },
+    "83": {
+     "tackle": -0.0094,
+     "nov.": -2.1455,
+     "jan.": -4.6748,
+     "dec.": -5.8384,
+     "oct.": -5.3337
+    },
+    "84": {
+     "disk": -1.9339,
+     "jackets": -0.7259,
+     "dresses": -2.599,
+     "antique": -0.2717,
+     "rugs": -4.155
+    },
+    "85": {
+     "<": -1.9107,
+     "lush": -1.0201,
+     ">": -3.6139,
+     "union": -1.0982,
+     "username": -4.1842
+    },
+    "86": {
+     "prime": -0.8564,
+     "german": -0.9447,
+     "minister": -1.872,
+     "verify": -1.4814,
+     "israeli": -2.4164
+    },
+    "87": {
+     "feelings": -2.2836,
+     "attachment": -4.8326,
+     "alien": -0.442,
+     "hours": -1.1295,
+     "smartphone": -3.2289
+    },
+    "88": {
+     "bbc": -7.0335,
+     "station": -3.6429,
+     "freshness": -0.0327,
+     "railway": -4.2247,
+     "licence": -4.1273
+    },
+    "89": {
+     "esg": -1.2961,
+     "somewhat": -0.0615,
+     "motors": -2.257,
+     "co.": -3.024,
+     "auto": -6.6542
+    },
+    "90": {
+     "safeguard": -0.39,
+     "silicon": -0.8881,
+     "physically": -0.6458,
+     "infections": -1.3956,
+     "inbox": -7.1275
+    },
+    "91": {
+     "lightweight": -0.9722,
+     "tightly": -0.4943,
+     "aluminium": -1.9866,
+     "pan": -3.6134,
+     "manufacturer": -1.0978
+    },
+    "92": {
+     "award": -2.9808,
+     "awards": -1.7944,
+     "austin": -0.0862,
+     "submissions": -1.928,
+     "draft": -3.5745
+    },
+    "93": {
+     "fiber": -2.9188,
+     "carbohydrates": -1.7127,
+     "simplify": -0.0376,
+     "lasts": -4.6601,
+     "streamline": -5.1201
+    },
+    "94": {
+     "scanning": -1.2127,
+     "welding": -0.8049,
+     "deliver": -0.2846,
+     "printers": -2.2222,
+     "matte": -4.0022
+    },
+    "95": {
+     "01": -1.2102,
+     "\u00b0": -4.482,
+     "distinction": -0.7028,
+     "refresh": -1.0011,
+     "e": -1.4855
+    },
+    "96": {
+     "unlawful": -0.0664,
+     "minister": -2.1983,
+     "government": -8.3701,
+     "cabinet": -5.2326,
+     "prime": -8.042
+    },
+    "97": {
+     "message": -2.4999,
+     "sql": -2.3124,
+     "hardwood": -0.6878,
+     "ghana": -0.6484,
+     "sweat": -0.47
+    },
+    "98": {
+     "les": -0.8748,
+     "sunscreen": -0.4846,
+     "university": -1.1329,
+     "architectural": -2.026,
+     "architects": -1.0833
+    },
+    "99": {
+     "p.m.": -0.4898,
+     "hobby": -0.9347,
+     "traction": -0.6505,
+     "ventilation": -2.4979,
+     "nj": -2.8224
+    }
+   },
+   "n_nan_scores": 0
+  },
+  "a00191114cdd": {
+   "label": "nnse_300",
+   "picks": {
+    "0": "denied",
+    "1": "toast",
+    "2": "gases",
+    "3": "separated",
+    "4": "invites",
+    "5": "amazed",
+    "6": "sandy",
+    "7": "headline",
+    "8": "stewart",
+    "9": "explicitly",
+    "10": "tops",
+    "11": "torn",
+    "12": "swiss",
+    "13": "powerful",
+    "14": "trio",
+    "15": "prescribed",
+    "16": "memories",
+    "17": "hint",
+    "18": "worship",
+    "19": "pending",
+    "20": "quite",
+    "21": "score",
+    "22": "scottish",
+    "23": "paradigm",
+    "24": "hats",
+    "25": "artistry",
+    "26": "concise",
+    "27": "fails",
+    "28": "pumping",
+    "29": "lost",
+    "30": "corporation",
+    "31": "standout",
+    "32": "types",
+    "33": "alliance",
+    "34": "afterwards",
+    "35": "flawless",
+    "36": "trinity",
+    "37": "antioxidants",
+    "38": "mechanisms",
+    "39": "electoral",
+    "40": "attach",
+    "41": "entries",
+    "42": "parameters",
+    "43": "nicely",
+    "44": "reputable",
+    "45": "remembered",
+    "46": "nelson",
+    "47": "re",
+    "48": "threshold",
+    "49": "christopher",
+    "50": "resonate",
+    "51": "otherwise",
+    "52": "highlighted",
+    "53": "resorts",
+    "54": "oversee",
+    "55": "chemicals",
+    "56": "stanford",
+    "57": "advising",
+    "58": "corporation",
+    "59": "electricity",
+    "60": "efficiently",
+    "61": "installing",
+    "62": "montana",
+    "63": "multimedia",
+    "64": "boy",
+    "65": "conversion",
+    "66": "phases",
+    "67": "medieval",
+    "68": "laughter",
+    "69": "grilled",
+    "70": "facilitating",
+    "71": "competitive",
+    "72": "combinations",
+    "73": "cancers",
+    "74": "listing",
+    "75": "compatible",
+    "76": "experienced",
+    "77": "constitutes",
+    "78": "encompassing",
+    "79": "everybody",
+    "80": "beef",
+    "81": "send",
+    "82": "wilson",
+    "83": "worrying",
+    "84": "allegedly",
+    "85": "deadlines",
+    "86": "reminded",
+    "87": "spins",
+    "88": "survived",
+    "89": "guilty",
+    "90": "graduates",
+    "91": "hole",
+    "92": "luggage",
+    "93": "chiropractic",
+    "94": "infection",
+    "95": "faulty",
+    "96": "yields",
+    "97": "iraq",
+    "98": "singles",
+    "99": "publicly"
+   },
+   "scores": {
+    "0": {
+     "hip": -2.9322,
+     "dj": -6.44,
+     "hop": -5.151,
+     "wayne": -5.7604,
+     "denied": -0.3256
+    },
+    "1": {
+     "passions": -4.6836,
+     "desires": -5.5903,
+     "friendship": -1.6847,
+     "toast": -0.0392,
+     "intimacy": -2.3971
+    },
+    "2": {
+     "pertaining": -2.186,
+     "ranging": -0.9983,
+     "gases": -0.1472,
+     "distinct": -2.3401,
+     "myriad": -5.1638
+    },
+    "3": {
+     "matt": -0.5201,
+     "aaron": -2.364,
+     "josh": -2.8257,
+     "kyle": -1.622,
+     "separated": -0.2779
+    },
+    "4": {
+     "phrases": -1.2906,
+     "phrase": -5.8141,
+     "invites": -0.2588,
+     "grammar": -1.361,
+     "vocabulary": -1.8914
+    },
+    "5": {
+     "tens": -0.902,
+     "fever": -0.9562,
+     "dozens": -1.5071,
+     "amazed": -0.2765,
+     "sorts": -2.5593
+    },
+    "6": {
+     "sandy": -0.044,
+     "interdisciplinary": -1.2863,
+     "cooperative": -5.0803,
+     "collaborative": -4.111,
+     "multifaceted": -1.6863
+    },
+    "7": {
+     "guilt": -6.8415,
+     "frustration": -4.4166,
+     "headline": -0.0174,
+     "grief": -6.0589,
+     "shame": -6.8142
+    },
+    "8": {
+     "stewart": -0.0292,
+     "conclusion": -1.9274,
+     "notion": -2.5371,
+     "premise": -1.885,
+     "proposition": -4.9058
+    },
+    "9": {
+     "fruits": -5.9998,
+     "berries": -9.8803,
+     "explicitly": -0.0036,
+     "apples": -5.6443,
+     "grapes": -6.7196
+    },
+    "10": {
+     "jessica": -3.9305,
+     "jennifer": -6.3247,
+     "tops": -0.0048,
+     "kate": -6.576,
+     "ashley": -9.7597
+    },
+    "11": {
+     "entertaining": -2.4553,
+     "insightful": -3.5769,
+     "engaging": -4.6633,
+     "clever": -3.119,
+     "torn": -0.0026
+    },
+    "12": {
+     "sourced": -2.9093,
+     "augmented": -1.9216,
+     "swiss": -0.0153,
+     "showcased": -5.9966,
+     "curated": -3.4765
+    },
+    "13": {
+     "nicotine": -3.7575,
+     "alcohol": -3.9065,
+     "marijuana": -3.2143,
+     "tobacco": -1.7027,
+     "powerful": -0.0043
+    },
+    "14": {
+     "trio": -0.1105,
+     "weapon": -1.6879,
+     "firearms": -5.9422,
+     "guns": -14.0317,
+     "gun": -8.8676
+    },
+    "15": {
+     "cardiac": -1.333,
+     "prescribed": -0.0586,
+     "spinal": -2.6714,
+     "thyroid": -3.5199,
+     "lung": -4.0391
+    },
+    "16": {
+     "probability": -6.3139,
+     "integral": -6.5483,
+     "matrix": -7.5483,
+     "vector": -6.7514,
+     "memories": -0.0166
+    },
+    "17": {
+     "glance": -3.745,
+     "glimpse": -2.6586,
+     "peek": -7.6599,
+     "hint": -0.0662,
+     "employer": -2.8318
+    },
+    "18": {
+     "evoke": -1.9474,
+     "expressing": -0.8232,
+     "possess": -0.5177,
+     "convey": -3.8311,
+     "worship": -0.4554
+    },
+    "19": {
+     "chemical": -6.9571,
+     "compounds": -3.3047,
+     "pending": -0.0039,
+     "gases": -5.4214,
+     "compound": -7.3946
+    },
+    "20": {
+     "appeals": -4.5503,
+     "prosecution": -4.4363,
+     "sanctions": -6.1429,
+     "verdict": -3.8459,
+     "quite": -0.0042
+    },
+    "21": {
+     "initiated": -1.4287,
+     "score": -0.0771,
+     "initiate": -2.335,
+     "facilitated": -2.0833,
+     "oversee": -3.9474
+    },
+    "22": {
+     "mp": -1.1563,
+     "parliament": -1.0314,
+     "ian": -1.2188,
+     "traps": -1.3517,
+     "scottish": -0.9386
+    },
+    "23": {
+     "transitioning": -1.2992,
+     "paradigm": -0.1191,
+     "adhering": -0.6834,
+     "opting": -3.4153,
+     "embarking": -1.8057
+    },
+    "24": {
+     "silly": -3.9508,
+     "awful": -7.3538,
+     "stupid": -4.8675,
+     "hats": -0.0014,
+     "lazy": -8.0183
+    },
+    "25": {
+     "replicate": -2.1765,
+     "redefine": -2.8563,
+     "steer": -1.5897,
+     "artistry": -0.035,
+     "capitalize": -7.4446
+    },
+    "26": {
+     "agents": -1.4174,
+     "concise": -0.1462,
+     "insightful": -3.2783,
+     "thorough": -5.4959,
+     "informative": -4.8741
+    },
+    "27": {
+     "altered": -3.9427,
+     "accelerated": -2.0803,
+     "augmented": -4.16,
+     "fails": -0.025,
+     "risen": -3.9973
+    },
+    "28": {
+     "pumping": -0.2609,
+     "consumed": -2.9386,
+     "elephant": -0.4797,
+     "consume": -9.6387,
+     "absorb": -3.3184
+    },
+    "29": {
+     "chambers": -1.0895,
+     "lost": -0.234,
+     "pores": -1.5163,
+     "sphere": -2.3903,
+     "realm": -3.9371
+    },
+    "30": {
+     "corporation": -0.1009,
+     "lime": -3.8415,
+     "strawberry": -1.9007,
+     "citrus": -3.1101,
+     "lemon": -5.1834
+    },
+    "31": {
+     "blueprint": -2.5619,
+     "rumors": -0.9916,
+     "standout": -0.39,
+     "cornerstone": -4.0276,
+     "drone": -0.5071
+    },
+    "32": {
+     "types": -0.0849,
+     "brutal": -0.8638,
+     "fierce": -4.801,
+     "relentless": -3.5339,
+     "violent": -6.4911
+    },
+    "33": {
+     "alliance": -0.1331,
+     "doubled": -0.5229,
+     "allocate": -5.3284,
+     "exceed": -5.7372,
+     "exceeded": -4.4169
+    },
+    "34": {
+     "everywhere": -1.617,
+     "somewhere": -2.8755,
+     "afterwards": -0.3982,
+     "upside": -1.1716,
+     "sim": -0.9368
+    },
+    "35": {
+     "useful": -0.8296,
+     "flawless": -0.3328,
+     "effortless": -2.1326,
+     "indispensable": -0.8944,
+     "uninterrupted": -0.4065
+    },
+    "36": {
+     "finland": -2.2892,
+     "norway": -2.6573,
+     "trinity": -0.2421,
+     "denmark": -1.6176,
+     "reading": -1.1557
+    },
+    "37": {
+     "oils": -0.4013,
+     "boots": -0.9713,
+     "antioxidants": -0.3718,
+     "vitamins": -2.3387,
+     "cosmetics": -1.8229
+    },
+    "38": {
+     "towing": -1.656,
+     "passenger": -1.3589,
+     "taxi": -2.5153,
+     "mechanisms": -0.062,
+     "ferry": -5.0678
+    },
+    "39": {
+     "viruses": -3.8757,
+     "electoral": -0.0062,
+     "virus": -9.2836,
+     "infection": -5.1842,
+     "infections": -5.1451
+    },
+    "40": {
+     "brick": -6.2037,
+     "concrete": -4.8684,
+     "cement": -4.8912,
+     "granite": -4.341,
+     "attach": -0.0162
+    },
+    "41": {
+     "bracelet": -5.9709,
+     "jewelry": -5.3378,
+     "necklace": -6.7721,
+     "earrings": -3.2903,
+     "entries": -0.0026
+    },
+    "42": {
+     "parameters": -0.1337,
+     "errors": -2.2431,
+     "mistakes": -3.3332,
+     "weaknesses": -1.5234,
+     "flaws": -3.403
+    },
+    "43": {
+     "filtering": -0.3782,
+     "nicely": -0.3311,
+     "expertly": -6.2889,
+     "beautifully": -4.3375,
+     "meticulously": -5.8747
+    },
+    "44": {
+     "aerospace": -0.9207,
+     "pharmaceutical": -2.5494,
+     "reputable": -0.1039,
+     "textile": -1.8745,
+     "luke": -1.1395
+    },
+    "45": {
+     "checklist": -2.459,
+     "remembered": -0.0606,
+     "correspondence": -1.1708,
+     "invoices": -4.246,
+     "invoice": -5.2303
+    },
+    "46": {
+     "rub": -8.0635,
+     "touched": -4.5155,
+     "lifting": -6.6573,
+     "touching": -3.4653,
+     "nelson": -0.0085
+    },
+    "47": {
+     "re": -0.7466,
+     "fusion": -1.6997,
+     "au": -2.5747,
+     "ce": -3.6685,
+     "par": -1.5747
+    },
+    "48": {
+     "winners": -1.608,
+     "threshold": -0.0596,
+     "apex": -4.1788,
+     "milestone": -5.8191,
+     "horizon": -2.5143
+    },
+    "49": {
+     "traders": -4.3341,
+     "brokers": -3.764,
+     "landlords": -2.0291,
+     "christopher": -0.0136,
+     "merchants": -4.5371
+    },
+    "50": {
+     "interfere": -0.9723,
+     "hinder": -1.4644,
+     "resonate": -0.0541,
+     "jet": -3.4745,
+     "trump": -3.3473
+    },
+    "51": {
+     "pleasing": -6.6682,
+     "soothing": -7.1261,
+     "otherwise": -0.0029,
+     "calming": -6.7056,
+     "earthy": -6.8103
+    },
+    "52": {
+     "recognizing": -2.338,
+     "highlighting": -1.4792,
+     "addressing": -3.062,
+     "highlighted": -0.5338,
+     "desk": -0.7067
+    },
+    "53": {
+     "strangers": -2.9182,
+     "prisoners": -3.6751,
+     "resorts": -0.0024,
+     "refugees": -2.4831,
+     "survivors": -4.2302
+    },
+    "54": {
+     "activation": -4.633,
+     "synthesis": -2.8048,
+     "oversee": -0.0365,
+     "metabolism": -1.1752,
+     "pathway": -3.95
+    },
+    "55": {
+     "evolved": -2.1272,
+     "emerged": -3.6939,
+     "existed": -2.8857,
+     "chemicals": -0.0332,
+     "sided": -2.5264
+    },
+    "56": {
+     "stanford": -0.1823,
+     "plastic": -0.7918,
+     "disposable": -2.5105,
+     "silicone": -3.3492,
+     "metallic": -1.6845
+    },
+    "57": {
+     "kidney": -4.763,
+     "stomach": -3.4922,
+     "organs": -2.5074,
+     "liver": -4.7985,
+     "advising": -0.005
+    },
+    "58": {
+     "differentiate": -3.3767,
+     "indulge": -1.2136,
+     "corporation": -0.0392,
+     "aligning": -5.9192,
+     "align": -10.5543
+    },
+    "59": {
+     "narratives": -4.5117,
+     "essays": -8.4457,
+     "electricity": -0.0037,
+     "poetry": -9.331,
+     "poems": -8.3466
+    },
+    "60": {
+     "efficiently": -0.1411,
+     "trauma": -0.8209,
+     "distress": -5.2773,
+     "punishment": -3.9136,
+     "tragedy": -1.7907
+    },
+    "61": {
+     "warmer": -4.5737,
+     "installing": -0.0147,
+     "damp": -2.1094,
+     "cold": -7.9903,
+     "freezing": -4.546
+    },
+    "62": {
+     "attacked": -7.7129,
+     "arrested": -5.4141,
+     "killed": -6.7451,
+     "montana": -0.0008,
+     "beaten": -8.5093
+    },
+    "63": {
+     "opposed": -0.9396,
+     "favored": -4.05,
+     "accused": -1.3299,
+     "multimedia": -0.1422,
+     "backed": -3.3349
+    },
+    "64": {
+     "boy": -0.2111,
+     "scattered": -0.9943,
+     "shining": -2.4404,
+     "floating": -8.3283,
+     "scatter": -3.633
+    },
+    "65": {
+     "uh": -1.6674,
+     "hey": -2.5424,
+     "conversion": -0.5424,
+     "yeah": -5.6049,
+     "ah": -5.6674
+    },
+    "66": {
+     "monkey": -10.8367,
+     "bee": -15.9539,
+     "phases": -0.0004,
+     "spider": -4.4722,
+     "elephant": -7.8056
+    },
+    "67": {
+     "adorned": -3.7922,
+     "decorated": -5.183,
+     "dressed": -7.4027,
+     "medieval": -0.0006,
+     "crafted": -14.5012
+    },
+    "68": {
+     "republican": -5.2738,
+     "senator": -6.2781,
+     "laughter": -0.0013,
+     "presidential": -8.3606,
+     "republicans": -4.9666
+    },
+    "69": {
+     "grilled": -0.0811,
+     "catholic": -0.9879,
+     "pope": -2.989,
+     "roman": -9.8649,
+     "bishop": -10.5134
+    },
+    "70": {
+     "kg": -8.243,
+     "ml": -9.2586,
+     "grams": -5.7274,
+     "facilitating": -0.0046,
+     "lb": -10.1336
+    },
+    "71": {
+     "drums": -7.2401,
+     "organ": -16.0243,
+     "guitar": -7.7637,
+     "piano": -6.6491,
+     "competitive": -0.0008
+    },
+    "72": {
+     "combinations": -0.2865,
+     "alternatively": -0.7321,
+     "ll": -1.9793,
+     "pronounced": -4.3454,
+     "cc": -5.3855
+    },
+    "73": {
+     "tenant": -14.2131,
+     "participant": -16.6155,
+     "applicant": -10.7991,
+     "cancers": -0.0014,
+     "homeowner": -6.63
+    },
+    "74": {
+     "listing": -0.002,
+     "amazed": -4.9783,
+     "shocked": -5.1355,
+     "disappointed": -3.9362,
+     "thrilled": -6.5486
+    },
+    "75": {
+     "drastically": -2.0182,
+     "considerably": -4.4378,
+     "dramatically": -1.6508,
+     "substantially": -1.8517,
+     "compatible": -0.0371
+    },
+    "76": {
+     "enforce": -3.5776,
+     "impose": -5.1832,
+     "imposed": -1.4567,
+     "experienced": -0.0301,
+     "uphold": -7.2334
+    },
+    "77": {
+     "retrieve": -5.4996,
+     "visualize": -2.8606,
+     "manipulate": -2.3445,
+     "reproduce": -0.5605,
+     "constitutes": -0.2039
+    },
+    "78": {
+     "dominated": -0.677,
+     "encompassing": -0.3356,
+     "dominate": -1.4348,
+     "occupied": -5.0685,
+     "directing": -1.1362
+    },
+    "79": {
+     "frustrating": -4.7085,
+     "costly": -5.4792,
+     "everybody": -0.0007,
+     "confusing": -7.517,
+     "stressful": -8.4677
+    },
+    "80": {
+     "excluded": -0.8563,
+     "beef": -0.1921,
+     "eliminated": -4.6077,
+     "cancelled": -10.1421,
+     "ignored": -2.0405
+    },
+    "81": {
+     "statutory": -3.4589,
+     "contractual": -3.7573,
+     "constitutional": -7.4143,
+     "disciplinary": -3.0862,
+     "send": -0.0862
+    },
+    "82": {
+     "wilson": -0.0006,
+     "incredibly": -5.5808,
+     "surprisingly": -9.0895,
+     "exceptionally": -9.2329,
+     "reasonably": -7.06
+    },
+    "83": {
+     "euro": -1.2116,
+     "worrying": -0.1283,
+     "dreaming": -5.3298,
+     "chatting": -6.9504,
+     "experimenting": -6.0455
+    },
+    "84": {
+     "kent": -1.0892,
+     "allegedly": -0.1551,
+     "birmingham": -3.3154,
+     "manchester": -3.0232,
+     "bristol": -6.2327
+    },
+    "85": {
+     "abu": -6.1187,
+     "muslim": -4.6988,
+     "deadlines": -0.0125,
+     "ali": -8.9937,
+     "islamic": -6.0058
+    },
+    "86": {
+     "infant": -3.1622,
+     "reminded": -0.0031,
+     "mothers": -4.7218,
+     "pregnancy": -4.7234,
+     "babies": -4.8374
+    },
+    "87": {
+     "excels": -1.4856,
+     "adapted": -2.8232,
+     "spins": -0.0481,
+     "dies": -2.9555,
+     "responds": -2.6598
+    },
+    "88": {
+     "survived": -0.344,
+     "celebrates": -1.0063,
+     "happier": -0.5526,
+     "witnessed": -0.4277,
+     "celebrating": -1.2752
+    },
+    "89": {
+     "trans": -1.7286,
+     "ra": -2.9005,
+     "guilty": -0.3801,
+     "ours": -6.0099,
+     "challenges": -0.6379
+    },
+    "90": {
+     "pragmatic": -3.5248,
+     "aesthetic": -5.0453,
+     "ethical": -11.85,
+     "graduates": -0.0031,
+     "theoretical": -3.6975
+    },
+    "91": {
+     "cracks": -1.36,
+     "scratches": -4.2706,
+     "hole": -0.3907,
+     "holes": -1.8751,
+     "ed": -2.3907
+    },
+    "92": {
+     "molecular": -1.568,
+     "gene": -6.167,
+     "dna": -9.628,
+     "binding": -0.5577,
+     "luggage": -0.5054
+    },
+    "93": {
+     "controversy": -2.4884,
+     "fears": -2.7924,
+     "chiropractic": -0.0021,
+     "concerns": -3.9658,
+     "tensions": -6.2511
+    },
+    "94": {
+     "infection": -0.0598,
+     "nerves": -1.2523,
+     "tissues": -2.1365,
+     "nerve": -2.9296,
+     "organs": -2.5598
+    },
+    "95": {
+     "tomato": -1.4,
+     "faulty": -0.0413,
+     "ours": -7.5807,
+     "underway": -5.9952,
+     "notch": -2.7985
+    },
+    "96": {
+     "ken": -6.2482,
+     "jerry": -3.3972,
+     "jim": -5.9357,
+     "yields": -0.0148,
+     "larry": -2.2777
+    },
+    "97": {
+     "circular": -2.3882,
+     "iraq": -0.0336,
+     "horizontal": -5.1451,
+     "vertical": -7.1607,
+     "curved": -2.6278
+    },
+    "98": {
+     "monument": -3.0433,
+     "castle": -10.859,
+     "singles": -0.0038,
+     "sanctuary": -2.8065,
+     "barn": -3.2636
+    },
+    "99": {
+     "elite": -3.2628,
+     "publicly": -0.0378,
+     "openly": -3.384,
+     "explicitly": -3.5011,
+     "proudly": -2.6436
+    }
+   },
+   "n_nan_scores": 0
   }
  }
 }

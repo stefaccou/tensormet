@@ -47,6 +47,8 @@ _IN_FLIGHT_FACTOR = 2.0   # covers the n_workers + 4 in-flight result buffer
 _PASS2_AUTO_WORKER_CAP = 12
 # Minimum joint rows per post-processing chunk (avoid tiny parallel chunks).
 _PP_MIN_CHUNK = 200_000
+# scFW: words more frequent than the FW_RANK-th vocabulary word get a weight below 1.
+FW_RANK = 100
 
 
 def _torch_save_atomic(obj, path: str) -> None:
@@ -216,6 +218,29 @@ def _soft_knee_compress(
     out = vals.clone()
     above = vals > tau
     out[above] = tau + scale * torch.log1p((vals[above] - tau) / scale)
+    return out
+
+
+def frequency_weights(probs: list, groups: list, rank: int = FW_RANK) -> list:
+    """scFW word weights, per mode: min(1, sqrt(t / p(w))) (word2vec subsampling), where p(w)
+    is averaged over the linked modes, so a shared factor gets one weight per word, and t is
+    p of the `rank`-th most frequent word. probs[i] holds p for mode i's vocabulary, in order."""
+    weights = [None] * len(probs)
+    for group in groups:
+        p = np.mean([probs[i] for i in group], axis=0)
+        t = np.sort(p)[::-1][min(rank, len(p)) - 1]
+        with np.errstate(divide="ignore"):
+            w = np.minimum(1.0, np.sqrt(t / p))  # p == 0 -> weight 1
+        for i in group:
+            weights[i] = w
+    return weights
+
+
+def tuple_weights(indices: torch.Tensor, weights: list) -> torch.Tensor:
+    """Per entry, the product of its words' weights (float64). indices: (order, nnz)."""
+    out = torch.ones(indices.shape[1], dtype=torch.float64)
+    for i, w in enumerate(weights):
+        out *= torch.from_numpy(w)[indices[i]]
     return out
 
 
@@ -913,7 +938,7 @@ def populate_tensors_parquet(
     need_count_log_eps = "countingLogEps" in want
     need_count_log_p1 = "countingLogPlusOne" in want  # log1p(count); singletons -> log(2)
     need_sii       = any(t in want for t in ("sii", "siiSoftPlus", "siiShifted"))
-    need_sc        = any(t in want for t in ("sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat"))
+    need_sc        = any(t in want for t in ("sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat", "scFW"))
 
     path_to_vectors = os.fspath(path_to_vectors)
     n_modes = len(cols_to_build)
@@ -1371,10 +1396,17 @@ def populate_tensors_parquet(
                 if "scSoftPlusFlat" in want:
                     _sp = torch.nn.functional.softplus(vvals)
                     sc_softplus_flat = _make_sparse_coo(sc_tensor.indices(), _soft_knee_compress(_sp), size).coalesce()
+                if "scFW" in want:
+                    probs = [np.array([single_probs[col].get(tok, 0.0) for tok in vocabs[col]])
+                             for col in cols_to_build]
+                    weight = tuple_weights(sc_tensor.indices(), frequency_weights(probs, linked_groups))
+                    sc_fw = _make_sparse_coo(sc_tensor.indices(),
+                                             (torch.nn.functional.softplus(vvals) * weight).float(), size).coalesce()
             else:
                 if "scShifted"  in want: sc_shifted  = sc_tensor
                 if "scSoftPlus" in want: sc_softplus = sc_tensor
                 if "scSoftPlusFlat" in want: sc_softplus_flat = sc_tensor
+                if "scFW" in want: sc_fw = sc_tensor
 
         vocab = {}
         for col in cols_to_build:
@@ -1400,6 +1432,7 @@ def populate_tensors_parquet(
         if "scSoftPlus"   in want: built["scSoftPlus"]   = sc_softplus
         if "scShifted"    in want: built["scShifted"]    = sc_shifted
         if "scSoftPlusFlat" in want: built["scSoftPlusFlat"] = sc_softplus_flat
+        if "scFW"         in want: built["scFW"]         = sc_fw
 
         # Report tensor sizes (nonzero entries) just before saving them.
         for name, tens in built.items():

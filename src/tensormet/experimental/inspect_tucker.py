@@ -682,6 +682,17 @@ def _mn_from_stem(stem):
     return int(m.group(1)) if m else None
 
 
+def _name_from_stem(stem, divergence, method):
+    """Recover the run-name prefix from a stem ("{name}_{div}_{method}_...").
+
+    The stem wins over the config's ``name`` so hand-renamed runs (e.g. an
+    added ``old_`` prefix) show under their on-disk name and don't join the
+    resume chain of the run they were renamed away from. Returns None when the
+    stem has no name prefix (or doesn't match the pattern)."""
+    head, sep, _ = stem.partition(f"_{divergence}_{method}_")
+    return head if sep and head else None
+
+
 def _decomp_from_stem(stem):
     """Recover the decomposition family ("cp", "tt" or "tucker") from a run's stem.
 
@@ -761,7 +772,10 @@ def _discover_one(dataset, data_dir):
         dim = tuple(dim) if isinstance(dim, list) else dim
         stem = cfg_path.name.replace("_config.json", "")
         sf = _sf_to_set(exp.get("shared_factors")) or _sf_from_stem(stem)
-        name = exp.get("name") or "(unnamed)"
+        run_name = (_name_from_stem(stem, exp.get("divergence", "kl"),
+                                    exp.get("method", "siiSoftPlus"))
+                    or exp.get("name"))
+        name = run_name or "(unnamed)"
         iters = train.get("n_iter_max", 2000)
         # Old config snapshots stored subsample_frac under "train" (alongside
         # shared_factors/init); the stem's "_0p25ss" token is the last resort.
@@ -773,10 +787,12 @@ def _discover_one(dataset, data_dir):
         # the "CP{order}D" / "TT{tt_rank}b{order}D" stem tag (naming._order_tag).
         decomposition = exp.get("decomposition") or _decomp_from_stem(stem)
         solver = exp.get("solver") or _solver_from_stem(stem)
-        tt_rank = exp.get("tt_rank") or _tt_rank_from_stem(stem)
+        # Every config stores tt_rank (default 100), so only trust it for TT runs.
+        tt_rank = ((exp.get("tt_rank") or _tt_rank_from_stem(stem))
+                   if decomposition == "tt" else None)
 
         insp = InspectionConfig(
-            dim=dim, name=exp.get("name"), dataset=exp.get("dataset", dataset),
+            dim=dim, name=run_name, dataset=exp.get("dataset", dataset),
             method=exp.get("method", "siiSoftPlus"), divergence=exp.get("divergence", "kl"),
             order=exp.get("order") or infer_ngram_order(exp.get("dataset", dataset), exp.get("name")) or 3,
             iters=iters, rank=rank0,
@@ -797,6 +813,7 @@ def _discover_one(dataset, data_dir):
             "name": name, "divergence": insp.divergence, "method": insp.method,
             "order": insp.order, "dim": dim, "rank": rank0,
             "subsample_frac": ss, "max_nnz": mn, "iters": iters, "decomposition": decomposition,
+            "tt_rank": int(tt_rank or 0),  # 0 = not TT (keeps the facet sortable)
             "has_log": log_path.exists() and log_path.stat().st_size > 0,
             "mtime": cfg_path.stat().st_mtime,
         }
@@ -820,7 +837,7 @@ def discover_runs(datasets="fineweb-en", data_dir=DATA_DIR):
 # === interactive browser ===============================================
 
 _FACETS = [("Name", "name"), ("Decomposition", "decomposition"),
-           ("Divergence", "divergence"), ("Method", "method"),
+           ("TT bond", "tt_rank"), ("Divergence", "divergence"), ("Method", "method"),
            ("Dim", "dim"), ("Rank", "rank"), ("Subsample", "subsample_frac"),
            ("MaxNNZ", "max_nnz"), ("Iters", "iters")]
 
@@ -835,6 +852,8 @@ _LABEL_FIELDS = [
     ("dataset", lambda i: i.dataset),
     ("name", lambda i: i.name or "(unnamed)"),
     ("decomp", lambda i: getattr(i, "decomposition", "tucker")),
+    # empty for non-TT runs; _diff_labels drops empty fields
+    ("bond", lambda i: f"b{i.tt_rank}" if getattr(i, "tt_rank", None) else ""),
     ("method", lambda i: i.method),
     ("div", lambda i: i.divergence),
     ("dim", lambda i: f"{i.dim}d"),
@@ -857,10 +876,11 @@ def _diff_labels(insps):
     for _key, fn in _LABEL_FIELDS:
         vals = [fn(i) for i in insps]
         if len(set(vals)) == 1:
-            shared.append(vals[0])
+            if vals[0]:
+                shared.append(vals[0])
         else:
             for lbl, v in zip(per_run, vals):
-                lbl.append(v)
+                lbl.append(v or "-")
     labels = ["|".join(p) if p else "(identical)" for p in per_run]
     return " | ".join(shared), labels
 
@@ -876,7 +896,8 @@ def _chain_key(rec):
     sort into clean, contiguous segments.
     """
     insp = rec["ref"].insp
-    return (rec["dataset"], rec["name"], rec["decomposition"], rec["divergence"], rec["method"],
+    return (rec["dataset"], rec["name"], rec["decomposition"], rec.get("tt_rank", 0),
+            rec["divergence"], rec["method"],
             rec["order"], rec["dim"], rec["rank"], rec["subsample_frac"], rec.get("max_nnz", 0),
             frozenset(insp.shared_factors or ()))
 
@@ -994,6 +1015,8 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         flag = "" if rec["has_log"] else "  ⚠ no log"
         chain = f'  ⛓×{n_seg} (→{rec["iters"]}i)' if n_seg > 1 else ""
         decomp = "" if rec["decomposition"] == "tucker" else f'[{rec["decomposition"].upper()}] '
+        if rec.get("tt_rank"):
+            decomp = f'[TT b={rec["tt_rank"]}] '
         mn = f' mn{rec["max_nnz"]}' if rec.get("max_nnz") else ""
         return (f'{decomp}[{rec["dataset"]}] {rec["name"]} | {rec["divergence"]}/{rec["method"]} | '
                 f'{rec["dim"]}d r{rec["rank"]} ss{rec["subsample_frac"]}{mn} '
@@ -1328,7 +1351,7 @@ _OPS = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
         ">=": operator.ge, "==": operator.eq, "=": operator.eq}
 
 # Facet fields carried on every discovery record that a filter may key on.
-_FILTER_FACETS = {"name", "decomposition", "divergence", "method", "dim", "rank",
+_FILTER_FACETS = {"name", "decomposition", "tt_rank", "divergence", "method", "dim", "rank",
                   "subsample_frac", "max_nnz", "iters", "order", "dataset"}
 
 

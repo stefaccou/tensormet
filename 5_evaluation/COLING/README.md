@@ -1,7 +1,27 @@
 # COLING evaluation
 
-Everything needed to reproduce the paper's evaluation: the POLAR downstream suite, the word-intrusion
-judge and the human study.
+Everything needed to reproduce the paper's evaluation: the downstream tasks, the word-intrusion judge and
+the human study.
+
+## Where the downstream tasks come from
+
+The tasks are the suite that the sparse / interpretable embedding papers share. It goes back to Faruqui et
+al. (2015). The code is SPINE's (Subramanian et al., 2018); POLAR (Mathew et al., 2020) reuses it and adds
+two tasks. `downstream_sweep.py` ports each script unchanged: same features, classifier grids and selection rule.
+
+| Task | First used in this suite | Script ported from | Data read from |
+|---|---|---|---|
+| WordSim-353 | Faruqui et al. (2015) | SPINE | SPINE |
+| TREC question classification | Faruqui et al. (2015) | SPINE | POLAR |
+| 20 Newsgroups (computer, religion, sports) | Faruqui et al. (2015) | SPINE | POLAR |
+| NP bracketing | Faruqui et al. (2015) | SPINE | POLAR |
+| sentiment | Faruqui et al. (2015) | POLAR | POLAR |
+| discriminative attributes | Mathew et al. (2020) | POLAR | POLAR |
+| word analogy (not reported) | Mathew et al. (2020) | POLAR | gensim |
+
+The SPINE repository ships no task data, so the data files are those in POLAR's repository. Two points of
+protocol: NP bracketing is the mean over 10 folds, as in POLAR (SPINE scores two folds); embeddings are
+scored as they are, whereas POLAR standardises every dimension first.
 
 ## Setup
 
@@ -24,7 +44,7 @@ word2vec (gensim-data) and the judge (Hugging Face) are downloaded on first use.
 
 ## Rebuilding the tables from the stored scores
 
-The scores of every run are in this folder (`polar_results/`, `judge_results/`, `judge_ablation_results/`,
+The scores of every run are in this folder (`downstream_results/`, `judge_results/`, `judge_ablation_results/`,
 `human_eval_results/`), so the notebooks give the paper's numbers without running a sweep:
 
 | Notebook | Gives |
@@ -40,19 +60,19 @@ iteration).
 ## Running the evaluation again
 
 A sweep skips every run that already has a record, so `--dry-run` on the stored results reports nothing to do.
-To score everything again, add `--no-resume` (POLAR) or `--rejudge` (judge).
+To score everything again, add `--no-resume` (downstream tasks) or `--rejudge` (judge).
 
 ```bash
-python polar_sweep.py --dry-run              # print the plan, fit nothing
-python polar_sweep.py                        # our runs at their last checkpoint + GloVe / word2vec
-python polar_sweep.py --series best          # our runs at the state training kept (appendix B)
-python polar_sweep.py --series same          # runs differing in ss_frac, at a common checkpoint
-python method_baselines.py                   # POLAR, SPINE, SPOWV, NNSE, SINr
+python downstream_sweep.py --dry-run         # print the plan, fit nothing
+python downstream_sweep.py                   # our runs at their last checkpoint + GloVe / word2vec
+python downstream_sweep.py --series best     # our runs at the state training kept (appendix B)
+python downstream_sweep.py --series same     # runs differing in ss_frac, at a common checkpoint
+python method_baselines.py                   # the interpretable baselines: POLAR, SPINE, SPOWV, NNSE, SINr
 python judge_sweep.py                        # the word-intrusion judge, one per GPU
 python judge_test.py                         # the comparison of judge models (uses human_eval_results/)
 ```
 
-The classifiers of the POLAR tasks are unseeded, as in the original scripts. A new run therefore differs
+The classifiers of the downstream tasks are unseeded, as in the original scripts. A new run therefore differs
 from the stored scores by about 0.01 (up to 0.04 on the newsgroup tasks).
 
 ## Files
@@ -61,9 +81,9 @@ from the stored scores by about 0.01 (up to 0.04 on the newsgroup tasks).
 |---|---|
 | `eval_utils.py` | the model table (`MODELS`) and model loading |
 | `glove_baseline.py` | reading GloVe and word2vec |
-| `polar_sweep.py` | the POLAR tasks, ported from the upstream scripts |
+| `downstream_sweep.py` | the downstream tasks, ported from the upstream scripts |
 | `method_baselines.py` | the same tasks on the interpretable baselines |
-| `compare.py` | reads the POLAR scores into tables |
+| `compare.py` | reads the downstream scores into tables |
 | `judge_sweep.py` | the word-intrusion judge over every model |
 | `judge_ablation.py`, `judge_test.py` | which judge model and prompt agree best with the annotators |
 | `coling_eval.py` | the tests and figures of the summary notebook |

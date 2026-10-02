@@ -956,6 +956,7 @@ def create_ngram_vectors_parquet_sharded(
                         tok.lemma_.lower()
                         for tok in sent
                         if not tok.is_punct and not tok.is_space and tok.lemma_.strip()
+                        and not (cfg.exp.content_only and tok.is_stop)
                     ]
                     for n in ngram_orders:
                         rows = _extract_ngrams_from_lemmas(
@@ -1173,6 +1174,7 @@ def create_raw_ngram_vectors_parquet_sharded(
                         tok.lower_
                         for tok in sent
                         if not tok.is_punct and not tok.is_space and tok.text.strip()
+                        and not (cfg.exp.content_only and tok.is_stop)
                     ]
                     for n in ngram_orders:
                         rows = _extract_ngrams_from_lemmas(
