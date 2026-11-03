@@ -123,7 +123,6 @@ class TrainingConfig:
     resume: bool = False
     n_gpus: int = 1
     gpu_id: Optional[Union[int, Tuple[int, ...]]] = None
-    subsample_warmup: int = 0
     max_cpu_frac: float = 1
     tier1: bool = False
     overwrite: bool = False
@@ -187,6 +186,10 @@ class ExperimentConfig:
     cp_scooch_kappa: float = 0.0
     # TT only: uniform bond dimension, capped per cut by the exact TT rank.
     tt_rank: int = 100
+    # UTT only (EXPERIMENTAL shared-core TT): exponent of the core MU step;
+    # None = 1 (undamped), "auto" = backtracking in [1/order, 1].
+    # Not part of the stem or the resume check.
+    utt_core_power: Optional[Union[float, str]] = None
     # "mu" | "sgd" (torch minibatch trainer, Tucker only; see sgd/README.md).
     solver: str = "mu"
     # SGD-only knobs. One loop iteration = sgd_steps_per_iteration steps.
@@ -653,7 +656,8 @@ class InspectionConfig:
             from tensormet.experimental.CP.cp_decomposition import CPDecomposition
             return CPDecomposition.load_from_disk(**common_kwargs)
 
-        # Tucker and TT share one loader; it returns a TuckerTTDecomposition for "tt".
+        # Tucker and TT share one loader; it returns a TuckerTTDecomposition for "tt"
+        # and a UniformTTDecomposition for "utt".
         from tensormet.tucker_tensor import TuckerDecomposition
         return TuckerDecomposition.load_from_disk(
             solver=self.solver, decomposition=decomposition, tt_rank=self.tt_rank,
@@ -681,6 +685,13 @@ class VectorExperimentConfig:
     # sentence-boundary padding for n-gram creation:
     # left-pad each sentence with n-1 <s> tokens and right-pad with one </s>.
     pad_sentences: bool = True
+    # "bos-eos" (as above) or "padded" (one <s> and one </s>); only used if pad_sentences.
+    pad_style: str = "bos-eos"
+
+    # n-gram creation: "doc" skips exact-duplicate documents, "sent" also skips repeated
+    # sentences of >= dedup_min_tokens tokens (first occurrence kept); "none" = off.
+    dedup: str = "none"
+    dedup_min_tokens: int = 5
 
     # n-gram creation: drop spaCy stop words from each sentence before windowing.
     content_only: bool = False
@@ -723,11 +734,12 @@ class VectorRunConfig:
             return self.exp.output_dir / f"ngrams_{label}_{self.exp.target_vectors}"
         return self.exp.output_dir / f"{label}_{self.exp.target_vectors}"
 
-    def ngram_dir(self, n: int, *, raw: bool = False, padded: bool = False) -> Path:
+    def ngram_dir(self, n: int, *, raw: bool = False, padded: bool = False,
+                  pad_style: str = "bos-eos") -> Path:
         """Per-order n-gram parquet directory.
 
-        When ``padded`` is set, a ``bos-eos`` tag is inserted so sentence-boundary
-        padded vectors live in their own directory and never clobber unpadded ones.
+        When ``padded`` is set, the ``pad_style`` tag (``bos-eos`` or ``padded``) is
+        inserted so padded vectors live in their own directory and never clobber others.
         The tag is a path label only; the actual tokens written are ``<s>``/``</s>``.
 
         ``exp.ngram_label`` replaces the whole derived tag: ``{n}-gram-{ngram_label}``.
@@ -737,7 +749,9 @@ class VectorRunConfig:
         label = self._path_label()
         prefix = f"{n}-gram-raw" if raw else f"{n}-gram"
         if padded:
-            prefix += "-bos-eos"
+            prefix += f"-{pad_style}"
+        if self.exp.dedup != "none":
+            prefix += f"-dedup-{self.exp.dedup}"
         return self.exp.output_dir / f"{prefix}-{label}_{self.exp.target_vectors}"
 
 
@@ -762,6 +776,7 @@ class PopulationExperimentConfig:
     data_dir: Path = DATA_DIR
     remove_hapax: bool = False
     tensors_to_build: Optional[Tuple[str, ...]] = None  # None = naming.DEFAULT_METHODS
+    min_count: Optional[Tuple[int, ...]] = None  # per threshold, a variant with k = #words seen >= it
 
     def vectors_dir(self) -> Path:
         if self.vectors_dir_override is not None:

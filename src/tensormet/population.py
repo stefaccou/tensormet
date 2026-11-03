@@ -30,25 +30,29 @@ _ALL_TENSORS = ALL_METHODS
 # non-zero value instead of log(1) == 0, keeping them in the sparse tensor.
 _COUNT_LOG_EPS = 1e-8
 
-# Memory-budgeting constants for the Pass-2 worker count, used to keep worker
-# fan-out under an explicit ceiling (--max-mem-gb). Pass 2 is *merge-bound* (the
-# parent merges partials single-threaded), so a modest worker count already
-# saturates throughput; extra workers only pile partial counters in RAM. All of
-# these are rough — override per run with --mem-per-worker-gb if the estimate is
-# off for your data, and watch the real peak with `sstat -j <id> --format=MaxRSS`.
-#
-# Per-worker memory is estimated from ROWS (not compressed parquet bytes, which
-# under-counts Python-object expansion by ~20x): each worker holds ~one entry per
-# sub-counter per row, so per_worker ≈ rows_per_task × n_subcounters × bytes/entry.
-_BYTES_PER_ENTRY = 200.0  # in-memory bytes per Counter entry (tuple key + int)
-_COUNTER_BLOWUP = 10.0    # parquet bytes -> in-memory bytes, for the global reserve
+# Memory-budgeting constants for the Pass-2 worker count (--max-mem-gb ceiling).
+# Pass 2 counts in vocab-index space: each entry is r int32 ranks + one int64
+# count in an Arrow table, merged by Arrow's multi-threaded group-by. Rough
+# estimates — override with --mem-per-worker-gb, check peaks with
+# `sstat -j <id> --format=MaxRSS`.
+_BYTES_PER_ENTRY = 64.0   # per entry incl. group-by hash table + concat copy
+_GLOBAL_BYTES_PER_ROW = 32.0  # parent accumulator per input row (upper bound: all distinct)
 _IN_FLIGHT_FACTOR = 2.0   # covers the n_workers + 4 in-flight result buffer
-# Pass 2 is merge-bound; capping auto workers avoids piling partials for no speedup.
-_PASS2_AUTO_WORKER_CAP = 12
+# Parent re-aggregates its buffer once it holds this many rows (or more than the
+# accumulator itself, which keeps total merge work ~linear).
+_MERGE_MIN_ROWS = 50_000_000
+# Pass-2 results are split into this many hash partitions, merged independently,
+# so no single Arrow group-by sees the whole joint (Arrow keeps one hash table
+# per thread, which multiplied a full-joint merge's memory by the core count).
+_N_PARTITIONS = 256
+# populated/<this file>: {"50": k, ...} for each --min-count threshold
+MIN_COUNT_KS_FILE = "min_count_ks.json"
 # Minimum joint rows per post-processing chunk (avoid tiny parallel chunks).
 _PP_MIN_CHUNK = 200_000
 # scFW: words more frequent than the FW_RANK-th vocabulary word get a weight below 1.
 FW_RANK = 100
+# scCDS: context-distribution smoothing exponent on the marginals (Levy et al. 2015).
+CDS_ALPHA = 0.75
 
 
 def _torch_save_atomic(obj, path: str) -> None:
@@ -119,27 +123,25 @@ def _pass2_worker(
     batch_rows: int,
     batch_readahead: int,
     fragment_readahead: int,
+    n_partitions: int = _N_PARTITIONS,
 ) -> dict:
     """
-    Process a subset of parquet shards and return partial subset_counters.
-    Runs in a child process – no shared state with the parent.
+    Count a few parquet shards. Returns {subset: list of n_partitions Arrow tables
+    (or None)}, each holding int32 vocab ranks (one column per subset col) + int64
+    "count". Runs in a child process.
     """
     import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
-    from collections import Counter
     from functools import reduce
 
-    # Parallelism here is across processes (one per shard task); pin each worker to
-    # a single Arrow thread so N workers ≈ N cores instead of N × all-core pools
-    # oversubscribing the node.
+    # One Arrow thread per worker so N workers ≈ N cores.
     pa.set_cpu_count(1)
     pa.set_io_thread_count(1)
 
-    # Reconstruct Arrow membership arrays locally (not picklable across processes)
     max_arrs = {col: pa.array(vocabs_max[col]) for col in cols_to_build}
 
-    subset_counters = {subset: Counter() for subset in subsets}
+    parts = {subset: [] for subset in subsets}
 
     dataset = ds.dataset(shard_paths, format="parquet")
     batches = dataset.to_batches(
@@ -152,26 +154,122 @@ def _pass2_worker(
     )
 
     for batch in batches:
-        t = pa.table({
-            col: _normalize_str_array(batch.column(i))
+        # rank in vocabs_max (== ranks[col]); null when out of vocabulary
+        codes = {
+            col: pc.index_in(_normalize_str_array(batch.column(i)), value_set=max_arrs[col])
             for i, col in enumerate(cols_to_build)
-        })
-        masks = {col: pc.is_in(t[col], value_set=max_arrs[col]) for col in cols_to_build}
+        }
+        t = pa.table(codes)
+        valid = {col: pc.is_valid(codes[col]) for col in cols_to_build}
 
         for subset in subsets:
-            subset_mask = reduce(pc.and_, (masks[col] for col in subset))
-            t_subset = t.filter(subset_mask)
+            subset_mask = reduce(pc.and_, (valid[col] for col in subset))
+            t_subset = t.select(list(subset)).filter(subset_mask)
             if t_subset.num_rows:
-                g_subset = (
+                parts[subset].append(
                     t_subset.group_by(list(subset))
                     .aggregate([(subset[0], "count")])
                     .rename_columns(list(subset) + ["count"])
                 )
-                _update_counter_from_grouped(
-                    subset_counters[subset], g_subset, list(subset), "count"
-                )
 
-    return subset_counters  # Counter is picklable → returned to parent via pickle
+    return {
+        subset: _split_partitions(_sum_grouped(tables, list(subset)), list(subset), n_partitions)
+        for subset, tables in parts.items()
+    }
+
+
+def _split_partitions(table, keys: list, n_partitions: int) -> list:
+    """Split a grouped table into n_partitions by a hash of its keys (None = empty)."""
+    if table is None:
+        return [None] * n_partitions
+    h = np.zeros(table.num_rows, dtype=np.int64)
+    for k in keys:  # simple multiplicative mix so frequent first words don't skew one part
+        h = h * 1_000_003 + table[k].to_numpy().astype(np.int64)
+    part = (h % n_partitions).astype(np.int32)
+    order = np.argsort(part, kind="stable")
+    bounds = np.searchsorted(part[order], np.arange(n_partitions + 1))
+    # take() per part (not slice): pickling a slice can ship the whole parent buffer
+    return [
+        table.take(pa.array(order[bounds[p]:bounds[p + 1]])) if bounds[p + 1] > bounds[p] else None
+        for p in range(n_partitions)
+    ]
+
+
+def _pass1_worker(shard_paths: list[str], cols_to_build: list[str], batch_rows: int) -> tuple:
+    """Count words per column in a few shards. Returns ({col: table(col, "count")}, n_rows)."""
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+
+    pa.set_cpu_count(1)
+    pa.set_io_thread_count(1)
+
+    parts = {col: [] for col in cols_to_build}
+    n_rows = 0
+    dataset = ds.dataset(shard_paths, format="parquet")
+    for batch in dataset.to_batches(columns=cols_to_build, batch_size=batch_rows,
+                                    use_threads=True, cache_metadata=True):
+        n_rows += batch.num_rows
+        for i, col in enumerate(cols_to_build):
+            t = pa.table({col: _normalize_str_array(batch.column(i))})
+            parts[col].append(t.group_by([col]).aggregate([(col, "count")])
+                              .rename_columns([col, "count"]))
+    return {col: _sum_grouped(tables, [col]) for col, tables in parts.items()}, n_rows
+
+
+def _compute_marginals(parquet_files, cols_to_build, batch_rows, n_workers):
+    """PASS 1: word counts per column, parallelised across shards.
+    Returns ({col: Counter}, total_rows)."""
+    acc = {col: [] for col in cols_to_build}
+    total = 0
+    paths = [os.fspath(p) for p in parquet_files]
+    n_workers = max(1, min(n_workers, len(paths)))
+    print(f"Pass 1/2: computing global marginals [{n_workers} workers, {len(paths)} shards] ...")
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futs = [pool.submit(_pass1_worker, [p], cols_to_build, batch_rows) for p in paths]
+        with tqdm(total=len(futs), desc="Pass 1/2", unit="shard") as pbar:
+            for fut in futs:
+                tables, n = fut.result()
+                total += n
+                for col, t in tables.items():
+                    if t is not None:
+                        acc[col].append(t)
+                    # word tables are small, but merge now and then to bound memory
+                    if len(acc[col]) >= 64:
+                        acc[col] = [_sum_grouped(acc[col], [col])]
+                pbar.update()
+
+    single = {}
+    for col in cols_to_build:
+        t = _sum_grouped(acc[col], [col])
+        single[col] = Counter() if t is None else Counter(
+            dict(zip(map(sys.intern, t[col].to_pylist()), t["count"].to_pylist()))
+        )
+    return single, total
+
+
+def _sum_grouped(tables: list, keys: list):
+    """Concatenate grouped (keys + "count") tables and sum counts per key."""
+    tables = [t for t in tables if t is not None and t.num_rows]
+    if not tables:
+        return None
+    if len(tables) == 1:
+        return tables[0]
+    return (
+        pa.concat_tables(tables)
+        .group_by(keys)
+        .aggregate([("count", "sum")])
+        .rename_columns(keys + ["count"])
+    )
+
+
+def _table_to_arrays(table, keys: list) -> tuple:
+    """Grouped table -> (idx (n, r) int32, counts (n,) int64)."""
+    if table is None:
+        return np.empty((0, len(keys)), dtype=np.int32), np.empty(0, dtype=np.int64)
+    idx = np.empty((table.num_rows, len(keys)), dtype=np.int32)
+    for j, k in enumerate(keys):
+        idx[:, j] = table[k].to_numpy()
+    return idx, table["count"].to_numpy().astype(np.int64, copy=False)
 
 
 def _soft_knee_compress(
@@ -242,6 +340,13 @@ def tuple_weights(indices: torch.Tensor, weights: list) -> torch.Tensor:
     for i, w in enumerate(weights):
         out *= torch.from_numpy(w)[indices[i]]
     return out
+
+
+def cds_marginals(counter: Counter, vocab: list, alpha: float = CDS_ALPHA) -> np.ndarray:
+    """p(w)^alpha / sum_v p(v)^alpha for each word in `vocab`, normalised over the
+    full marginal (not just the vocab). counter holds p (or counts) for one mode."""
+    z = sum(v ** alpha for v in counter.values())
+    return np.array([counter.get(tok, 0.0) ** alpha / z for tok in vocab], dtype=np.float64)
 
 
 def _make_sparse_coo(idx: torch.Tensor, values: torch.Tensor, size: tuple):
@@ -329,15 +434,16 @@ def _sii_range(st: dict, sel: np.ndarray, cnt_f: np.ndarray) -> np.ndarray:
     return res
 
 
-def _sc_range(st: dict, sel: np.ndarray, cnt_f: np.ndarray) -> np.ndarray:
-    """Vectorised specific correlation for a block of joint rows."""
+def _sc_range(st: dict, sel: np.ndarray, cnt_f: np.ndarray, marg_key: str = "marg") -> np.ndarray:
+    """Vectorised specific correlation for a block of joint rows.
+    marg_key="marg_cds" uses the CDS-smoothed marginals (scCDS)."""
     order = st["order"]
     total_len = st["total_len"]
     joint = cnt_f / total_len
     nonpos = joint <= 0
     prod_marg = np.ones(sel.shape[0], dtype=np.float64)
     for i in range(order):
-        p = st["marg"][i][sel[:, i]]
+        p = st[marg_key][i][sel[:, i]]
         nonpos |= p <= 0
         prod_marg = prod_marg * p
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -377,6 +483,8 @@ def _fill_range(st: dict, start: int, end: int, variant) -> tuple:
         vals["sii"] = _sii_range(st, sel, cnt_f).astype(np.float32)
     if need["sc"]:
         vals["sc"] = _sc_range(st, sel, cnt_f).astype(np.float32)
+    if need["sc_cds"]:
+        vals["sc_cds"] = _sc_range(st, sel, cnt_f, "marg_cds").astype(np.float32)
     return out_idx, vals
 
 
@@ -389,22 +497,10 @@ def _pp_worker(start: int, end: int, variant) -> tuple:
 
 def _build_pp_arrays(subset_counters, single_probs, vocabs_max, ranks,
                      cols, order, total_len, base, need) -> dict:
-    """Convert the joint + sub counters into COW-safe NumPy arrays.
-
-    Mutates ``subset_counters`` (deletes each converted Counter, then clears it) to
-    reclaim the large dict memory before the heavy compute starts.
-    """
+    """Assemble the COW-safe state from Pass-2 arrays ({subset: (idx, counts)},
+    idx holding vocab ranks). Empties ``subset_counters`` as it goes."""
     full_cols = tuple(cols)
-    full_ctr = subset_counters[full_cols]
-    n_rows = len(full_ctr)
-    idx_max = np.empty((n_rows, order), dtype=np.int32)
-    counts = np.empty(n_rows, dtype=np.int64)
-    col_ranks = [ranks[c] for c in cols]
-    for row, (ktuple, c) in enumerate(full_ctr.items()):
-        for j in range(order):
-            idx_max[row, j] = col_ranks[j][ktuple[j]]
-        counts[row] = c
-    del subset_counters[full_cols]
+    idx_max, counts = subset_counters.pop(full_cols)
 
     # marginal probability per rank, per mode (single_probs already normalised)
     marg = [
@@ -421,19 +517,11 @@ def _build_pp_arrays(subset_counters, single_probs, vocabs_max, ranks,
         for r in range(2, order):  # subset sizes 2 .. order-1
             for pos in combinations(range(order), r):
                 sub_cols = tuple(cols[p] for p in pos)
-                ctr = subset_counters[sub_cols]
-                k = np.empty((len(ctr), r), dtype=np.int32)
-                v = np.empty(len(ctr), dtype=np.int64)
-                pr = [ranks[cols[p]] for p in pos]
-                for ii, (kt, cc) in enumerate(ctr.items()):
-                    for j in range(r):
-                        k[ii, j] = pr[j][kt[j]]
-                    v[ii] = cc
+                k, v = subset_counters.pop(sub_cols)
                 enc = _encode_keys(k, base)
                 order_idx = np.argsort(enc, kind="stable")
                 sub_keys[pos] = enc[order_idx]
                 sub_counts[pos] = v[order_idx]
-                del subset_counters[sub_cols]
 
     subset_counters.clear()  # everything needed now lives in NumPy arrays
 
@@ -447,7 +535,7 @@ def _build_pp_arrays(subset_counters, single_probs, vocabs_max, ranks,
         "order": order,
         "base": base,
         "need": need,
-        "N": n_rows,
+        "N": len(counts),
     }
 
 
@@ -568,36 +656,37 @@ def _compute_subset_counters(
 ):
     """PASS 2: restricted joint counts, parallelised across shards.
 
-    Returns ``subset_counters`` ({subset_tuple: Counter}) for the subsets
-    ``_required_subsets`` says are live: every subset of size >= 2 when sii is
-    wanted, otherwise the full joint alone. Extracted from the populator so a
-    cache hit can bypass it entirely.
+    Returns {subset_tuple: (idx (n, r) int32 vocab ranks, counts (n,) int64)} for
+    the subsets ``_required_subsets`` says are live: every subset of size >= 2
+    when sii is wanted, otherwise the full joint alone.
     """
     import time as _time
 
     subsets = _required_subsets(cols_to_build, need_sii)
-    subset_counters = {subset: Counter() for subset in subsets}
+    P = _N_PARTITIONS
+    # per subset, per hash partition: merged so far / worker results not yet merged
+    acc = {subset: [None] * P for subset in subsets}
+    buf = {subset: [[] for _ in range(P)] for subset in subsets}
+    buf_rows = {subset: [0] * P for subset in subsets}
+    min_rows = max(1, _MERGE_MIN_ROWS // P)
+
+    def _merge(subset, p):
+        acc[subset][p] = _sum_grouped([acc[subset][p]] + buf[subset][p], list(subset))
+        buf[subset][p] = []
+        buf_rows[subset][p] = 0
 
     shards_per_task = max(1, shards_per_task)
 
-    # Worker count: an explicit --max-workers wins; otherwise scale to the node's
-    # cores (cpu_frac) but cap by an explicit memory ceiling so we never recreate
-    # the swapping the old shards//100 heuristic was guarding against. The parent's
-    # global accumulator grows regardless of worker count; each extra worker adds
-    # its own partial counters + in-flight result buffer, which is what must fit.
+    # Worker count: an explicit --max-workers wins; otherwise cpu_frac of the
+    # cores, capped by the memory ceiling.
     if max_workers and max_workers > 0:
         n_workers = min(max_workers, len(parquet_files))
         print(f"using {n_workers} workers (explicit --max-workers, "
               f"{shards_per_task} shard(s)/task)")
     else:
         cpu_budget = compute_num_threads(cpu_frac)
-        total_parquet_bytes = sum(p.stat().st_size for p in parquet_files)
 
-        # Per-worker estimate from ROWS: each worker holds ~one entry per live
-        # counter per row of its task. (Compressed parquet bytes under-count this
-        # ~20x.) Counting the *live* subsets rather than the full 2**order - 1 -
-        # order set matters: with sii off there is exactly one, so the estimate no
-        # longer collapses the fan-out to a single worker at high order.
+        # Per-worker estimate: ~one entry per live subset per row of its task.
         n_subcounters = max(1, len(subsets))
         rows_per_task = (total_rows / max(1, len(parquet_files))) * shards_per_task
         if mem_per_worker_gb and mem_per_worker_gb > 0:
@@ -606,21 +695,18 @@ def _compute_subset_counters(
             per_worker_gb = rows_per_task * n_subcounters * _BYTES_PER_ENTRY / 1e9
 
         mem_budget_gb, mem_src = resolve_mem_budget_gb(max_mem_gb)
-        global_reserve_gb = total_parquet_bytes * _COUNTER_BLOWUP / 1e9
+        global_reserve_gb = total_rows * n_subcounters * _GLOBAL_BYTES_PER_ROW / 1e9
         headroom_gb = mem_budget_gb - global_reserve_gb
         denom = max(per_worker_gb * _IN_FLIGHT_FACTOR, 1e-9)
         mem_budget_workers = max(1, int(headroom_gb // denom))
 
-        # Pass 2 is merge-bound: a modest worker count saturates the single-threaded
-        # parent merge, so cap auto fan-out (more workers only pile partials in RAM).
-        n_workers = min(cpu_budget, mem_budget_workers, _PASS2_AUTO_WORKER_CAP,
-                        len(parquet_files))
+        n_workers = min(cpu_budget, mem_budget_workers, len(parquet_files))
         print(
             f"using {n_workers} workers "
             f"(cpu_budget={cpu_budget} @ cpu_frac={cpu_frac}, "
             f"mem_budget={mem_budget_workers} [ceiling={mem_budget_gb:.1f}GB src={mem_src}, "
             f"global_reserve~{global_reserve_gb:.1f}GB, per_worker~{per_worker_gb:.2f}GB], "
-            f"merge_cap={_PASS2_AUTO_WORKER_CAP}, {shards_per_task} shard(s)/task)"
+            f"{shards_per_task} shard(s)/task)"
         )
         if headroom_gb <= 0:
             print(
@@ -677,8 +763,18 @@ def _compute_subset_counters(
                 for fut in done_futs:
                     partial = fut.result()
                     del pending[fut]
-                    for subset, counter in partial.items():
-                        subset_counters[subset].update(counter)
+                    _submit_one()  # keep workers busy while the parent merges
+                    for subset, tables in partial.items():
+                        for p, table in enumerate(tables):
+                            if table is None:
+                                continue
+                            buf[subset][p].append(table)
+                            buf_rows[subset][p] += table.num_rows
+                            a = acc[subset][p]
+                            if buf_rows[subset][p] >= max(a.num_rows if a is not None else 0,
+                                                          min_rows):
+                                _merge(subset, p)
+                    del partial
                     n_done += 1
                     elapsed = _time.perf_counter() - t_pass2_start
                     rate = n_done / elapsed
@@ -690,9 +786,28 @@ def _compute_subset_counters(
                         refresh=False,
                     )
                     pbar.update()
-                    _submit_one()
 
-    return subset_counters
+    # Partitions hold disjoint keys: merge each on its own, then copy straight into
+    # one preallocated array pair (no full-joint group-by or concatenate).
+    out = {}
+    for subset in subsets:
+        for p in range(P):
+            _merge(subset, p)
+        parts = acc.pop(subset)
+        n = sum(t.num_rows for t in parts if t is not None)
+        idx = np.empty((n, len(subset)), dtype=np.int32)
+        counts = np.empty(n, dtype=np.int64)
+        pos = 0
+        for p in range(P):
+            if parts[p] is None:
+                continue
+            i, c = _table_to_arrays(parts[p], list(subset))
+            parts[p] = None
+            idx[pos:pos + len(c)] = i
+            counts[pos:pos + len(c)] = c
+            pos += len(c)
+        out[subset] = (idx, counts)
+    return out
 
 
 # -- parquet helpers --
@@ -768,23 +883,22 @@ def _update_counter_from_grouped(counter: Counter, grouped: pa.Table, key_cols: 
 
 def _hapax_report_and_filter(subset_counters: dict) -> dict:
     """
-    Remove all entries with count == 1 from every subset counter.
-    Prints a before/after comparison and returns the filtered counters.
+    Remove all entries with count == 1 from every subset ({subset: (idx, counts)}).
+    Prints a before/after comparison and returns the filtered arrays.
     """
     print("\n── Hapax removal ──────────────────────────────────────────")
 
     rows = []
     filtered = {}
-    for subset, counter in subset_counters.items():
+    for subset, (idx, counts) in subset_counters.items():
         name = "(" + ", ".join(subset) + ")"
-        n_types_before = len(counter)
-        n_tokens_before = sum(counter.values())
-        hapax = {k for k, v in counter.items() if v == 1}
-        n_hapax = len(hapax)
-        new_counter = Counter({k: v for k, v in counter.items() if v > 1})
-        n_types_after = len(new_counter)
-        n_tokens_after = sum(new_counter.values())
-        filtered[subset] = new_counter
+        keep = counts > 1
+        n_types_before = len(counts)
+        n_tokens_before = int(counts.sum())
+        n_hapax = n_types_before - int(keep.sum())
+        filtered[subset] = (idx[keep], counts[keep])
+        n_types_after = n_types_before - n_hapax
+        n_tokens_after = int(filtered[subset][1].sum())
         rows.append({
             "subset": name,
             "types_before": n_types_before,
@@ -823,6 +937,14 @@ def _most_common_keys(counter: Counter, k: int) -> list:
     # Counter.most_common is deterministic enough for our use;
     # ties will follow internal ordering—same behavior as original Counter use.
     return [x for (x, _) in counter.most_common(k)]
+
+
+def _min_count_k(counters: list[Counter], min_count: int) -> int:
+    """Number of words whose count, averaged over the given (linked) modes, is >= min_count."""
+    total = Counter()
+    for counter in counters:
+        total.update(counter)
+    return sum(1 for c in total.values() if c / len(counters) >= min_count)
 
 
 def _shared_topk_hmean(counters: list[Counter], k: int, eps: float = 0.0,
@@ -923,7 +1045,17 @@ def populate_tensors_parquet(
     cpu_frac: float = 0.5,
     max_mem_gb: float | None = None,
     mem_per_worker_gb: float | None = None,
+    min_count: int | list[int] | None = None,
 ):
+    """min_count: one threshold or a list; each adds a variant whose k is the number of words
+    seen >= that many times (count averaged over linked modes), next to top_ks; named by that
+    k like the others."""
+    if min_count is None:
+        min_counts = []
+    elif isinstance(min_count, int):
+        min_counts = [min_count]
+    else:
+        min_counts = sorted(set(min_count))
     if tensors_to_build is not None:
         unknown = [t for t in tensors_to_build if t not in _ALL_TENSORS]
         if unknown:
@@ -939,13 +1071,17 @@ def populate_tensors_parquet(
     need_count_log_p1 = "countingLogPlusOne" in want  # log1p(count); singletons -> log(2)
     need_sii       = any(t in want for t in ("sii", "siiSoftPlus", "siiShifted"))
     need_sc        = any(t in want for t in ("sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat", "scFW"))
+    need_sc_cds    = any(t in want for t in ("scCDS", "scCDSSoftPlus"))
 
     path_to_vectors = os.fspath(path_to_vectors)
     n_modes = len(cols_to_build)
 
     # Normalise both sources into a deduplicated list of per-mode tuples.
     # Uniform entries (int) become (k,)*n_modes; asymmetric entries must have len == n_modes.
-    if not isinstance(top_ks, list):
+    # top_ks may be None when only min_count is given
+    if top_ks is None:
+        top_ks = []
+    elif not isinstance(top_ks, list):
         top_ks = [top_ks]
     variants: list[tuple] = [(k,) * n_modes for k in top_ks]
     for tup in (top_ks_asymmetric or []):
@@ -957,9 +1093,12 @@ def populate_tensors_parquet(
             )
         variants.append(tup)
     variants = sorted(set(variants))
+    if not variants and not min_counts:
+        raise ValueError("Give --top-ks, --top-ks-asymmetric or --min-count.")
 
-    # Per-mode maximum needed across all variants (drives pass-2 vocab size)
-    max_ks = tuple(max(v[i] for v in variants) for i in range(n_modes))
+    # Per-mode maximum needed across all variants (drives pass-2 vocab size);
+    # recomputed below once the min_count variants are known.
+    max_ks = tuple(max(v[i] for v in variants) for i in range(n_modes)) if variants else None
 
     print(f"Populating tensors for variants={variants} from {path_to_vectors}...")
 
@@ -998,33 +1137,35 @@ def populate_tensors_parquet(
         print(f"Loading cached marginals from {cache_path}")
         single_probs, total_len = _load_marginals_cache(cache_path, cols_to_build)
     else:
-        single_probs = {col: Counter() for col in cols_to_build}
-        batches1 = dataset.to_batches(
-            columns=cols_to_build,
-            batch_size=batch_rows,
-            batch_readahead=batch_readahead,
-            fragment_readahead=fragment_readahead,
-            use_threads=True,
-            cache_metadata=True,
-        )
-        print("Pass 1/2: computing global marginals ...")
-        seen_rows = 0
-        with tqdm(total=total_rows, desc="Pass 1/2", unit="rows") as pbar:
-            for batch in batches1:
-                pbar.update(batch.num_rows)
-                seen_rows += batch.num_rows
-                t = pa.table({col: _normalize_str_array(batch.column(i))
-                              for i, col in enumerate(cols_to_build)})
-                for col in cols_to_build:
-                    g_col = (t.group_by([col])
-                             .aggregate([(col, "count")])
-                             .rename_columns([col, "count"]))
-                    _update_counter_from_grouped(single_probs[col], g_col, [col], "count")
+        n_pass1 = max_workers if max_workers and max_workers > 0 else compute_num_threads(cpu_frac)
+        single_probs, seen_rows = _compute_marginals(
+            parquet_files, list(cols_to_build), batch_rows, n_pass1)
         if seen_rows == 0:
             raise ValueError("No rows found in the parquet dataset.")
         total_len = seen_rows
         _save_marginals_cache(cache_path, single_probs, total_len,
                                   cols_to_build, path_to_vectors)
+
+    # each min_count threshold adds a top-k variant: k = number of words seen >= it
+    # (count averaged over linked modes), built like any other k.
+    mc_ks = {}
+    for mc in min_counts:
+        mc_variant = [0] * n_modes
+        for group in linked_factor_groups(n_modes, shared_factors):
+            k = _min_count_k([single_probs[cols_to_build[i]] for i in group], mc)
+            for i in group:
+                mc_variant[i] = k
+        print(f"min_count={mc} -> variant {tuple(mc_variant)}")
+        variants = sorted(set(variants) | {tuple(mc_variant)})
+        mc_ks[str(mc)] = mc_variant[0] if len(set(mc_variant)) == 1 else list(mc_variant)
+    if min_counts:
+        # threshold -> k, so `nnt --dim mc50` can find the variant (older entries kept)
+        mc_path = Path(path_to_tensors) / "populated" / MIN_COUNT_KS_FILE
+        saved = json.loads(mc_path.read_text()) if mc_path.exists() else {}
+        saved.update(mc_ks)
+        mc_path.write_text(json.dumps(saved, indent=2, sort_keys=True))
+        print(f"min_count -> k written to {mc_path}")
+        max_ks = tuple(max(v[i] for v in variants) for i in range(n_modes))
 
     # vocab for max_k (per-mode) once
     vocabs_max = {
@@ -1074,7 +1215,7 @@ def populate_tensors_parquet(
         "count": need_count, "prob_log": need_prob_log,
         "count_log": need_count_log, "count_log_eps": need_count_log_eps,
         "count_log_p1": need_count_log_p1,
-        "sii": need_sii, "sc": need_sc,
+        "sii": need_sii, "sc": need_sc, "sc_cds": need_sc_cds,
     }
     base = max(len(vocabs_max[col]) for col in cols_to_build)
     use_fast = (not need_sii) or _encoding_fits(base, order)
@@ -1134,8 +1275,18 @@ def populate_tensors_parquet(
         print("Probabilities computed for vocab-restricted subset marginals.")
         print("Probabilities computed for vocab-restricted joints.")
 
+        if not use_fast:
+            # per-row fallback below looks counts up by token tuple
+            subset_counters = {
+                subset: Counter({
+                    tuple(vocabs_max[c][i] for c, i in zip(subset, row)): int(cnt)
+                    for row, cnt in zip(idx.tolist(), counts.tolist())
+                })
+                for subset, (idx, counts) in subset_counters.items()
+            }
+
         if use_fast:
-            print("Post-processing: converting counters to COW-safe NumPy arrays...")
+            print("Post-processing: building COW-safe NumPy arrays...")
             pp_state = _build_pp_arrays(
                 subset_counters, single_probs, vocabs_max, ranks,
                 list(cols_to_build), order, total_len, base, need,
@@ -1197,7 +1348,7 @@ def populate_tensors_parquet(
         return log(prod(numerator_terms) / prod(denominator_terms))
 
 
-    def specific_correlation(col_realisations):
+    def specific_correlation(col_realisations, cds=False):
         if len(col_realisations) != len(cols_to_build):
             raise ReferenceError("Same number of columns expected.")
 
@@ -1207,7 +1358,11 @@ def populate_tensors_parquet(
 
         marginals = []
         for i, realisation in enumerate(col_realisations):
-            p = single_probs[cols_to_build[i]][realisation]
+            col = cols_to_build[i]
+            if cds:
+                p = cds_probs[col][ranks[col][realisation]]
+            else:
+                p = single_probs[col][realisation]
             if p <= 0:
                 return float("-inf")
             marginals.append(p)
@@ -1223,10 +1378,18 @@ def populate_tensors_parquet(
     # Fast path uses the COW-safe NumPy arrays built (or loaded from checkpoint)
     # above; the per-row Python fallback (closures) only runs when composite-key
     # encoding would overflow int64 (very large order × vocab).
+    # CDS marginals come from the Pass-1 marginals, so they are never part of the
+    # Pass-2 checkpoint and work with checkpoints written before scCDS existed.
+    cds_probs = None
+    if need_sc_cds:
+        cds_probs = {col: cds_marginals(single_probs[col], vocabs_max[col]) for col in cols_to_build}
+
     global _PP_STATE
     pp_executor = None
     pp_chunks = 1
     if use_fast:
+        if need_sc_cds:
+            pp_state["marg_cds"] = [cds_probs[col] for col in cols_to_build]
         _PP_STATE = pp_state
         N_rows = _PP_STATE["N"]
         # Parallelise across row-ranges via fork so the big arrays are COW-shared
@@ -1290,6 +1453,9 @@ def populate_tensors_parquet(
             if need_sc:
                 v = specific_correlation(els_to_check)
                 buf["sc"][n] = float(v) if v != float("-inf") else -1e38
+            if need_sc_cds:
+                v = specific_correlation(els_to_check, cds=True)
+                buf["sc_cds"][n] = float(v) if v != float("-inf") else -1e38
             n += 1
         out_idx = idx_arr[:n]
         vals = {k: buf[k][:n] for k in need if need[k]}
@@ -1332,6 +1498,8 @@ def populate_tensors_parquet(
                 sii_tensor = _make_sparse_coo(idx, empty, size).coalesce()
             if need_sc:
                 sc_tensor = _make_sparse_coo(idx, empty, size).coalesce()
+            if need_sc_cds:
+                sc_cds_tensor = _make_sparse_coo(idx, empty, size).coalesce()
         else:
             # out_idx is (m, order); transpose to (order, m) COO indices. Each channel
             # is built and coalesced from its own (COW-safe) NumPy buffer.
@@ -1350,6 +1518,8 @@ def populate_tensors_parquet(
                 sii_tensor = _make_sparse_coo(idx, torch.from_numpy(vals["sii"]), size).coalesce()
             if need_sc:
                 sc_tensor = _make_sparse_coo(idx, torch.from_numpy(vals["sc"]), size).coalesce()
+            if need_sc_cds:
+                sc_cds_tensor = _make_sparse_coo(idx, torch.from_numpy(vals["sc_cds"]), size).coalesce()
             del out_idx, vals
 
         # countingLog: drop hapax legomena whose log(count) == 0 (cnt == 1), not stored explicit zeros.
@@ -1408,6 +1578,14 @@ def populate_tensors_parquet(
                 if "scSoftPlusFlat" in want: sc_softplus_flat = sc_tensor
                 if "scFW" in want: sc_fw = sc_tensor
 
+        if need_sc_cds:
+            if sc_cds_tensor._nnz() and "scCDSSoftPlus" in want:
+                sc_cds_softplus = _make_sparse_coo(
+                    sc_cds_tensor.indices(), torch.nn.functional.softplus(sc_cds_tensor.values()), size
+                ).coalesce()
+            elif "scCDSSoftPlus" in want:
+                sc_cds_softplus = sc_cds_tensor
+
         vocab = {}
         for col in cols_to_build:
             vocab[f"vocab_{col}"] = vocabs[col]
@@ -1433,6 +1611,8 @@ def populate_tensors_parquet(
         if "scShifted"    in want: built["scShifted"]    = sc_shifted
         if "scSoftPlusFlat" in want: built["scSoftPlusFlat"] = sc_softplus_flat
         if "scFW"         in want: built["scFW"]         = sc_fw
+        if "scCDS"        in want: built["scCDS"]        = sc_cds_tensor
+        if "scCDSSoftPlus" in want: built["scCDSSoftPlus"] = sc_cds_softplus
 
         # Report tensor sizes (nonzero entries) just before saving them.
         for name, tens in built.items():

@@ -664,6 +664,8 @@ _MN_STEM_RE = re.compile(r"_(\d+)mn(?=_|$)")
 # bare "..._3D_..." tag instead.
 _DECOMP_STEM_RE = re.compile(r"_CP\d+D(?=_|$)")
 _TT_STEM_RE = re.compile(r"_TT(\d+)b\d+D(?=_|$)")
+# "..._UTT50b3D_...": the shared-core TT (experimental/uniform_tt) at bond 50.
+_UTT_STEM_RE = re.compile(r"_UTT(\d+)b\d+D(?=_|$)")
 
 # "..._SGD3D_..." marks the SGD solver (naming._order_tag with
 # solver="sgd"); MU stems carry no solver tag.
@@ -703,12 +705,14 @@ def _decomp_from_stem(stem):
     """
     if _DECOMP_STEM_RE.search(stem):
         return "cp"
+    if _UTT_STEM_RE.search(stem):
+        return "utt"
     return "tt" if _TT_STEM_RE.search(stem) else "tucker"
 
 
 def _tt_rank_from_stem(stem):
     """Recover the TT bond dimension from a run's stem, or None if not a TT run."""
-    m = _TT_STEM_RE.search(stem)
+    m = _TT_STEM_RE.search(stem) or _UTT_STEM_RE.search(stem)
     return int(m.group(1)) if m else None
 
 
@@ -789,7 +793,7 @@ def _discover_one(dataset, data_dir):
         solver = exp.get("solver") or _solver_from_stem(stem)
         # Every config stores tt_rank (default 100), so only trust it for TT runs.
         tt_rank = ((exp.get("tt_rank") or _tt_rank_from_stem(stem))
-                   if decomposition == "tt" else None)
+                   if decomposition in ("tt", "utt") else None)
 
         insp = InspectionConfig(
             dim=dim, name=run_name, dataset=exp.get("dataset", dataset),
@@ -800,8 +804,8 @@ def _discover_one(dataset, data_dir):
             solver=solver, decomposition=decomposition, tt_rank=tt_rank,
         )
         decomp_tag = "" if decomposition == "tucker" else f"[{decomposition.upper()}] "
-        if decomposition == "tt" and tt_rank:
-            decomp_tag = f"[TT b={tt_rank}] "
+        if decomposition in ("tt", "utt") and tt_rank:
+            decomp_tag = f"[{decomposition.upper()} b={tt_rank}] "
         if solver == "sgd":
             decomp_tag = f"[SGD] {decomp_tag}"
         log_path = decomp_dir / f"{stem}_log.txt"
@@ -1016,7 +1020,7 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         chain = f'  ⛓×{n_seg} (→{rec["iters"]}i)' if n_seg > 1 else ""
         decomp = "" if rec["decomposition"] == "tucker" else f'[{rec["decomposition"].upper()}] '
         if rec.get("tt_rank"):
-            decomp = f'[TT b={rec["tt_rank"]}] '
+            decomp = f'[{rec["decomposition"].upper()} b={rec["tt_rank"]}] '
         mn = f' mn{rec["max_nnz"]}' if rec.get("max_nnz") else ""
         return (f'{decomp}[{rec["dataset"]}] {rec["name"]} | {rec["divergence"]}/{rec["method"]} | '
                 f'{rec["dim"]}d r{rec["rank"]} ss{rec["subsample_frac"]}{mn} '

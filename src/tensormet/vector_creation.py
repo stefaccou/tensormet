@@ -9,6 +9,11 @@ from itertools import islice
 
 import json
 import time
+import hashlib
+import signal
+import multiprocessing as mp
+from collections import deque
+import numpy as np
 import string
 from tqdm import tqdm
 
@@ -761,10 +766,12 @@ def extract_core_lemmas(text: str, nlp: spacy.Language) -> str:
 # Schema per n: (sent_id int64, w1 string, ..., wN string)
 # ---------------------------------------------------------------------------
 
-# Sentence-boundary padding tokens. Left-pad with n-1 BOS so the first real word
-# has a full-width context; right-pad with a single EOS so the model learns to stop.
+# Sentence-boundary padding tokens. Pad styles:
+#   "bos-eos": n-1 BOS left, one EOS right (classic causal n-gram LM padding).
+#   "padded":  one BOS left, one EOS right (symmetric, encoder-like).
 BOS_TOKEN = "<s>"
 EOS_TOKEN = "</s>"
+PAD_STYLES = ("bos-eos", "padded")
 
 
 def _ngram_schema(n: int) -> pa.Schema:
@@ -780,6 +787,7 @@ def _extract_ngrams_from_lemmas(
     sent_id: int,
     *,
     pad: bool = False,
+    pad_style: str = "bos-eos",
     bos: str = BOS_TOKEN,
     eos: str = EOS_TOKEN,
 ) -> list[dict]:
@@ -787,7 +795,11 @@ def _extract_ngrams_from_lemmas(
         # Skip empty sentences entirely; otherwise we'd emit pure-boundary n-grams.
         if not lemmas:
             return []
-        seq = [bos] * (n - 1) + lemmas + [eos]
+        if pad_style not in PAD_STYLES:
+            raise ValueError(f"Unknown pad_style {pad_style!r}; expected one of {PAD_STYLES}.")
+        n_bos = n - 1 if pad_style == "bos-eos" else 1
+        # "padded": sentences shorter than n-2 tokens yield no windows.
+        seq = [bos] * n_bos + lemmas + [eos]
     else:
         if len(lemmas) < n:
             return []
@@ -799,6 +811,165 @@ def _extract_ngrams_from_lemmas(
             row[f"w{j + 1}"] = seq[i + j]
         rows.append(row)
     return rows
+
+
+DEDUP_MODES = ("none", "doc", "sent")
+
+
+def _hash64(s: str) -> int:
+    return int.from_bytes(hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest(), "little")
+
+
+def _doc_hash(text: str) -> int:
+    return _hash64(" ".join(text.split()).lower())
+
+
+def _sent_hash(tokens: list[str]) -> int:
+    return _hash64("\x1f".join(tokens))
+
+
+class _Deduper:
+    """Exact document / sentence dedup via 64-bit hashes (first occurrence kept).
+
+    Hashes are stored in ``{state_dir}/_dedup_hashes.npz`` on close and reloaded on
+    resume; ~70 bytes of RAM per distinct hash (about 5 GB per 70M sentences).
+    """
+
+    def __init__(self, mode: str, min_tokens: int, state_dir: Path, raw_seen: int):
+        if mode not in DEDUP_MODES:
+            raise ValueError(f"Unknown dedup {mode!r}; expected one of {DEDUP_MODES}.")
+        self.mode = mode
+        self.min_tokens = min_tokens
+        self.path = state_dir / "_dedup_hashes.npz"
+        self.docs: set[int] = set()
+        self.sents: set[int] = set()
+        self.n_docs_dropped = 0
+        self.n_sents_dropped = 0
+        if mode != "none" and raw_seen > 0:
+            if self.path.exists():
+                z = np.load(self.path)
+                self.docs = set(z["docs"].tolist())
+                self.sents = set(z["sents"].tolist())
+                if int(z["raw_seen"]) != raw_seen:
+                    print(f"Warning: dedup hashes saved at raw_seen={int(z['raw_seen']):,}, "
+                          f"resuming at {raw_seen:,}; duplicates of the gap are not caught.")
+            else:
+                print("Warning: resuming without saved dedup hashes; earlier text is not deduplicated against.")
+
+    @staticmethod
+    def _seen(store: set, h: int) -> bool:
+        if h in store:
+            return True
+        store.add(h)
+        return False
+
+    def drop_doc(self, text: str) -> bool:
+        if self.mode == "none":
+            return False
+        if self._seen(self.docs, _doc_hash(text)):
+            self.n_docs_dropped += 1
+            return True
+        return False
+
+    def drop_sent(self, tokens: list[str]) -> bool:
+        if self.mode != "sent" or len(tokens) < self.min_tokens:
+            return False
+        if self._seen(self.sents, _sent_hash(tokens)):
+            self.n_sents_dropped += 1
+            return True
+        return False
+
+    def keep_mask(self, doc_h: np.ndarray, sent_doc: np.ndarray,
+                  sent_h: np.ndarray, sent_ok: np.ndarray) -> np.ndarray:
+        """Batch version of drop_doc/drop_sent on precomputed hashes, in stream order.
+
+        ``sent_ok`` marks sentences long enough for sentence dedup. Returns the
+        per-sentence keep mask.
+        """
+        if self.mode == "none":
+            return np.ones(len(sent_doc), dtype=bool)
+        keep_doc = np.ones(len(doc_h), dtype=bool)
+        for i, h in enumerate(doc_h.tolist()):
+            if self._seen(self.docs, h):
+                keep_doc[i] = False
+                self.n_docs_dropped += 1
+        keep = keep_doc[sent_doc]
+        if self.mode == "sent":
+            idx = np.flatnonzero(keep & sent_ok)
+            for i, h in zip(idx.tolist(), sent_h[idx].tolist()):
+                if self._seen(self.sents, h):
+                    keep[i] = False
+                    self.n_sents_dropped += 1
+        return keep
+
+    def summary(self) -> str:
+        return f"dedup: docs dropped={self.n_docs_dropped:,} | sents dropped={self.n_sents_dropped:,}"
+
+    def save(self, raw_seen: int) -> None:
+        if self.mode == "none":
+            return
+        np.savez(self.path, docs=np.fromiter(self.docs, np.uint64, len(self.docs)),
+                 sents=np.fromiter(self.sents, np.uint64, len(self.sents)), raw_seen=raw_seen)
+
+
+_RAW_NLP = None
+_RAW_OPTS: dict = {}
+
+
+def _raw_worker_init(opts: dict) -> None:
+    global _RAW_NLP, _RAW_OPTS
+    # Ctrl-C is handled by the main process, which drains the pending batches.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _RAW_NLP = spacy.blank("en")
+    _RAW_NLP.add_pipe("sentencizer")
+    _RAW_NLP.max_length = 1_000_000
+    _RAW_OPTS = opts
+
+
+def _raw_worker_batch(texts: list[str]) -> dict:
+    """Worker: texts -> hashes + n-gram windows as Arrow columns.
+
+    Windows match _extract_ngrams_from_lemmas; ``counts[n][s]`` is the number of
+    windows of sentence s, so the main process can drop whole sentences by mask.
+    """
+    o = _RAW_OPTS
+    dedup = o["dedup"] != "none"
+    doc_h, sent_doc, sent_h, sent_ok = [], [], [], []
+    cols = {n: [[] for _ in range(n)] for n in o["orders"]}
+    counts = {n: [] for n in o["orders"]}
+    for d, doc in enumerate(_RAW_NLP.pipe(texts, batch_size=o["batch_size"])):
+        if dedup:
+            doc_h.append(_doc_hash(texts[d]))
+        for sent in doc.sents:
+            tokens = [
+                tok.lower_
+                for tok in sent
+                if not tok.is_punct and not tok.is_space and tok.text.strip()
+                and not (o["content_only"] and tok.is_stop)
+            ]
+            sent_doc.append(d)
+            ok = o["dedup"] == "sent" and len(tokens) >= o["min_tokens"]
+            sent_ok.append(ok)
+            sent_h.append(_sent_hash(tokens) if ok else 0)
+            for n in o["orders"]:
+                if o["pad"]:
+                    n_bos = n - 1 if o["pad_style"] == "bos-eos" else 1
+                    seq = [BOS_TOKEN] * n_bos + tokens + [EOS_TOKEN] if tokens else []
+                else:
+                    seq = tokens
+                L = len(seq) - n + 1
+                if L > 0:
+                    for j in range(n):
+                        cols[n][j].extend(seq[j:j + L])
+                counts[n].append(max(L, 0))
+    return {
+        "doc_h": np.array(doc_h, dtype=np.uint64),
+        "sent_doc": np.array(sent_doc, dtype=np.int64),
+        "sent_h": np.array(sent_h, dtype=np.uint64),
+        "sent_ok": np.array(sent_ok, dtype=bool),
+        "counts": {n: np.array(c, dtype=np.int64) for n, c in counts.items()},
+        "cols": {n: [pa.array(c, type=pa.string()) for c in cs] for n, cs in cols.items()},
+    }
 
 
 def _safe_open_part_writer(output_dir: Path, part_id: int, schema: pa.Schema):
@@ -839,7 +1010,7 @@ def create_ngram_vectors_parquet_sharded(
     # own _meta.json so there is no shared-state split.
     ns: dict[int, dict] = {}
     for n in ngram_orders:
-        n_dir = cfg.ngram_dir(n, padded=cfg.exp.pad_sentences)
+        n_dir = cfg.ngram_dir(n, padded=cfg.exp.pad_sentences, pad_style=cfg.exp.pad_style)
         n_dir.mkdir(parents=True, exist_ok=True)
         n_meta_path = n_dir / "_meta.json"
 
@@ -928,12 +1099,17 @@ def create_ngram_vectors_parquet_sharded(
     if raw_seen > 0:
         ds = ds.skip(raw_seen)
 
+    dedup = _Deduper(cfg.exp.dedup, cfg.exp.dedup_min_tokens,
+                     ns[ngram_orders[0]]["output_dir"], raw_seen)
+
     def gen_texts() -> Iterator[str]:
         nonlocal raw_seen
         for ex in ds:
             raw_seen += 1
             txt = ex.get(cfg.hf.text_column)
             if not txt or len(txt) > cfg.exp.max_text_length:
+                continue
+            if dedup.drop_doc(txt):
                 continue
             yield txt
 
@@ -958,9 +1134,12 @@ def create_ngram_vectors_parquet_sharded(
                         if not tok.is_punct and not tok.is_space and tok.lemma_.strip()
                         and not (cfg.exp.content_only and tok.is_stop)
                     ]
+                    if dedup.drop_sent(lemmas):
+                        continue
                     for n in ngram_orders:
                         rows = _extract_ngrams_from_lemmas(
-                            lemmas, n, global_sent_id, pad=cfg.exp.pad_sentences
+                            lemmas, n, global_sent_id, pad=cfg.exp.pad_sentences,
+                            pad_style=cfg.exp.pad_style,
                         )
                         if rows:
                             ns[n]["buffer"].extend(rows)
@@ -1003,7 +1182,11 @@ def create_ngram_vectors_parquet_sharded(
                 ns[n]["writer"].close()
                 ns[n]["writer"] = None
         save_all_metas()
+        dedup.save(raw_seen)
         gc.collect()
+
+    if dedup.mode != "none":
+        print(dedup.summary())
 
     for n in ngram_orders:
         print(f"{n}-gram vectors written: {ns[n]['vector_count']:,} (dir: {ns[n]['output_dir']})")
@@ -1063,7 +1246,7 @@ def create_raw_ngram_vectors_parquet_sharded(
 
     ns: dict[int, dict] = {}
     for n in ngram_orders:
-        n_dir = cfg.ngram_dir(n, raw=True, padded=cfg.exp.pad_sentences)
+        n_dir = cfg.ngram_dir(n, raw=True, padded=cfg.exp.pad_sentences, pad_style=cfg.exp.pad_style)
         n_dir.mkdir(parents=True, exist_ok=True)
         n_meta_path = n_dir / "_meta.json"
 
@@ -1114,6 +1297,10 @@ def create_raw_ngram_vectors_parquet_sharded(
                 encoding="utf-8",
             )
 
+    # Buffers hold Arrow tables (built in the workers), not row dicts.
+    for st in ns.values():
+        st["buffer_rows"] = 0
+
     def flush_n(n: int) -> None:
         st = ns[n]
         if not st["buffer"]:
@@ -1122,8 +1309,11 @@ def create_raw_ngram_vectors_parquet_sharded(
             st["writer"], st["part_id"] = _safe_open_part_writer(
                 st["output_dir"], st["part_id"], st["schema"]
             )
-        wrote = flush_parquet(st["writer"], st["buffer"], SCHEMA=st["schema"])
+        table = pa.concat_tables(st["buffer"])
+        st["writer"].write_table(table)
+        wrote = table.num_rows
         st["buffer"].clear()
+        st["buffer_rows"] = 0
         st["vector_count"] += wrote
         st["part_rows"] += wrote
         if st["part_rows"] >= cfg.exp.rows_per_part:
@@ -1132,10 +1322,8 @@ def create_raw_ngram_vectors_parquet_sharded(
             st["part_id"] += 1
             st["part_rows"] = 0
 
-    # Blank model: tokeniser + rule-based sentenciser only; no tagger or lemmatiser.
-    nlp = spacy.blank("en")
-    nlp.add_pipe("sentencizer")
-    nlp.max_length = 1_000_000
+    if cfg.exp.pad_sentences and cfg.exp.pad_style not in PAD_STYLES:
+        raise ValueError(f"Unknown pad_style {cfg.exp.pad_style!r}; expected one of {PAD_STYLES}.")
 
     ds_kwargs = dict(split=cfg.hf.split, streaming=True)
     ds = (
@@ -1146,47 +1334,87 @@ def create_raw_ngram_vectors_parquet_sharded(
     if raw_seen > 0:
         ds = ds.skip(raw_seen)
 
-    def gen_texts() -> Iterator[str]:
-        nonlocal raw_seen
+    dedup = _Deduper(cfg.exp.dedup, cfg.exp.dedup_min_tokens,
+                     ns[ngram_orders[0]]["output_dir"], raw_seen)
+
+    # read_seen = docs taken from the stream; raw_seen (saved in _meta.json) only
+    # advances once a batch's windows are buffered, so resume never skips docs.
+    read_seen = raw_seen
+
+    def gen_batches(size: int) -> Iterator[tuple[list[str], int]]:
+        nonlocal read_seen
+        batch: list[str] = []
         for ex in ds:
-            raw_seen += 1
+            read_seen += 1
             txt = ex.get(cfg.hf.text_column)
             if not txt or len(txt) > cfg.exp.max_text_length:
                 continue
-            yield txt
+            batch.append(txt)
+            if len(batch) >= size:
+                yield batch, read_seen
+                batch = []
+        if batch:
+            yield batch, read_seen
 
-    def chunked(iterable, size):
-        it = iter(iterable)
-        while True:
-            batch = list(islice(it, size))
-            if not batch:
-                return
-            yield batch
+    def consume(res: dict, batch_end: int) -> None:
+        """Main process: dedup on worker hashes, sent_ids, mask windows — in stream order."""
+        nonlocal global_sent_id, raw_seen
+        keep = dedup.keep_mask(res["doc_h"], res["sent_doc"], res["sent_h"], res["sent_ok"])
+        # Kept sentences are numbered consecutively, as before.
+        sent_ids = global_sent_id + np.cumsum(keep) - 1
+        global_sent_id += int(keep.sum())
+        all_kept = bool(keep.all())
+        for n in ngram_orders:
+            counts = res["counts"][n]
+            sid = np.repeat(sent_ids, counts)
+            cols = res["cols"][n]
+            if not all_kept:
+                wmask = np.repeat(keep, counts)
+                sid = sid[wmask]
+                mask = pa.array(wmask)
+                cols = [c.filter(mask) for c in cols]
+            if len(sid) == 0:
+                continue
+            table = pa.Table.from_arrays([pa.array(sid, type=pa.int64()), *cols], schema=ns[n]["schema"])
+            ns[n]["buffer"].append(table)
+            ns[n]["buffer_rows"] += table.num_rows
+        raw_seen = batch_end
+
+    # Workers tokenise, hash and build the windows as Arrow columns; the main
+    # process only does the order-dependent parts (dedup sets, sent_ids, writing).
+    n_workers = max(1, compute_num_threads(cfg.exp.cpu_frac) - 1)
+    max_pending = 4 * n_workers
+    print(f"Tokenising with {n_workers} worker processes")
+    worker_opts = dict(
+        orders=list(ngram_orders), pad=cfg.exp.pad_sentences, pad_style=cfg.exp.pad_style,
+        content_only=cfg.exp.content_only, dedup=cfg.exp.dedup,
+        min_tokens=cfg.exp.dedup_min_tokens, batch_size=cfg.exp.batch_size,
+    )
+    pool = mp.get_context("spawn").Pool(
+        n_workers, initializer=_raw_worker_init, initargs=(worker_opts,),
+    )
+    pending: deque = deque()
+    batches = gen_batches(cfg.exp.batch_size * 8)
 
     start_time = time.time()
     last_log_time = start_time
 
     try:
-        for text_batch in chunked(gen_texts(), cfg.exp.batch_size * 8):
-            for doc in nlp.pipe(text_batch, batch_size=cfg.exp.batch_size):
-                for sent in doc.sents:
-                    tokens = [
-                        tok.lower_
-                        for tok in sent
-                        if not tok.is_punct and not tok.is_space and tok.text.strip()
-                        and not (cfg.exp.content_only and tok.is_stop)
-                    ]
-                    for n in ngram_orders:
-                        rows = _extract_ngrams_from_lemmas(
-                            tokens, n, global_sent_id, pad=cfg.exp.pad_sentences
-                        )
-                        if rows:
-                            ns[n]["buffer"].extend(rows)
-                    global_sent_id += 1
+        while True:
+            while len(pending) < max_pending:
+                nxt = next(batches, None)
+                if nxt is None:
+                    break
+                texts, batch_end = nxt
+                pending.append((pool.apply_async(_raw_worker_batch, (texts,)), batch_end))
+            if not pending:
+                break
+            res, batch_end = pending.popleft()
+            consume(res.get(), batch_end)
 
             flushed = False
             for n in ngram_orders:
-                if len(ns[n]["buffer"]) >= cfg.exp.rows_per_flush:
+                if ns[n]["buffer_rows"] >= cfg.exp.rows_per_flush:
                     flush_n(n)
                     flushed = True
             if flushed:
@@ -1205,6 +1433,7 @@ def create_raw_ngram_vectors_parquet_sharded(
                     f"[{elapsed:,.1f}s] raw_seen={raw_seen:,} | sentences={global_sent_id:,} | "
                     f"{per_n} | vec/s={vps:,.0f} | "
                     f"ETA={eta_seconds / 3600:,.2f}h ({eta_seconds / 60:,.1f}m)"
+                    + (f" | {dedup.summary()}" if dedup.mode != "none" else "")
                 )
                 last_log_time = now
 
@@ -1214,13 +1443,27 @@ def create_raw_ngram_vectors_parquet_sharded(
     except KeyboardInterrupt:
         print("\nGracefully interrupting and flushing buffers...")
     finally:
+        # Write out batches already sent to workers: their docs are in the dedup
+        # hashes, so dropping them would lose those docs on resume.
+        try:
+            while pending:
+                res, batch_end = pending.popleft()
+                consume(res.get(), batch_end)
+        except Exception as e:
+            print(f"Warning: could not drain pending batches ({e!r}); resume restarts at raw_seen={raw_seen:,}.")
+        pool.terminate()
+        pool.join()
         for n in ngram_orders:
             flush_n(n)
             if ns[n]["writer"]:
                 ns[n]["writer"].close()
                 ns[n]["writer"] = None
         save_all_metas()
+        dedup.save(raw_seen)
         gc.collect()
+
+    if dedup.mode != "none":
+        print(dedup.summary())
 
     for n in ngram_orders:
         print(f"{n}-gram (raw) vectors written: {ns[n]['vector_count']:,} (dir: {ns[n]['output_dir']})")

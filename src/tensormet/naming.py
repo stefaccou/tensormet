@@ -41,6 +41,7 @@ ALL_METHODS = [
     "probLog", "probLogSoftPlus", "probLogShifted",
     "sii", "siiSoftPlus", "siiShifted",
     "sc",  "scSoftPlus",  "scShifted", "scSoftPlusFlat", "scFW",
+    "scCDS", "scCDSSoftPlus",
 ]
 
 # Default subset population builds when tensors_to_build is not given. Kept
@@ -77,7 +78,7 @@ def _r0(rank: _Rank) -> int:
     return rank[0] if rank else 0
 
 
-_DECOMPOSITION_TAG = {"cp": "CP", "tt": "TT"}
+_DECOMPOSITION_TAG = {"cp": "CP", "tt": "TT", "utt": "UTT"}
 
 
 def _order_tag(order: int, decomposition: str = "tucker", solver: str = "mu",
@@ -93,10 +94,11 @@ def _order_tag(order: int, decomposition: str = "tucker", solver: str = "mu",
     ``tt_rank`` is required for decomposition='tt' and ignored otherwise: the
     bond dimension fixes the TT core shapes, so runs differing only in it are
     different models."""
-    if decomposition == "tt":
+    if decomposition in ("tt", "utt"):
+        # 'utt' (EXPERIMENTAL shared-core TT) carries its bond the same way.
         if tt_rank is None:
-            raise ValueError("decomposition='tt' needs tt_rank to build a filename")
-        base = f"TT{int(tt_rank)}b{order}D"
+            raise ValueError(f"decomposition={decomposition!r} needs tt_rank to build a filename")
+        base = f"{_DECOMPOSITION_TAG[decomposition]}{int(tt_rank)}b{order}D"
     else:
         base = f"{_DECOMPOSITION_TAG.get(decomposition, '')}{order}D"
     return f"SGD{base}" if solver == "sgd" else base

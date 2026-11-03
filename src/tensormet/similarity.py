@@ -12,6 +12,9 @@ import pyarrow.parquet as pq
 import torch
 from scipy.stats import spearmanr
 
+# Max entries in one [batch, vocab] similarity block (~64 MB in fp32).
+_SIM_BLOCK_ELEMS = 2 ** 24
+
 def get_eval_num_threads(fraction: float = 0.75, min_threads: int = 1) -> int:
     """Return n_threads ≈ fraction * available CPUs (at least min_threads).
 
@@ -91,6 +94,15 @@ def evaluate_sample(tensor,
     # Move indices to GPU once
     indices_tensor = torch.tensor(valid_indices, device=device)
 
+    # Cap the [batch, vocab] similarity block so a large vocabulary doesn't take
+    # VRAM the decomposition's batch sizing assumed was free.
+    max_vocab = max(int(F.shape[0]) for F in tensor.factors)
+    batch_size = max(1, min(batch_size, _SIM_BLOCK_ELEMS // max_vocab))
+
+    # Unit-norm factor rows, once per distinct matrix: tied (shared) modes hold
+    # the same tensor, so every role after the first reuses it.
+    F_hat_cache = {}
+
     # Accumulators
     rank_score = 0.0
     prob_score = 0.0
@@ -103,7 +115,9 @@ def evaluate_sample(tensor,
 
     for i, role_name in enumerate(role_pbar):
         F = tensor.factors[i]
-        F_norm = torch.norm(F, p=2, dim=1, keepdim=True).clamp(min=eps)
+        if id(F) not in F_hat_cache:
+            F_hat_cache[id(F)] = F / torch.norm(F, p=2, dim=1, keepdim=True).clamp(min=eps)
+        F_hat = F_hat_cache[id(F)]
 
         # Fine-grained sentence-level progress bar
         sentence_pbar = tqdm(total=num_valid,
@@ -118,25 +132,25 @@ def evaluate_sample(tensor,
 
             # GPU Prediction (Tucker contraction)
             G_batch = tensor.batch_excluded_role_vector(b_idx, role_name)
-            G_norm = torch.norm(G_batch, p=2, dim=1, keepdim=True).clamp(min=eps)
+            G_hat = G_batch / torch.norm(G_batch, p=2, dim=1, keepdim=True).clamp(min=eps)
 
             # Cosine Similarity via Batched Matrix Multiplication
             # [Batch, Rank] @ [Rank, Vocab] -> [Batch, Vocab]
-            similarities = torch.mm(G_batch, F.t()) / torch.mm(G_norm, F_norm.t())
-            similarities = torch.clamp(similarities, -1.0, 1.0)
+            similarities = torch.mm(G_hat, F_hat.t()).clamp_(-1.0, 1.0)
 
             # Target score extraction
             targets = b_idx[:, i]
-            sim_target = similarities[torch.arange(curr_batch_len), targets].view(-1, 1)
+            rows = torch.arange(curr_batch_len, device=device)
+            sim_target = similarities[rows, targets].view(-1, 1)
 
             # Vectorized Rank Calculation (Parallel count on GPU)
             ranks = torch.sum(similarities >= sim_target, dim=1)
             ranks = torch.clamp(ranks, min=1)
             rank_score += torch.sum(1.0 / ranks.float()).item() / n_roles
 
-            # Softmax Probability
-            probs = torch.softmax(similarities / softmax_temperature, dim=1)
-            p_target = probs[torch.arange(curr_batch_len), targets]
+            # Softmax probability of the target only: exp(s_t/T - logsumexp(s/T))
+            log_norm = torch.logsumexp(similarities.div_(softmax_temperature), dim=1)
+            p_target = torch.exp(sim_target.view(-1) / softmax_temperature - log_norm)
             prob_score += torch.sum(p_target).item() / n_roles
 
             # CPU Tilde Check (Minimal data transfer)

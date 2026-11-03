@@ -43,7 +43,8 @@ class UpdateRouting:
 def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedim=False,
                             masked: bool = False, decomposition: str = "tucker",
                             cp_inner_iters: int = 1,
-                            cp_scooch_kappa: float = 0.0) -> UpdateRouting:
+                            cp_scooch_kappa: float = 0.0,
+                            utt_core_power=None) -> UpdateRouting:
     """Return the correct update functions for the step if logging is active.
 
     masked : bool
@@ -63,6 +64,12 @@ def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedi
     if decomposition == "tt":
         from tensormet.tt_hybrid.tt_routing import get_tt_update_routing_step
         return get_tt_update_routing_step(divergence=divergence, log_step=log_step)
+
+    if decomposition == "utt":
+        # EXPERIMENTAL shared-core TT (experimental/uniform_tt/README.md).
+        from tensormet.experimental.uniform_tt.utt_routing import get_utt_update_routing_step
+        return get_utt_update_routing_step(divergence=divergence, log_step=log_step,
+                                           core_power=utt_core_power)
 
     if decomposition == "cp":
         from tensormet.experimental.CP.cp_routing import get_cp_update_routing_step

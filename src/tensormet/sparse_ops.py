@@ -1246,6 +1246,10 @@ def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, rando
     elif init == "svd_gpu":
         return _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state,
                                           with_core=with_core)
+    elif init == "svd_stream":
+        from tensormet.experimental.stream_svd import initialize_svd_stream
+        return initialize_svd_stream(sparse_tensor, shape, rank, modes, random_state,
+                                     with_core=with_core)
     else:
         core, factors = init
 

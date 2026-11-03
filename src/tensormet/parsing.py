@@ -133,6 +133,11 @@ def _none_if_missing(value, sentinel=None):
     return None if value is sentinel else value
 
 
+def _parse_utt_core_power(s: str):
+    """--utt-core-power: a fixed exponent (float) or "auto" (backtracking)."""
+    return "auto" if s.strip().lower() == "auto" else float(s)
+
+
 def _parse_gpu_id(s: str):
     """
     Parse --gpu-id as a single int or a comma-separated list of ints.
@@ -191,6 +196,32 @@ def _parse_top_ks_asymmetric(s: str) -> Tuple[Tuple[int, ...], ...]:
     return tuple(variants)
 
 
+def _parse_dim_or_min_count(s: str):
+    """--dim: "mc<N>" is kept as a string (resolved once the dataset is known);
+    anything else goes through _parse_dim unchanged."""
+    s_strip = s.strip()
+    if s_strip.startswith("mc") and s_strip[2:].isdigit():
+        return s_strip
+    return _parse_dim(s)
+
+
+def _resolve_min_count_dim(spec: str, data_dir: Path, dataset: str) -> "int | Tuple[int, ...]":
+    """'mc50' -> the k the population recorded for --min-count 50
+    (populated/min_count_ks.json, written by population.py)."""
+    path = Path(data_dir) / "tensors" / dataset / "populated" / "min_count_ks.json"
+    if not path.exists():
+        raise SystemExit(f"--dim {spec}: {path} not found - run the population with "
+                         f"--min-count {spec[2:]} first.")
+    ks = json.loads(path.read_text())
+    if spec[2:] not in ks:
+        raise SystemExit(f"--dim {spec}: no min-count {spec[2:]} entry in {path} "
+                         f"(has: {', '.join(sorted(ks, key=int)) or 'none'}).")
+    k = ks[spec[2:]]
+    dim = k if isinstance(k, int) else (k[0] if len(set(k)) == 1 else tuple(k))
+    print(f"[parsing] --dim {spec} -> {dim} (from {path})")
+    return dim
+
+
 def _parse_dim(s: str) -> "int | Tuple[int, ...]":
     """Parse --dim as a single int or comma-separated ints (for asymmetric tensors).
 
@@ -229,7 +260,9 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--method", type=str, default=None)
     parser.add_argument("--divergence", type=str, default=None)
-    parser.add_argument("--dim", type=_parse_dim, default=None)
+    parser.add_argument("--dim", type=_parse_dim_or_min_count, default=None,
+                        help="Vocab size k (or comma-separated per mode), or mc<N> for the "
+                             "variant built with --min-count N, e.g. --dim mc50.")
     parser.add_argument("--order", type=int, default=None) # new: order
     parser.add_argument("--rank", type=str, default=None,
                         help="Comma-separated ranks, e.g. --rank 100,100,100 or single int")
@@ -278,9 +311,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--max-nnz", type=int, dest="max_nnz", default=None,
                         help="Hard ceiling on NNZ entries used per update step (global across "
                              "all GPU shards). Combines with --subsample-frac as "
-                             "min(round(frac*nnz), max_nnz). 0 disables. Note: "
-                             "--subsample-warmup iterations still use the full tensor.")
-    parser.add_argument("--subsample-warmup", type=int, dest="subsample_warmup", default=None)
+                             "min(round(frac*nnz), max_nnz). 0 disables.")
     parser.add_argument("--objective", type=str, default=None,
                         choices=["full", "masked"],
                         help="'full' fits the zero-filled tensor (count data); "
@@ -347,16 +378,23 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
 
     # 'cp' is still EXPERIMENTAL (reviews/CP_IMPLEMENTATION_PLAN.md); 'tt' is not.
     parser.add_argument("--decomposition", type=str, default=None,
-                        choices=["tucker", "cp", "tt"],
+                        choices=["tucker", "cp", "tt", "utt"],
                         help="Decomposition family: 'tucker' (default, existing pipeline), "
                              "'tt' (Tucker-TT hybrid: Tucker factors, tensor-train core) "
                              "or 'cp' (EXPERIMENTAL nonnegative CP). Both non-Tucker "
                              "families support --n-gpus > 1 and are objective=full only; "
-                             "'tt' is KL only.")
+                             "'tt' is KL only. 'utt' (EXPERIMENTAL) is 'tt' with one core "
+                             "shared by every position; it needs all modes in shared_factors.")
     parser.add_argument("--tt-rank", type=int, dest="tt_rank", default=None,
                         help="TT only: bond dimension of the tensor-train core (default 100). "
                              "Part of the artifact name ('TT{tt_rank}b{order}D'), so runs at "
                              "different bonds never share files.")
+    parser.add_argument("--utt-core-power", type=_parse_utt_core_power, dest="utt_core_power",
+                        default=None,
+                        help="UTT only: exponent of the shared-core MU step (default 1 = undamped; "
+                             "1/order guarantees the KL error never increases, but moves slowly). "
+                             "'auto' starts at 1 and halves the exponent (down to 1/order) whenever "
+                             "a core step raises the KL on the iteration's window, undoing that step.")
     parser.add_argument("--cp-inner-iters", type=int, dest="cp_inner_iters", default=None,
                         help="CP only: CP-APR inner iterations per mode per sweep (default 1).")
     parser.add_argument("--cp-scooch-kappa", type=float, dest="cp_scooch_kappa", default=None,
@@ -409,12 +447,21 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
             print(f"[parsing] --order not given; inferred order={inferred_order} from n-gram label")
             parsed_dict["order"] = inferred_order
 
+    # --dim mc<N>: look up the k of the --min-count N variant
+    if isinstance(parsed_dict.get("dim"), str):
+        parsed_dict["dim"] = _resolve_min_count_dim(
+            parsed_dict["dim"],
+            parsed_dict.get("data_dir") or default_train.data_dir,
+            parsed_dict.get("dataset") or default_exp.dataset,
+        )
+
     # Build new ExperimentConfig from defaults, overriding only provided values
     exp_kwargs = {}
     for field in ("dataset", "method", "order", "divergence", "dim", "name",
                   "random_state", "epsilon", "init", "normalize_factors",
                   "shared_factors", "subsample_frac", "max_nnz", "objective",
                   "decomposition", "cp_inner_iters", "cp_scooch_kappa", "tt_rank",
+                  "utt_core_power",
                   "solver", "sgd_lr", "sgd_batch_size", "sgd_optimizer",
                   "sgd_parametrization", "sgd_steps_per_iteration", "sgd_warm_start",
                   "sgd_batch_scope", "sgd_sync_every", "sgd_micro_batch",
@@ -448,7 +495,6 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "resume",
         "n_gpus",
         "gpu_id",
-        "subsample_warmup",
         "max_cpu_frac",
         "tier1",
         "overwrite",
@@ -564,6 +610,32 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
         help="Pad each sentence with n-1 <s> tokens and one </s> before extracting "
              "n-grams (default: true). Padded output goes to a separate '-bos-eos' dir.",
     )
+    parser.add_argument(
+        "--pad-style",
+        type=str,
+        dest="pad_style",
+        choices=["bos-eos", "padded"],
+        default=None,
+        help="With --pad-sentences: 'bos-eos' (n-1 <s> + one </s>, default) or 'padded' "
+             "(one <s> + one </s>). Output dir is tagged '-bos-eos' or '-padded'.",
+    )
+    parser.add_argument(
+        "--dedup",
+        type=str,
+        dest="dedup",
+        choices=["none", "doc", "sent"],
+        default=None,
+        help="N-grams only: 'doc' skips exact-duplicate documents, 'sent' also skips "
+             "repeated sentences (>= --dedup-min-tokens tokens; first occurrence kept). "
+             "Default 'none'. Output dir is tagged '-dedup-doc' / '-dedup-sent'.",
+    )
+    parser.add_argument(
+        "--dedup-min-tokens",
+        type=int,
+        dest="dedup_min_tokens",
+        default=None,
+        help="With --dedup sent: shorter sentences are never deduplicated (default: 5).",
+    )
 
     parser.add_argument(
         "--content-only",
@@ -612,6 +684,9 @@ def parse_vector_run_config(argv: Optional[List[str]] = None) -> VectorRunConfig
         "cpu_frac",
         "log_every_s",
         "pad_sentences",
+        "pad_style",
+        "dedup",
+        "dedup_min_tokens",
         "content_only",
         "ngram_label",
         "name",
@@ -727,14 +802,18 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
     parser.add_argument("--tensors-to-build", type=_parse_cols_to_build, dest="tensors_to_build", default=None,
                         help="Comma-separated list of tensor names to build. Omit for the default set "
                              "(countingLog,countingLogEps,scSoftPlus). "
-                             "Valid: counting,countingLog,countingLogEps,probLog,probLogSoftPlus,probLogShifted,sii,siiSoftPlus,siiShifted,sc,scSoftPlus,scShifted,scSoftPlusFlat,scFW. "
+                             "Valid: counting,countingLog,countingLogEps,probLog,probLogSoftPlus,probLogShifted,sii,siiSoftPlus,siiShifted,sc,scSoftPlus,scShifted,scSoftPlusFlat,scFW,scCDS,scCDSSoftPlus. "
                              "E.g. --tensors-to-build counting,countingLog,sc")
+    parser.add_argument("--min-count", type=_parse_top_ks, dest="min_count", default=None,
+                        help="Comma-separated count thresholds, e.g. --min-count 50,100. Each adds a "
+                             "variant next to --top-ks: k = number of words seen at least that many "
+                             "times (count averaged over linked modes). Saved and named by that k.")
 
     parsed = parser.parse_args(args=argv)
     d = vars(parsed)
 
-    # If only asymmetric variants were specified, don't pull in the default uniform top_ks.
-    if d.get("top_ks_asymmetric") is not None and d.get("top_ks") is None:
+    # If only asymmetric or min_count variants were specified, don't pull in the default uniform top_ks.
+    if (d.get("top_ks_asymmetric") is not None or d.get("min_count") is not None) and d.get("top_ks") is None:
         d["top_ks"] = ()
 
     if d.get("shared_factors") is False:
@@ -764,6 +843,7 @@ def parse_population_run_config(argv: Optional[List[str]] = None) -> PopulationR
             "min_mode_ks",
             "ensured_vocab",
             "tensors_to_build",
+            "min_count",
     ):
         if d.get(f) is not None:
             exp_kwargs[f] = d[f]

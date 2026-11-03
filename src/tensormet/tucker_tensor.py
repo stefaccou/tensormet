@@ -93,6 +93,18 @@ def _as_host(x):
     if isinstance(x, (list, tuple)):
         return [_as_host(v) for v in x]
     return cp.asnumpy(x)
+
+
+def _torch_views(arrays):
+    """Zero-copy torch views of CuPy arrays. A repeated array (tied modes) maps
+    to one tensor, so evaluate_sample normalises it only once."""
+    views = {}
+    for a in arrays:
+        if id(a) not in views:
+            views[id(a)] = torch.from_dlpack(a)
+    return [views[id(a)] for a in arrays]
+
+
 # Maps tensor role names to SimLex-999 POS tags (first match per POS wins)
 _SIMLEX_POS_MAP = {
     "root": "V", "verb": "V",
@@ -226,9 +238,9 @@ class TuckerDecomposition:
                 "decomposition='cp' loads through "
                 "tensormet.experimental.CP.cp_decomposition.CPDecomposition.load_from_disk"
             )
-        if decomposition not in ("tucker", "tt"):
-            raise ValueError(f"decomposition must be 'tucker' or 'tt'; got {decomposition!r}")
-        if decomposition == "tt" and tt_rank is None:
+        if decomposition not in ("tucker", "tt", "utt"):
+            raise ValueError(f"decomposition must be 'tucker', 'tt' or 'utt'; got {decomposition!r}")
+        if decomposition in ("tt", "utt") and tt_rank is None:
             tt_rank = 100  # matches ExperimentConfig.tt_rank
         base = os.path.join(DATA_DIR, "tensors", dataset)
         base = readonly_dispatch(base, tier1)
@@ -337,7 +349,7 @@ class TuckerDecomposition:
                 for line in f:
                     run_info = json.loads(line)
                     if run_info.get("results", {}).get("model_path") == decomp_path:
-                        _label = "Tucker-TT" if decomposition == "tt" else "Tucker"
+                        _label = {"tt": "Tucker-TT", "utt": "shared-core TT"}.get(decomposition, "Tucker")
                         print(f"Loaded {_label} decomposition with the following parameters:")
                         for key, value in run_info.items():
                             print(f"  {key}: {value}")
@@ -370,6 +382,11 @@ class TuckerDecomposition:
             from tensormet.tt_hybrid.tt_decomposition import TuckerTTDecomposition
             if not issubclass(cls, TuckerTTDecomposition):
                 target = TuckerTTDecomposition
+        elif decomposition == "utt":
+            # EXPERIMENTAL shared-core TT: the payload's first element is [C, α, ω].
+            from tensormet.experimental.uniform_tt.utt_decomposition import UniformTTDecomposition
+            if not issubclass(cls, UniformTTDecomposition):
+                target = UniformTTDecomposition
 
         instance = target(core, factors, vocab, shared_factors=parsed_shared, roles=roles)
         instance.decomp_path = Path(decomp_path)
@@ -1513,10 +1530,16 @@ class SparseTupleTensor:
             cp_scooch_kappa = getattr(cfg.exp, "cp_scooch_kappa", 0.0)
             # Tucker-TT hybrid (tt_hybrid/README.md).
             tt_rank = getattr(cfg.exp, "tt_rank", 100)
-            if decomposition not in ("tucker", "cp", "tt"):
+            # EXPERIMENTAL shared-core TT (experimental/uniform_tt/README.md).
+            utt_core_power = getattr(cfg.exp, "utt_core_power", None)
+            if decomposition not in ("tucker", "cp", "tt", "utt"):
                 raise ValueError(
-                    f"cfg.exp.decomposition must be 'tucker', 'cp' or 'tt'; got {decomposition!r}"
+                    f"cfg.exp.decomposition must be 'tucker', 'cp', 'tt' or 'utt'; got {decomposition!r}"
                 )
+            if decomposition == "utt" and utt_core_power == "auto":
+                # One controller for the whole run: its exponent carries across iterations.
+                from tensormet.experimental.uniform_tt.utt_ops import AdaptiveCorePower
+                utt_core_power = AdaptiveCorePower()
 
             # SGD solver (sgd/README.md). getattr for the same deserialized-config
             # back-compat reason as above: pre-SGD records carry none of these
@@ -1626,7 +1649,10 @@ class SparseTupleTensor:
         # tuple rather than a container class, so no module path ends up inside
         # the pickle and a saved model survives the code moving.
         _is_cp = decomposition == "cp"
-        _is_tt = decomposition == "tt"
+        # "utt" (shared-core TT) also keeps a list in `core` ([C, α, ω]), so it
+        # rides on every list-core TT branch; `_is_utt` marks where it differs.
+        _is_utt = decomposition == "utt"
+        _is_tt = decomposition in ("tt", "utt")
         if _is_cp:
             from tensorly.cp_tensor import CPTensor as TensorModel
         elif _is_tt:
@@ -1687,6 +1713,12 @@ class SparseTupleTensor:
             _sgd_resume_payload = checkpoint_tensor
             checkpoint_tensor = None
 
+        if init == "svd_stream" and not _is_sgd and checkpoint_tensor is None:
+            # Experimental streamed GPU SVD: pooled per tied group, all GPUs, cached.
+            from tensormet.experimental.stream_svd import set_run_context
+            set_run_context(cfg, tied_groups=nontrivial_linked_groups(self.shared_factors, num_factors=len(modes)),
+                            device_ids=list(range(getattr(cfg.train, "n_gpus", 1))))
+
         if _is_sgd:
             # Init (random or warm start) lives inside SGDTrainer; `core` and
             # `factors` stay undefined on this path — every downstream consumer
@@ -1705,7 +1737,16 @@ class SparseTupleTensor:
 
             core = [cp.asarray(C) for C in ckpt_core] if _is_tt else cp.asarray(ckpt_core)
             factors = [cp.asarray(factor) for factor in ckpt_factors]
-            if _is_tt:
+            if _is_utt:
+                _rho, _r = int(tt_rank), int(rank[0])
+                expected = [(_rho, _r, _rho), (_rho,), (_rho,)]
+                if [tuple(int(d) for d in C.shape) for C in core] != expected:
+                    raise ValueError(
+                        f"decomposition='utt' resumed a checkpoint whose core has shapes "
+                        f"{[tuple(C.shape) for C in core]}; expected {expected} "
+                        f"for rank={rank}, tt_rank={tt_rank}. Delete it or match the config."
+                    )
+            elif _is_tt:
                 from tensormet.tt_hybrid.tt_chain import core_shapes
                 expected = core_shapes(rank, tt_rank)
                 if [tuple(int(d) for d in C.shape) for C in core] != expected:
@@ -1729,6 +1770,13 @@ class SparseTupleTensor:
                 self.tensor, shape, rank, modes, init, random_state,
                 thread_budget=thread_budget, divergence=divergence, epsilon=epsilon,
             )
+        elif _is_utt:
+            from tensormet.experimental.uniform_tt.utt_ops import initialize_uniform_tt
+            # `core` = [C, α, ω]; every mode gets the same factor.
+            core, factors = initialize_uniform_tt(
+                self.tensor, shape, rank, modes, init, random_state,
+                tt_rank=tt_rank, thread_budget=thread_budget, epsilon=epsilon,
+            )
         elif _is_tt:
             from tensormet.tt_hybrid.tt_ops import initialize_tucker_tt
             # `core` = list of TT cores; see the swap-points note above.
@@ -1744,7 +1792,6 @@ class SparseTupleTensor:
 
         _n_gpus = getattr(cfg.train, "n_gpus", 1)
         _subsample_frac = getattr(cfg.exp, "subsample_frac", 1.0)
-        _subsample_warmup = getattr(cfg.train, "subsample_warmup", 0)
 
         # --- max_nnz: hard global ceiling on NNZ per update step ---
         # Resolved here into an effective fraction: every downstream frac<1.0
@@ -1904,6 +1951,11 @@ class SparseTupleTensor:
         # Sets of modes that share one matrix. {(0,1),(1,2),(2,3)} is one group of
         # four, not three pairs — linked_factors above only has the direct links.
         _tied_groups = nontrivial_linked_groups(self.shared_factors, num_factors=len(modes))
+        if _is_utt and [sorted(g) for g in _tied_groups] != [list(modes)]:
+            raise ValueError(
+                f"decomposition='utt' shares one core across all positions, so every mode "
+                f"must share one factor too (shared_factors='all'); got groups {_tied_groups}."
+            )
 
         # Make shared modes actually share from step 0. Init draws one matrix per
         # mode, and a resumed legacy checkpoint holds several (the old per-mode +
@@ -2021,7 +2073,11 @@ class SparseTupleTensor:
         # the judge is resident, so its footprint is accounted for) instead of
         # once per factor update, core sweep and error pass.
         _tt_batch_nnz = None
-        if _is_tt:
+        if _is_utt:
+            from tensormet.experimental.uniform_tt.utt_ops import estimate_batch_nnz_utt
+            with core[0].device:
+                _tt_batch_nnz = estimate_batch_nnz_utt(core, factors)
+        elif _is_tt:
             from tensormet.tt_hybrid.tt_ops import estimate_batch_nnz_tt
             # _gpu_free_bytes() reads whichever device is current; pin to the one
             # the cores live on so a sharded run never sizes against a shard's GPU.
@@ -2032,6 +2088,10 @@ class SparseTupleTensor:
         # Announce the routing family (sharding engages iff largedim and n_gpus > 1).
         if _is_cp:
             _selected_path = (f"cp (nnz-streaming, inner_iters={cp_inner_iters}"
+                              + (f", sharded×{_n_gpus}" if _sst is not None else "")
+                              + ")")
+        elif _is_utt:
+            _selected_path = (f"shared-core tt (nnz-streaming, bond={int(core[0].shape[0])}"
                               + (f", sharded×{_n_gpus}" if _sst is not None else "")
                               + ")")
         elif _is_tt:
@@ -2112,7 +2172,8 @@ class SparseTupleTensor:
                                                   largedim=largedim, masked=masked,
                                                   decomposition=decomposition,
                                                   cp_inner_iters=cp_inner_iters,
-                                                  cp_scooch_kappa=cp_scooch_kappa)
+                                                  cp_scooch_kappa=cp_scooch_kappa,
+                                                  utt_core_power=utt_core_power)
                 # --- multi-GPU routing override (largedim variants only) ---
                 # Sharding engages iff largedim is selected and n_gpus > 1. CP and
                 # TT have a single kernel family, so _largedim_selected doesn't apply.
@@ -2123,6 +2184,14 @@ class SparseTupleTensor:
                     routing = get_sharded_cp_update_routing_step(
                         _sst, divergence=divergence, log_step=log_step,
                         inner_iters=cp_inner_iters, scooch_kappa=cp_scooch_kappa,
+                    )
+                elif _is_utt and _sst is not None:
+                    from tensormet.experimental.uniform_tt.utt_routing import (
+                        get_sharded_utt_update_routing_step,
+                    )
+                    routing = get_sharded_utt_update_routing_step(
+                        _sst, divergence=divergence, log_step=log_step,
+                        core_power=utt_core_power,
                     )
                 elif _is_tt and _sst is not None:
                     from tensormet.tt_hybrid.tt_routing import (
@@ -2155,14 +2224,10 @@ class SparseTupleTensor:
                 # --- stochastic tensor selection ---
                 if _sst is not None:
                     _sst.set_iter_seed(iteration)
-                _use_subsample = (
-                    _subsample_frac < 1.0
-                    and iteration >= _subsample_warmup
-                    and _sst is None   # multi-GPU handles sampling internally
-                )
+                # _iter_sampler is None on the multi-GPU path (it samples internally)
                 _current_tensor = (
                     _iter_sampler.sample(iteration)
-                    if _use_subsample else self.tensor
+                    if _iter_sampler is not None else self.tensor
                 )
                 # --- factors ---
                 # A shared factor sits at several legs at once, so updating it
@@ -2350,29 +2415,35 @@ class SparseTupleTensor:
                 # The SGD path already runs on the pytorch backend; for MU this
                 # flips cupy -> pytorch for the eval stack (restored below).
                 tl.set_backend("pytorch")
+                # Eval runs on the GPU the model already lives on.
                 if _is_sgd:
                     _sem_core_np, _sem_factors_np = _sgd_trainer.materialize()
-                    core_cpu = tl.tensor(_sem_core_np)
-                    factors_cpu = [tl.tensor(f) for f in _sem_factors_np]
-                elif _is_tt:
-                    core_cpu = [tl.tensor(cp.asnumpy(C)) for C in core]
-                    factors_cpu = [tl.tensor(cp.asnumpy(f)) for f in factors]
+                    _eval_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    core_eval = torch.as_tensor(_sem_core_np, device=_eval_dev)
+                    factors_eval = [torch.as_tensor(f, device=_eval_dev) for f in _sem_factors_np]
                 else:
-                    core_cpu = tl.tensor(cp.asnumpy(core))
-                    factors_cpu = [tl.tensor(cp.asnumpy(f)) for f in factors]
+                    # Zero-copy torch views of the CuPy arrays; tied modes keep one tensor.
+                    core_eval = _torch_views(core) if _is_tt else torch.from_dlpack(core)
+                    factors_eval = _torch_views(factors)
                 roles = extract_roles_from_vocab(vocab)
                 if _is_cp:
                     # Same eval contract (batch_excluded_role_vector, judge and
                     # SimLex accessors), so everything downstream is unchanged.
                     from tensormet.experimental.CP.cp_decomposition import CPDecomposition
-                    tucker_decomp = CPDecomposition(weights=core_cpu, factors=factors_cpu,
+                    tucker_decomp = CPDecomposition(weights=core_eval, factors=factors_eval,
                                                     vocab=vocab, roles=roles)
+                elif _is_utt:
+                    from tensormet.experimental.uniform_tt.utt_decomposition import (
+                        UniformTTDecomposition,
+                    )
+                    tucker_decomp = UniformTTDecomposition(tt_cores=core_eval, factors=factors_eval,
+                                                           vocab=vocab, roles=roles)
                 elif _is_tt:
                     from tensormet.tt_hybrid.tt_decomposition import TuckerTTDecomposition
-                    tucker_decomp = TuckerTTDecomposition(tt_cores=core_cpu, factors=factors_cpu,
+                    tucker_decomp = TuckerTTDecomposition(tt_cores=core_eval, factors=factors_eval,
                                                           vocab=vocab, roles=roles)
                 else:
-                    tucker_decomp = TuckerDecomposition(core=core_cpu, factors=factors_cpu, vocab=vocab, roles=roles)
+                    tucker_decomp = TuckerDecomposition(core=core_eval, factors=factors_eval, vocab=vocab, roles=roles)
 
                 sem_out = evaluate_sample(
                     tucker_decomp,
@@ -2429,13 +2500,11 @@ class SparseTupleTensor:
                     try:
                         # The judge was loaded up-front (see setup) so its measured
                         # footprint is already reflected in every batch estimate; no
-                        # mid-run reload is needed here. But cp.asnumpy() above only
-                        # frees the CuPy *arrays* — CuPy's memory pool keeps the
-                        # underlying blocks cached rather than returning them to the
+                        # mid-run reload is needed here. But CuPy's memory pool keeps
+                        # freed blocks cached rather than returning them to the
                         # driver, so PyTorch's allocator can still fail to cudaMalloc
-                        # room for the judge's activations even though CuPy itself
-                        # has nothing live. Trim the pools right before scoring so the
-                        # freed decomposition memory is actually available to torch.
+                        # room for the judge's activations. Trim the pools right
+                        # before scoring so that memory is actually available to torch.
                         if _is_sgd:
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
@@ -2470,6 +2539,13 @@ class SparseTupleTensor:
                             sem_out = {**sem_out, **_dim_out}
                     except Exception as _dim_err:
                         print(f"Warning: dimension-consistency scoring failed ({_dim_err}); skipping.")
+
+                # The views would otherwise keep this iteration's arrays alive, and
+                # torch's cached eval buffers would eat the VRAM the next update's
+                # batch sizing assumes is free.
+                del tucker_decomp, core_eval, factors_eval
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 fitness_scores.append(sem_out)
                 if save_intermediate:  # every check, so the log is complete while the run is going

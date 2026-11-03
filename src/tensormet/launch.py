@@ -181,6 +181,7 @@ def launch_tensor_population(cfg):
             cpu_frac=cfg.exp.cpu_frac,
             max_mem_gb=cfg.exp.max_mem_gb,
             mem_per_worker_gb=cfg.exp.mem_per_worker_gb,
+            min_count=cfg.exp.min_count,
         )
 
     end_time = time.time()
@@ -379,9 +380,10 @@ def launch_nnt_decomposition(cfg):
 
         factors_t = [tl.tensor(_as_host(f)) for f in factors]
         _decomposition = getattr(cfg.exp, "decomposition", "tucker")
-        if _decomposition == "tt":
-            # Tucker-TT hybrid: `core` is the list of TT cores, and the payload is
-            # a plain tuple so the pickle carries no module path.
+        if _decomposition in ("tt", "utt"):
+            # Tucker-TT hybrid: `core` is the list of TT cores ([C, α, ω] for the
+            # shared-core 'utt'), and the payload is a plain tuple so the pickle
+            # carries no module path.
             tucker_decomp_torch = ([tl.tensor(_as_host(C)) for C in core], factors_t)
         elif _decomposition == "cp":
             from tensorly.cp_tensor import CPTensor
@@ -458,7 +460,7 @@ def launch_nnt_decomposition(cfg):
         )
         if not (cfg.exp.name and "bench" in cfg.exp.name):
             notify_discord(
-                f"Saved {'Tucker-TT' if _decomposition == 'tt' else _decomposition.capitalize()} "
+                f"Saved {({'tt': 'Tucker-TT', 'utt': 'shared-core TT'}).get(_decomposition, _decomposition.capitalize())} "
                 f"decomposition {cfg.exp.method} - "
                 f"{cfg.exp.dim}/{cfg.exp.rank[0]} to {final_paths['model']}"
                 f" in {end_time - start_time:.2f} seconds."
