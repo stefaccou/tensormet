@@ -13,7 +13,11 @@ X̂ = G ×_1 A^(1) ×_2 … ×_N A^(N), with non-negativity enforced through a
 parametrization (default ``softplus``: A = softplus(θ) + eps, so positivity is
 structural and gradients never die at the boundary; ``clamp`` stores the
 factors directly and projects onto [eps, ∞) after each optimizer step, which
-is closer in spirit to MU's clip but can zero-lock).
+is closer in spirit to MU's clip but can zero-lock; ``exp`` stores log-values,
+so every step is relative — see ``PARAMETRIZATIONS``).
+
+The TT and utt models (``sgd_tt.py``, ``experimental/uniform_tt/utt_sgd.py``)
+implement the same surface; ``sgd_trainer.make_sgd_model`` picks one.
 
 Objectives (matching the MU path's divergences and error normalizations)
 ------------------------------------------------------------------------
@@ -110,6 +114,37 @@ def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
     return torch.log(torch.expm1(y.clamp_min(1e-6)))
 
 
+# Non-negativity parametrizations: raw parameter θ -> non-negative view.
+#   softplus  softplus(θ) + eps
+#   clamp     θ itself, projected onto [eps, ∞) after each step
+#   exp       exp(θ): a rescale of the view is an additive shift of θ, which is
+#             what lets the TT/utt models re-gauge without spoiling Adam's state
+PARAMETRIZATIONS = ("softplus", "clamp", "exp")
+
+
+def view_from_raw(raw: torch.Tensor, parametrization: str, eps: float) -> torch.Tensor:
+    if parametrization == "softplus":
+        return F.softplus(raw) + eps
+    if parametrization == "exp":
+        return torch.exp(raw)
+    return raw
+
+
+def raw_from_view(view: torch.Tensor, parametrization: str, eps: float) -> torch.Tensor:
+    """Inverse of ``view_from_raw``, exact down to the dtype's ``tiny``.
+
+    Unlike ``_inv_softplus`` there is no 1e-6 clamp: ℓ1-normalized TT factors
+    have entries around 1/V, far below it. softplus⁻¹(y) = y + log(-expm1(-y)),
+    the overflow-free form of log(expm1(y))."""
+    tiny = torch.finfo(view.dtype).tiny
+    if parametrization == "softplus":
+        y = (view - eps).clamp_min(tiny)
+        return y + torch.log(-torch.expm1(-y))
+    if parametrization == "exp":
+        return torch.log(view.clamp_min(tiny))
+    return view
+
+
 def _contraction_plan(rank: Sequence[int]) -> Tuple[int, bool, int]:
     """``(split, gemm_left, width)`` for the two-group entry contraction.
 
@@ -150,7 +185,8 @@ def _intermediate_width(rank: Sequence[int]) -> int:
     return _contraction_plan(rank)[2]
 
 
-def _rank_derived_chunk(rank: Sequence[int], budget: int = 1 << 26) -> int:
+def _rank_derived_chunk(rank: Sequence[int], budget: int = 1 << 26,
+                        width: Optional[int] = None) -> int:
     """Largest entry count whose forward intermediate fits ``budget`` elements.
 
     ``budget`` defaults to 2^26 elements (~256 MB fp32). Under the two-group
@@ -160,13 +196,19 @@ def _rank_derived_chunk(rank: Sequence[int], budget: int = 1 << 26) -> int:
     width genuinely cannot be brought down (order 5+), where it binds and the
     budget is exceeded on purpose — a chunk of 1 would be unusable, but it means
     very large orders want an explicit ``--sgd-micro-batch``.
+
+    ``width`` overrides the per-entry intermediate size; models other than
+    Tucker pass their own (``model.entry_width``).
     """
-    return int(max(64, min(1 << 20, budget // _intermediate_width(rank))))
+    if width is None:
+        width = _intermediate_width(rank)
+    return int(max(64, min(1 << 20, budget // max(1, int(width)))))
 
 
-def _default_eval_chunk(rank: Sequence[int], budget: int = 1 << 26) -> int:
+def _default_eval_chunk(rank: Sequence[int], budget: int = 1 << 26,
+                        width: Optional[int] = None) -> int:
     """Entries per chunk in ``full_relative_error`` (see ``_rank_derived_chunk``)."""
-    return _rank_derived_chunk(rank, budget)
+    return _rank_derived_chunk(rank, budget, width=width)
 
 
 def _row_khatri_rao(rows: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -190,6 +232,8 @@ def resolve_micro_batch(
     dtype: torch.dtype = torch.float32,
     budget: int = 1 << 26,
     ceiling_bytes: int = 2 << 30,
+    *,
+    width: Optional[int] = None,
 ) -> int:
     """Entries per forward/backward inside one optimizer step.
 
@@ -204,15 +248,18 @@ def resolve_micro_batch(
     ``_default_eval_chunk`` uses. An explicit value is honoured but still
     checked against ``ceiling_bytes``, so an over-large request fails with a
     message naming the knob instead of a bare CUDA OOM.
+
+    ``width`` is the model's per-entry intermediate size (``model.entry_width``);
+    None derives Tucker's from the rank.
     """
     batch_size = int(batch_size)
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-    inter = _intermediate_width(rank)
+    inter = _intermediate_width(rank) if width is None else max(1, int(width))
     itemsize = torch.empty((), dtype=dtype).element_size()
 
     if micro_batch is None:
-        return min(batch_size, _rank_derived_chunk(rank, budget))
+        return min(batch_size, _rank_derived_chunk(rank, budget, width=inter))
 
     mb = int(micro_batch)
     if mb < 1:
@@ -223,10 +270,10 @@ def resolve_micro_batch(
         raise ValueError(
             f"An SGD forward pass at micro_batch={mb} and rank={tuple(rank)} would "
             f"allocate a {projected / 2**30:.1f} GiB intermediate "
-            f"({mb} entries x prod(rank[:-1])={inter} x {itemsize} B), above the "
+            f"({mb} entries x {inter} elements per entry x {itemsize} B), above the "
             f"{ceiling_bytes / 2**30:.1f} GiB ceiling — and autograd saves it for "
             f"the backward pass on top. Lower --sgd-micro-batch (the rank-derived "
-            f"default here is {min(batch_size, _rank_derived_chunk(rank, budget))}) "
+            f"default here is {min(batch_size, _rank_derived_chunk(rank, budget, width=inter))}) "
             f"or lower --rank."
         )
     return mb
@@ -312,8 +359,8 @@ class SGDTuckerModel(torch.nn.Module):
         if self.order > 25:
             raise ValueError("einsum-letter scheme supports order <= 25.")
         self.rank = _as_rank_tuple(rank, self.order)
-        if parametrization not in ("softplus", "clamp"):
-            raise ValueError("parametrization must be 'softplus' or 'clamp'.")
+        if parametrization not in PARAMETRIZATIONS:
+            raise ValueError(f"parametrization must be one of {PARAMETRIZATIONS}.")
         self.parametrization = parametrization
         self.eps = float(eps)
         self.owner = _parse_shared_factors(shared_factors, self.order)
@@ -350,7 +397,12 @@ class SGDTuckerModel(torch.nn.Module):
                 for f in factors0
             ]
 
-        to_raw = _inv_softplus if parametrization == "softplus" else (lambda t: t)
+        if parametrization == "softplus":
+            to_raw = _inv_softplus
+        elif parametrization == "exp":
+            to_raw = torch.log
+        else:
+            to_raw = lambda t: t  # noqa: E731
         self._core_raw = torch.nn.Parameter(to_raw(core0))
         # Only owner modes hold a Parameter; aliased modes read the owner's.
         self._factor_raw = torch.nn.ParameterDict({
@@ -362,6 +414,8 @@ class SGDTuckerModel(torch.nn.Module):
         self._split, self._gemm_left, self._width = _contraction_plan(self.rank)
         self._left_width = math.prod(self.rank[:self._split]) if self._split else 0
         self._right_width = math.prod(self.rank[self._split:]) if self._split else 0
+        # Largest forward intermediate per entry; sizes micro-batches and eval chunks.
+        self.entry_width = self._width
 
         # --- einsum equations, built once ---
         lo = einsum_letters(self.order)                  # core modes, lowercase
@@ -376,16 +430,16 @@ class SGDTuckerModel(torch.nn.Module):
 
     # --- non-negative views -------------------------------------------------
     @property
+    def device(self) -> torch.device:
+        return self._core_raw.device
+
+    @property
     def core(self) -> torch.Tensor:
-        if self.parametrization == "softplus":
-            return F.softplus(self._core_raw) + self.eps
-        return self._core_raw
+        return view_from_raw(self._core_raw, self.parametrization, self.eps)
 
     def factor(self, mode: int) -> torch.Tensor:
         raw = self._factor_raw[str(self.owner[mode])]
-        if self.parametrization == "softplus":
-            return F.softplus(raw) + self.eps
-        return raw
+        return view_from_raw(raw, self.parametrization, self.eps)
 
     @property
     def factors(self) -> List[torch.Tensor]:
@@ -458,6 +512,10 @@ class SGDTuckerModel(torch.nn.Module):
                 for p in self._factor_raw.values():
                     p.clamp_(min=self.eps)
 
+    def regauge_(self):
+        """No-op: the trainers call this on every model; only the chain
+        models (sgd_tt, utt_sgd) have a gauge to fix."""
+
     def materialize(self) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Detached CPU numpy (core, factors) — TuckerDecomposition-ready."""
         with torch.no_grad():
@@ -496,9 +554,10 @@ def _distinct_views(core, factors) -> List[torch.Tensor]:
 
     ``nonneg_views`` hands back one tensor object per distinct raw parameter, so
     identity is the right key here — this is the list whose gradients map
-    one-to-one onto the model's trainable parameters."""
-    out = [core]
-    seen = {id(core)}
+    one-to-one onto the model's trainable parameters. ``core`` may be a list
+    (the TT cores, or utt's [C, α, ω])."""
+    out = list(core) if isinstance(core, (list, tuple)) else [core]
+    seen = {id(t) for t in out}
     for f in factors:
         if id(f) not in seen:
             seen.add(id(f))
@@ -609,7 +668,8 @@ class GradStepper:
 
         self.batch_size = int(batcher.batch_size)
         self.micro_batch = resolve_micro_batch(
-            model.rank, self.batch_size, micro_batch, dtype=dtype
+            model.rank, self.batch_size, micro_batch, dtype=dtype,
+            width=model.entry_width,
         )
         self._slices = [
             (lo, min(lo + self.micro_batch, self.batch_size))
@@ -715,7 +775,8 @@ class GradStepper:
             leaf.grad = gbuf
             leaves.append(leaf)
         leaf_of = {id(s): l for s, l in zip(outs, leaves)}
-        core_l = leaf_of[id(core)]
+        core_l = ([leaf_of[id(c)] for c in core] if isinstance(core, (list, tuple))
+                  else leaf_of[id(core)])
         factors_l = [leaf_of[id(f)] for f in factors]
 
         for lo, hi in self._slices:
@@ -847,7 +908,7 @@ def full_relative_error(
     a coalesced tensor is sorted by index, not a sample.
     """
     if chunk is None:
-        chunk = _default_eval_chunk(model.rank)
+        chunk = _default_eval_chunk(model.rank, width=model.entry_width)
     core, factors = model.nonneg_views()
     nnz = values.shape[0]
     acc = values.new_zeros(())

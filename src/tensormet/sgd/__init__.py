@@ -15,9 +15,12 @@ _SUBMODULE_BY_NAME = {
     "sampled_loss": "sgd_tucker",
     "zero_entry_term": "sgd_tucker",
     "sgd_non_negative_tucker": "sgd_tucker",
+    "SGDTTModel": "sgd_tt",
     "SGDTrainer": "sgd_trainer",
+    "make_sgd_model": "sgd_trainer",
     "ShardedSGDTrainer": "sharded_sgd",
     "make_collective": "collectives",
+    "mu_init_for_sgd": "sgd_init",
 }
 
 __all__ = list(_SUBMODULE_BY_NAME)

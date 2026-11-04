@@ -35,6 +35,30 @@ from tensormet.sgd.sgd_tucker import (
 from tensormet.utils import SparseCOOTensor
 
 
+def make_sgd_model(decomposition: str = "tucker", *, shape, rank, tt_rank=None,
+                   parametrization="softplus", shared_factors=None, init="random",
+                   random_state=0, device=None, dtype=torch.float32, eps=_EPS,
+                   sum_x=None):
+    """The SGD model for ``decomposition``. All three share one surface, so the
+    trainers never branch on the model type. ``sum_x`` (Σ of the data) sets the
+    TT/utt random-init scale; Tucker ignores it, like ``tt_rank``."""
+    common = dict(shape=shape, rank=rank, parametrization=parametrization,
+                  shared_factors=shared_factors, init=init, random_state=random_state,
+                  device=device, dtype=dtype, eps=eps)
+    if decomposition == "tucker":
+        return SGDTuckerModel(**common)
+    if decomposition not in ("tt", "utt"):
+        raise ValueError(f"solver='sgd' supports decomposition 'tucker', 'tt' or 'utt'; "
+                         f"got {decomposition!r}")
+    if tt_rank is None:
+        raise ValueError(f"decomposition={decomposition!r} needs tt_rank.")
+    if decomposition == "tt":
+        from tensormet.sgd.sgd_tt import SGDTTModel
+        return SGDTTModel(tt_rank=tt_rank, sum_x=sum_x, **common)
+    from tensormet.experimental.uniform_tt.utt_sgd import SGDUTTModel
+    return SGDUTTModel(tt_rank=tt_rank, sum_x=sum_x, **common)
+
+
 class SGDTrainer:
     """Minibatch SGD/Adam trainer over a torch sparse COO tensor."""
 
@@ -61,6 +85,9 @@ class SGDTrainer:
         micro_batch: Optional[int] = None,
         cuda_graph: bool = False,
         resume_payload: Optional[dict] = None,
+        decomposition: str = "tucker",
+        tt_rank: Optional[int] = None,
+        regauge_every: int = 1,
     ):
         if objective not in ("full", "masked"):
             raise ValueError(f"objective must be 'full' or 'masked', got {objective!r}")
@@ -70,6 +97,8 @@ class SGDTrainer:
         if self.steps_per_iteration < 1:
             raise ValueError("steps_per_iteration must be >= 1")
         self.eval_chunk = eval_chunk
+        # Blocks between gauge resets (0 = never); a no-op for Tucker.
+        self.regauge_every = max(0, int(regauge_every))
 
         # SparseCOOTensor is load_from_disk's stand-in wherever prod(shape)
         # overflows torch's numel (order 5 at dim 10000). Only .coalesce() /
@@ -79,12 +108,13 @@ class SGDTrainer:
             raise TypeError("SGDTrainer expects a torch sparse COO tensor.")
         t = sparse_coo.coalesce()
 
-        self.model = SGDTuckerModel(
-            shape=t.shape, rank=rank, parametrization=parametrization,
-            shared_factors=shared_factors, init=init, random_state=random_state,
-            device=device, dtype=dtype, eps=epsilon,
+        self.model = make_sgd_model(
+            decomposition, shape=t.shape, rank=rank, tt_rank=tt_rank,
+            parametrization=parametrization, shared_factors=shared_factors,
+            init=init, random_state=random_state, device=device, dtype=dtype,
+            eps=epsilon, sum_x=float(t.values().sum()),
         )
-        self.device = self.model._core_raw.device
+        self.device = self.model.device
 
         self.indices = t.indices().to(self.device)
         self.values = t.values().to(self.device, dtype=dtype)
@@ -149,6 +179,8 @@ class SGDTrainer:
             self.stepper.compute_grads(step)
             self.opt.step()
             self.model.project_()
+        if self.regauge_every and (iteration + 1) % self.regauge_every == 0:
+            self.model.regauge_()
 
         if not log_step:
             return None
@@ -190,7 +222,7 @@ class SGDTrainer:
     # --- materialization / checkpointing ------------------------------------
 
     def materialize(self) -> Tuple[np.ndarray, List[np.ndarray]]:
-        """Detached CPU numpy (core, factors) — TuckerDecomposition-ready."""
+        """Detached CPU numpy (core, factors); for TT/utt ``core`` is a list."""
         return self.model.materialize()
 
     def checkpoint_payload(self, iteration: int) -> dict:

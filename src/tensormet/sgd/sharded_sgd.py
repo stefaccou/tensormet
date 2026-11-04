@@ -26,11 +26,11 @@ import numpy as np
 import torch
 
 from tensormet.sgd.collectives import make_collective
+from tensormet.sgd.sgd_trainer import make_sgd_model
 from tensormet.sgd.sgd_tucker import (
     _EPS,
     EntryBatcher,
     GradStepper,
-    SGDTuckerModel,
     _default_eval_chunk,
     make_eval_subset,
     sampled_loss,
@@ -71,6 +71,9 @@ class ShardedSGDTrainer:
         cuda_graph: bool = False,
         comm_backend: str = "auto",
         resume_payload: Optional[dict] = None,
+        decomposition: str = "tucker",
+        tt_rank: Optional[int] = None,
+        regauge_every: int = 1,
     ):
         if objective not in ("full", "masked"):
             raise ValueError(f"objective must be 'full' or 'masked', got {objective!r}")
@@ -88,6 +91,8 @@ class ShardedSGDTrainer:
             raise ValueError("steps_per_iteration must be >= 1")
         self.batch_scope = batch_scope
         self.sync_every = max(1, int(sync_every))
+        # Blocks between gauge resets (0 = never); a no-op for Tucker.
+        self.regauge_every = max(0, int(regauge_every))
 
         self.devices = [torch.device(f"cuda:{d}") for d in device_ids]
         n_shards = len(self.devices)
@@ -113,11 +118,13 @@ class ShardedSGDTrainer:
         # in the checkpointing sense; the optimizer step runs redundantly on all
         # of them off the same all-reduced gradient (see module docstring), so
         # there is no per-step parameter broadcast.
+        sum_x = float(values_all.sum())
         self._models = [
-            SGDTuckerModel(
-                shape=t.shape, rank=rank, parametrization=parametrization,
-                shared_factors=shared_factors, init=init, random_state=random_state,
-                device=dev, dtype=dtype, eps=epsilon,
+            make_sgd_model(
+                decomposition, shape=t.shape, rank=rank, tt_rank=tt_rank,
+                parametrization=parametrization, shared_factors=shared_factors,
+                init=init, random_state=random_state, device=dev, dtype=dtype,
+                eps=epsilon, sum_x=sum_x,
             )
             for dev in self.devices
         ]
@@ -181,7 +188,8 @@ class ShardedSGDTrainer:
             ))
         self.micro_batch = self.steppers[0].micro_batch
 
-        self.eval_chunk = eval_chunk or _default_eval_chunk(self.master.rank)
+        self.eval_chunk = eval_chunk or _default_eval_chunk(
+            self.master.rank, width=self.master.entry_width)
         # Per-shard eval subsets, sized proportionally so the union is a uniform
         # sample of the whole tensor and each shard's rescaled accumulator is an
         # unbiased estimate of its own nnz term (see make_eval_subset).
@@ -382,6 +390,9 @@ class ShardedSGDTrainer:
         self._opts[g].step()
         self._models[g].project_()
 
+    def _regauge(self, g: int) -> None:
+        self._models[g].regauge_()
+
     def _local_steps(self, g: int, first: int, n_steps: int) -> None:
         stepper, opt, model = self.steppers[g], self._opts[g], self._models[g]
         for step in range(first, first + n_steps):
@@ -410,6 +421,11 @@ class ShardedSGDTrainer:
                 self._fan_out(self._local_steps, step, n)
                 self._average_params()
                 step += n
+
+        # Replicas hold identical parameters here, and the reset is
+        # deterministic, so they stay bit-identical after it.
+        if self.regauge_every and (iteration + 1) % self.regauge_every == 0:
+            self._fan_out(self._regauge)
 
         if not log_step:
             return None

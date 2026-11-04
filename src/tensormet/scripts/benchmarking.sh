@@ -1,14 +1,19 @@
 #!/bin/bash
 
 # Canonical benchmark driver: runs the dataset × rank × divergence matrix for
-# ANY solver and appends one session entry to benchmark.json.
+# ANY variant and appends one session entry to benchmark.json.
 #
-#   benchmarking.sh                 # MU (multiplicative updates), the default
-#   benchmarking.sh --solver sgd    # torch minibatch solver
-#   benchmarking.sh --solver cp     # MU on the EXPERIMENTAL nonnegative CP family
-#   benchmarking.sh --solver tt     # MU on the Tucker-TT hybrid
+#   benchmarking.sh                 # tt: MU on the Tucker-TT hybrid (the default)
+#   benchmarking.sh utt             # MU on the EXPERIMENTAL shared-core TT
+#   benchmarking.sh mu              # MU on the full Tucker core
+#   benchmarking.sh sgd             # torch minibatch solver (Tucker)
+#   benchmarking.sh cp              # MU on the EXPERIMENTAL nonnegative CP family
+#   benchmarking.sh --solver utt    # same as the bare word
 #   benchmarking.sh --name "tc off" # free-text session label, shown in the notebook
 #   benchmarking.sh --max-seconds N # per-run kill switch (default 3600, 0 = off)
+#
+# Shared settings (method, dim, GPUs, datasets, ranks, seed, init) are the same
+# for every variant. Only what a variant cannot run is changed, see below.
 #
 # This is the ONE implementation. Everything else (2_benchmarking/*.sh for the
 # local box, scripts/9_hpc/tier{1,2}/*.sh for PBS/Slurm) is a thin wrapper that
@@ -19,10 +24,12 @@
 # Every setting below is overridable from the environment (BENCH_*) so wrappers
 # never need to edit the body. List-valued knobs are space-separated strings:
 #
-#   BENCH_SOLVER=mu|sgd|cp|tt  BENCH_N_GPUS=4   BENCH_METHOD=scSoftPlus
+#   BENCH_SOLVER=tt|utt|mu|sgd|cp  BENCH_N_GPUS=2  BENCH_METHOD=scSoftPlus
 #   BENCH_NAME="tensor cores off"   # session label recorded in benchmark.json
-#   BENCH_DATASETS="a b"    BENCH_RANKS="10 50" BENCH_DIVERGENCES="kl fr"
+#   BENCH_DATASETS="a b"    BENCH_RANKS="10 50"
+#   BENCH_DIVERGENCES="kl"  # default; "kl fr" re-enables the FR rows
 #   BENCH_DIM=10000         BENCH_ITERATIONS=4  BENCH_RUN_EXTRA=true
+#   BENCH_INIT=random       # init for every variant except sgd (always random)
 #   BENCH_JSON=/path/benchmark.json             BENCH_DRY_RUN=true
 #   BENCH_MAX_SECONDS_PER_DECOMP=3600           # per-run watchdog, 0 disables
 #   (sgd only) BENCH_SGD_LR, BENCH_SGD_BATCH_SIZE, BENCH_SGD_STEPS_PER_ITER,
@@ -30,7 +37,8 @@
 #              BENCH_SGD_WARM_START, BENCH_SGD_COMM_BACKEND,
 #              BENCH_LOG_EVERY, BENCH_RUN_VARIANTS
 #   (cp only)  BENCH_CP_INNER_ITERS, BENCH_CP_SCOOCH_KAPPA
-#   (tt only)  BENCH_TT_RANK                    # bond dimension, default 100
+#   (tt, utt)  BENCH_TT_RANK                    # bond dimension, default 100
+#   (utt only) BENCH_UTT_CORE_POWER             # float or "auto"; unset = 1
 #
 # --- How the solvers differ, and why ------------------------------------------
 # The SGD path rejects several MU-only knobs (guard rails in
@@ -60,13 +68,21 @@
 # ('TT{tt_rank}b{order}D'), so sessions at different bonds never collide on disk
 # and can be run back to back.
 #
+# UTT (experimental/uniform_tt/README.md) is TT with one core shared by every
+# position. Same flags as TT (KL only, no --largedim / --normalize-factors), and
+# one more difference: it needs ALL modes tied, so --shared-factors is "all" on
+# every dataset. On the 4-gram set that equals the usual "0-1,1-2,2-3"; on the
+# 3-gram sets it also ties mode 0, which the other variants leave free.
+# Note: at random init UTT can stall in a frequency-only state (flat error);
+# BENCH_INIT=svd_stream avoids that, but then set it for every variant.
+#
 # CONSEQUENCE FOR COMPARABILITY: MU's core matrix subsamples NNZ (0.25 / 0.025),
 # so it fits a *smaller tensor* than SGD does. Reconstruction errors across
 # different subsample fractions are not on the same tensor and must not be
 # diffed. The SGD matrix therefore runs at full data and keys its results with
 # the "__nosub" suffix, i.e. the same key MU emits in its no-subsampling extra
 # runs. Out of the box the aligned rows are the ones MU already runs full-data
-# (fineweb-en, rank 10, kl+fr); to align more, add them to _extra_configs with
+# (fineweb-en, rank 10, kl; plus fr when enabled); to align more, add them to _extra_configs with
 # subsample 1.0 and suffix "nosub". Other rows show "n/a" in the notebook.
 #
 # CP and TT need no such realignment: they run MU's subsample fractions and emit
@@ -101,11 +117,12 @@
 
 set -o pipefail
 
-SOLVER="${BENCH_SOLVER:-mu}"
+SOLVER="${BENCH_SOLVER:-tt}"
 DRY_RUN="${BENCH_DRY_RUN:-false}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        tt|utt|mu|sgd|cp) SOLVER="$1"; shift ;;
         --solver)   SOLVER="$2"; shift 2 ;;
         --n-gpus)   BENCH_N_GPUS="$2"; shift 2 ;;
         --method)   BENCH_METHOD="$2"; shift 2 ;;
@@ -113,7 +130,7 @@ while [[ $# -gt 0 ]]; do
         --max-seconds) BENCH_MAX_SECONDS_PER_DECOMP="$2"; shift 2 ;;
         --dry-run)  DRY_RUN=true; shift ;;
         -h|--help)
-            sed -n '3,10p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+            sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
             exit 0 ;;
         *)
             echo "ERROR: unknown argument '$1' (see --help)" >&2
@@ -121,31 +138,40 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$SOLVER" != "mu" && "$SOLVER" != "sgd" && "$SOLVER" != "cp" && "$SOLVER" != "tt" ]]; then
-    echo "ERROR: --solver must be 'mu', 'sgd', 'cp' or 'tt', got '$SOLVER'" >&2
-    exit 2
-fi
+case "$SOLVER" in
+    tt|utt|mu|sgd|cp) ;;
+    *)
+        echo "ERROR: variant must be tt, utt, mu, sgd or cp, got '$SOLVER'" >&2
+        exit 2 ;;
+esac
+
+# TT and UTT share the TT chain machinery.
+IS_TT_FAMILY=false
+[[ "$SOLVER" == "tt" || "$SOLVER" == "utt" ]] && IS_TT_FAMILY=true
 
 read -r -a DATASETS    <<< "${BENCH_DATASETS:-fineweb-en fineweb_english_1B 4-gram-raw-fineweb-en_100000000}"
 read -r -a RANKS       <<< "${BENCH_RANKS:-10 50 100}"
-read -r -a DIVERGENCES <<< "${BENCH_DIVERGENCES:-kl fr}"
+# FR is off by default (no longer used); BENCH_DIVERGENCES="kl fr" turns it back on.
+read -r -a DIVERGENCES <<< "${BENCH_DIVERGENCES:-kl}"
 
-# TT implements the KL/Poisson divergence only (the FR denominator needs a
-# doubled, Gram-weighted chain). Drop anything else rather than queueing runs
+# TT and UTT implement the KL/Poisson divergence only (the FR denominator needs
+# a doubled, Gram-weighted chain). Drop anything else rather than queueing runs
 # that are guaranteed to raise NotImplementedError at fit time.
-if [[ "$SOLVER" == "tt" ]]; then
+if [[ "$IS_TT_FAMILY" == "true" ]]; then
     _tt_dropped=()
     for _d in "${DIVERGENCES[@]}"; do
         [[ "$_d" != "kl" ]] && _tt_dropped+=("$_d")
     done
     if (( ${#_tt_dropped[@]} > 0 )); then
-        echo "NOTE: solver=tt is KL only; skipping divergence(s): ${_tt_dropped[*]}" >&2
+        echo "NOTE: $SOLVER is KL only; skipping divergence(s): ${_tt_dropped[*]}" >&2
     fi
     DIVERGENCES=(kl)
 fi
 DIM="${BENCH_DIM:-10000}"
 N_GPUS="${BENCH_N_GPUS:-2}"
-METHOD="${BENCH_METHOD:-counting}"
+METHOD="${BENCH_METHOD:-scSoftPlus}"
+# Init for every variant but sgd (which always starts random).
+INIT="${BENCH_INIT:-random}"
 # Free-text session label. Purely descriptive: it never touches run names or
 # combo keys, so a labelled session still diffs against an unlabelled one.
 NAME="${BENCH_NAME:-}"
@@ -184,12 +210,14 @@ RUN_VARIANTS="${BENCH_RUN_VARIANTS:-false}"
 CP_INNER_ITERS="${BENCH_CP_INNER_ITERS:-1}"
 CP_SCOOCH_KAPPA="${BENCH_CP_SCOOCH_KAPPA:-0.0}"
 
-# --- TT knob: bond dimension of the tensor-train core (kernel default is 100).
+# --- TT / UTT knob: bond dimension of the tensor-train core (kernel default 100).
 TT_RANK="${BENCH_TT_RANK:-100}"
 if ! [[ "$TT_RANK" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: BENCH_TT_RANK must be a positive integer, got '$TT_RANK'" >&2
     exit 2
 fi
+# --- UTT knob: core-step exponent (float or "auto"); empty = code default (1).
+UTT_CORE_POWER="${BENCH_UTT_CORE_POWER:-}"
 
 if [[ "$SOLVER" == "sgd" ]]; then
     ITERATIONS="${BENCH_ITERATIONS:-20}"
@@ -213,12 +241,12 @@ elif [[ "$SOLVER" == "cp" ]]; then
     LOG_EVERY="${BENCH_LOG_EVERY:-1}"
     SEM_CHECK_EVERY=4
     RUN_PREFIX="bench_cp_"
-elif [[ "$SOLVER" == "tt" ]]; then
+elif [[ "$IS_TT_FAMILY" == "true" ]]; then
     # Same cadence as MU and CP: one sweep per iteration.
     ITERATIONS="${BENCH_ITERATIONS:-4}"
     LOG_EVERY="${BENCH_LOG_EVERY:-1}"
     SEM_CHECK_EVERY=4
-    RUN_PREFIX="bench_tt_"
+    RUN_PREFIX="bench_${SOLVER}_"
 else
     ITERATIONS="${BENCH_ITERATIONS:-4}"
     LOG_EVERY="${BENCH_LOG_EVERY:-1}"
@@ -246,7 +274,7 @@ if (( N_GPUS > 1 )); then
 fi
 
 [[ -n "$NAME" ]] && echo "benchmark name:   $NAME"
-echo "benchmark config: solver=$SOLVER method=$METHOD dim=$DIM n_gpus=$N_GPUS iterations=$ITERATIONS"
+echo "benchmark config: variant=$SOLVER method=$METHOD dim=$DIM n_gpus=$N_GPUS iterations=$ITERATIONS init=$([[ "$SOLVER" == "sgd" ]] && echo random || echo "$INIT")"
 if (( MAX_SECONDS_PER_DECOMP > 0 )); then
     echo "                  per-run limit=${MAX_SECONDS_PER_DECOMP}s (killed and recorded TIMEOUT on expiry)"
 else
@@ -262,6 +290,8 @@ elif [[ "$SOLVER" == "cp" ]]; then
     echo "                  cp=EXPERIMENTAL nonnegative CP, inner_iters=$CP_INNER_ITERS scooch_kappa=$CP_SCOOCH_KAPPA"
 elif [[ "$SOLVER" == "tt" ]]; then
     echo "                  tt=Tucker-TT hybrid, tt_rank=$TT_RANK (KL only)"
+elif [[ "$SOLVER" == "utt" ]]; then
+    echo "                  utt=EXPERIMENTAL shared-core TT, tt_rank=$TT_RANK core_power=${UTT_CORE_POWER:-1} (KL only, all modes tied)"
 fi
 echo "                  results -> $BENCHMARK_JSON"
 
@@ -395,17 +425,22 @@ with open('$TMPJSON', 'w') as f:
 "
 }
 
-# Per-dataset structural settings. SUBSAMPLE applies to MU and CP (SGD always
-# runs full data — see the comparability note in the header).
+# Per-dataset structural settings. SUBSAMPLE applies to every variant but SGD
+# (SGD always runs full data — see the comparability note in the header).
 _dataset_shape() {
     case "$1" in
         fineweb-en)
             ORDER=3; SHARED_FACTORS="1-2"; SUBSAMPLE=0.25 ;;
         4-gram-raw-fineweb-en_100000000)
             ORDER=4; SHARED_FACTORS="0-1,1-2,2-3"; SUBSAMPLE=0.025 ;;
+        # Recent data, extras only. ~10x the 100M set, hence a 10x smaller frac.
+        4-gram-raw-bos-eos-fineweb-en_1B)
+            ORDER=4; SHARED_FACTORS="all"; SUBSAMPLE=0.0025 ;;
         *)
             ORDER=3; SHARED_FACTORS="1-2"; SUBSAMPLE=0.025 ;;
     esac
+    # UTT shares one core across positions, so it needs every mode tied.
+    [[ "$SOLVER" == "utt" ]] && SHARED_FACTORS="all"
 }
 
 # _build_args <dataset> <rank> <div> <subsample> <optimizer> <param> <lr> <batch>
@@ -459,14 +494,17 @@ _build_args() {
             --cp-inner-iters "$CP_INNER_ITERS"
             --cp-scooch-kappa "$CP_SCOOCH_KAPPA"
         )
-    elif [[ "$SOLVER" == "tt" ]]; then
+    elif [[ "$IS_TT_FAMILY" == "true" ]]; then
         # No --largedim / --normalize-factors, same reasons as CP.
         NNT_ARGS+=(
-            --decomposition tt
+            --decomposition "$SOLVER"
             --tt-rank "$TT_RANK"
             --objective full
             --subsample-frac "$subsample"
         )
+        if [[ "$SOLVER" == "utt" && -n "$UTT_CORE_POWER" ]]; then
+            NNT_ARGS+=(--utt-core-power "$UTT_CORE_POWER")
+        fi
     else
         NNT_ARGS+=(
             --largedim true
@@ -474,6 +512,9 @@ _build_args() {
             --subsample-frac "$subsample"
         )
     fi
+
+    # Same init for every variant; sgd sets its own (random) above.
+    [[ "$SOLVER" != "sgd" ]] && NNT_ARGS+=(--init "$INIT")
 }
 
 # _run_one <key> <dataset> <rank> <div> [subsample] [optimizer] [param] [lr] [batch]
@@ -497,8 +538,8 @@ _run_one() {
         echo -e "\n\n\n>>> [$key] (solver=sgd opt=$optimizer param=$parametrization lr=$lr bs=$batch)"
     elif [[ "$SOLVER" == "cp" ]]; then
         echo -e "\n\n\n>>> [$key] (solver=cp subsample=$SUBSAMPLE inner_iters=$CP_INNER_ITERS)"
-    elif [[ "$SOLVER" == "tt" ]]; then
-        echo -e "\n\n\n>>> [$key] (solver=tt subsample=$SUBSAMPLE tt_rank=$TT_RANK)"
+    elif [[ "$IS_TT_FAMILY" == "true" ]]; then
+        echo -e "\n\n\n>>> [$key] (solver=$SOLVER subsample=$SUBSAMPLE tt_rank=$TT_RANK shared=$SHARED_FACTORS)"
     else
         echo -e "\n\n\n>>> [$key] (solver=mu subsample=$SUBSAMPLE)"
     fi
@@ -551,18 +592,24 @@ for dataset in "${DATASETS[@]}"; do
 done
 
 
-# --- MU/CP: extra no-subsampling runs (the rows SGD can be diffed against) ----
+# --- Extra rows (all variants but SGD; off with BENCH_RUN_EXTRA=false) --------
 # dataset|rank|div|subsample|suffix
+# The suffix names the subsample frac: rows at different fracs fit different
+# data, so a changed frac must give a new key, never a diff against the old one.
 _extra_configs=(
+    # Full data: the rows SGD can be diffed against.
     "fineweb-en|10|kl|1.0|nosub"
     "fineweb-en|10|fr|1.0|nosub"
+    # Small check on recent data, all modes tied (same setup for every variant).
+    "4-gram-raw-bos-eos-fineweb-en_1B|50|kl|0.0025|ss0.0025"
+    "4-gram-raw-bos-eos-fineweb-en_1B|50|fr|0.0025|ss0.0025"
 )
 
 if [[ "$SOLVER" != "sgd" && "$RUN_EXTRA" == "true" ]]; then
     for config in "${_extra_configs[@]}"; do
         IFS='|' read -r dataset rank div subsample suffix <<< "$config"
-        # TT is KL only; skip the fr row rather than queueing a guaranteed crash.
-        [[ "$SOLVER" == "tt" && "$div" != "kl" ]] && continue
+        # Only the enabled divergences (this also keeps fr away from TT/UTT).
+        [[ " ${DIVERGENCES[*]} " != *" $div "* ]] && continue
         _run_one "${dataset}__rank${rank}__${div}__${suffix}" \
             "$dataset" "$rank" "$div" "$subsample"
     done
@@ -644,12 +691,12 @@ PYEOF
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 SGD_META="$(printf '%s|%s|%s|%s|%s' "$SGD_OPTIMIZER" "$SGD_PARAMETRIZATION" "$SGD_LR" "$SGD_BATCH_SIZE" "$SGD_STEPS_PER_ITER")"
 CP_META="$(printf '%s|%s' "$CP_INNER_ITERS" "$CP_SCOOCH_KAPPA")"
-python3 - "$TIMESTAMP" "$N_GPUS" "$TMPJSON" "$BENCHMARK_JSON" "$SOLVER" "$METHOD" "$SGD_META" "$NAME" "$CP_META" "$TT_RANK" <<'PYEOF'
+python3 - "$TIMESTAMP" "$N_GPUS" "$TMPJSON" "$BENCHMARK_JSON" "$SOLVER" "$METHOD" "$SGD_META" "$NAME" "$CP_META" "$TT_RANK" "${UTT_CORE_POWER:-1}" "$INIT" <<'PYEOF'
 import json, sys
 from pathlib import Path
 
 (timestamp, n_gpus, tmpjson, benchmark_json, solver, method, sgd_meta, name,
- cp_meta, tt_rank) = sys.argv[1:]
+ cp_meta, tt_rank, utt_core_power, init) = sys.argv[1:]
 
 with open(tmpjson) as f:
     results = json.load(f)
@@ -664,6 +711,9 @@ entry = {
 }
 if name:
     entry["name"] = name
+# Older sessions carry no 'init' key; they all ran random.
+if solver != "sgd" and init != "random":
+    entry["init"] = init
 if solver == "sgd":
     optimizer, parametrization, lr, batch_size, steps = sgd_meta.split("|")
     entry["sgd_config"] = f"{optimizer}/{parametrization} lr={lr} bs={batch_size} steps/iter={steps}"
@@ -672,6 +722,8 @@ elif solver == "cp":
     entry["cp_config"] = f"inner_iters={inner_iters} scooch_kappa={scooch_kappa}"
 elif solver == "tt":
     entry["tt_config"] = f"tt_rank={tt_rank}"
+elif solver == "utt":
+    entry["utt_config"] = f"tt_rank={tt_rank} core_power={utt_core_power} shared=all"
 entry.update(results)
 
 if Path(benchmark_json).exists():

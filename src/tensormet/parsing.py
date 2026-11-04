@@ -320,7 +320,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--solver", type=str, default=None,
                         choices=["mu", "sgd"],
                         help="Optimizer family: 'mu' (default, multiplicative updates) or 'sgd' "
-                             "(torch minibatch Adam/SGD; Tucker only). One loop "
+                             "(torch minibatch Adam/SGD; tucker, tt and utt). One loop "
                              "iteration = --sgd-steps-per-iteration optimizer steps, so all "
                              "iteration-based knobs keep their meaning.")
     parser.add_argument("--sgd-lr", type=float, dest="sgd_lr", default=None,
@@ -332,9 +332,15 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         choices=["adam", "sgd"],
                         help="SGD only: torch optimizer (default adam).")
     parser.add_argument("--sgd-parametrization", type=str, dest="sgd_parametrization", default=None,
-                        choices=["softplus", "clamp"],
-                        help="SGD only: non-negativity via softplus reparametrization (default) "
-                             "or clamp+projection (apples-to-apples with MU's clip).")
+                        choices=["softplus", "clamp", "exp"],
+                        help="SGD only: non-negativity via softplus reparametrization (default), "
+                             "clamp+projection (apples-to-apples with MU's clip), or exp "
+                             "(log-space; recommended for tt/utt, where it keeps Adam's "
+                             "state valid across gauge resets).")
+    parser.add_argument("--sgd-regauge-every", type=int, dest="sgd_regauge_every", default=None,
+                        help="SGD tt/utt only: iterations between exact gauge resets "
+                             "(default 1; 0 = never). x̂ is unchanged by a reset; it keeps "
+                             "the chain product inside fp32 range. Affects the trajectory.")
     parser.add_argument("--sgd-steps-per-iteration", type=int, dest="sgd_steps_per_iteration", default=None,
                         help="SGD only: optimizer steps per loop iteration (default 100).")
     parser.add_argument("--sgd-warm-start", type=str, dest="sgd_warm_start", default=None,
@@ -464,7 +470,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                   "utt_core_power",
                   "solver", "sgd_lr", "sgd_batch_size", "sgd_optimizer",
                   "sgd_parametrization", "sgd_steps_per_iteration", "sgd_warm_start",
-                  "sgd_batch_scope", "sgd_sync_every", "sgd_micro_batch",
+                  "sgd_regauge_every", "sgd_batch_scope", "sgd_sync_every", "sgd_micro_batch",
                   "sgd_cuda_graph", "sgd_comm_backend", "sgd_eval_sample"):
         v = parsed_dict.get(field, None)
         if v is not None:

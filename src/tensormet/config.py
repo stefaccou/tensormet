@@ -190,15 +190,16 @@ class ExperimentConfig:
     # None = 1 (undamped), "auto" = backtracking in [1/order, 1].
     # Not part of the stem or the resume check.
     utt_core_power: Optional[Union[float, str]] = None
-    # "mu" | "sgd" (torch minibatch trainer, Tucker only; see sgd/README.md).
+    # "mu" | "sgd" (torch minibatch trainer for tucker, tt and utt; see sgd/README.md).
     solver: str = "mu"
     # SGD-only knobs. One loop iteration = sgd_steps_per_iteration steps.
     sgd_lr: float = 1e-2
     sgd_batch_size: int = 4096
     sgd_optimizer: str = "adam"            # "adam" | "sgd"
-    sgd_parametrization: str = "softplus"  # "softplus" | "clamp"
+    sgd_parametrization: str = "softplus"  # "softplus" | "clamp" | "exp"
     sgd_steps_per_iteration: int = 100
     sgd_warm_start: Optional[str] = None   # MU model .pt used as init (not resume)
+    sgd_regauge_every: int = 1             # TT/utt: iterations between gauge resets; 0 = off
     # Multi-GPU SGD knobs (see sgd/README.md). Only batch_scope and sync_every
     # change the trajectory, and hence resume compatibility.
     sgd_batch_scope: str = "per_device"    # "per_device" | "global"
@@ -420,6 +421,9 @@ class RunConfig:
                     int(getattr(self.exp, "sgd_steps_per_iteration", 100)) and
                     (old_exp.get("sgd_warm_start") or None) ==
                     (getattr(self.exp, "sgd_warm_start", None) or None) and
+                    # TT/utt gauge resets change the raw parameters Adam sees.
+                    int(old_exp.get("sgd_regauge_every", 1)) ==
+                    int(getattr(self.exp, "sgd_regauge_every", 1)) and
                     # Multi-GPU SGD trajectory knobs. Only these two change the
                     # sequence of parameter updates; sgd_micro_batch,
                     # sgd_cuda_graph and sgd_comm_backend are memory/dispatch

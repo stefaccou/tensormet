@@ -40,6 +40,7 @@ steps (default 100). All iteration-based knobs (`n_iter_max`,
 
 ## Files here
 
+- `sgd_tt.py` — `SGDTTModel` (Tucker-TT) and `sq_norm`; see "TT and utt".
 - `sgd_tucker.py` — model (`SGDTuckerModel`), deterministic `EntryBatcher`
   (pure function of (seed, step) → resume replays exact batches), objectives,
   exact error, the standalone `sgd_non_negative_tucker` for notebooks, and
@@ -199,8 +200,9 @@ than the whole job.
 3. `parsing.py` — `--solver` + the twelve `--sgd-*` flags; exp field tuple.
 4. `tucker_tensor.py` — `_is_sgd` branch in
    `non_negative_tucker_with_similarity`: torch-COO input check, guard rails
-   (rejects `decomposition=cp`, `subsample_frac<1`, `max_nnz`, SVD init,
-   `normalize_factors`, `largedim`), trainer construction (+ warm start),
+   (rejects `decomposition=cp`, `subsample_frac<1`, `max_nnz`,
+   `normalize_factors`, `largedim`), trainer construction (+ warm start or
+   SVD init via `sgd_init.mu_init_for_sgd`),
    the update+error section swapped for `trainer.run_block`, dict checkpoint
    payloads at the periodic/SIGINT sites, `torch.cuda.empty_cache()` instead
    of CuPy pool trims, solver-gated tensorly backend flips, `_as_host` at the
@@ -239,11 +241,58 @@ across different `n_gpus`" promise still holds, and MU is untouched. On resume
 every device's optimizer is restored from the checkpoint, not just device 0's,
 because every device steps.
 
+## TT and utt (`--decomposition tt|utt`)
+
+```bash
+python3 -m tensormet.scripts.nnt \
+    --solver sgd --decomposition utt --tt-rank 100 --rank 100 --order 4 \
+    --divergence kl --sgd-parametrization exp --sgd-lr 1e-2 \
+    --sgd-warm-start <MU utt model .pt>
+```
+
+Same trainers, batcher, collectives and checkpoint format; only the model
+changes (`sgd_trainer.make_sgd_model`):
+
+- `sgd_tt.py` — `SGDTTModel`: Tucker factors + TT cores, forward via
+  `tt_hybrid.tt_chain` on torch. About `N·R·ρ²` flops per entry (Tucker:
+  `prod(R)`), so a step is much cheaper than a Tucker SGD step at order ≥ 4.
+- `experimental/uniform_tt/utt_sgd.py` — `SGDUTTModel`: `[C, α, ω]` + one
+  factor shared by all modes; forward expands to TT cores (`expand_uniform`).
+
+Zero-entry terms are exact closed forms in fp64: Σ_all x̂ is the chain on factor
+column sums; ‖X̂‖² is the chain of X̂ against itself joined by the factor Grams
+(`sgd_tt.sq_norm`, `2ρ³R + ρ²R²` per site). So both divergences and both
+objectives work, unlike MU-TT (KL, full only).
+
+**Gauge.** A chain model has scale directions that leave x̂ unchanged (factor
+column vs. core slice, the two sides of a bond, per-core scalars whose product
+is 1; for utt, C vs. α through the Perron root). Adam drifts along them and the
+N-fold product leaves fp32 range — the order-6 MU failure mode. Every
+`--sgd-regauge-every` iterations (default 1; 0 = off) `model.regauge_()` resets
+the gauge exactly: ℓ1 factor columns, balanced bonds, equal core masses (TT);
+ℓ1 columns + MU's Perron gauge (utt). Prefer `--sgd-parametrization exp`: the
+reset is then an additive shift of the raw parameters and the log-space
+gradient is gauge-invariant, so Adam's moments stay valid across it. Under
+softplus they are only approximately right after a reset, and core entries
+in softplus's linear range take additive rather than relative steps.
+
+**Init.** `random` uses the same draws as the MU init
+(`initialize_tucker_tt` / `initialize_uniform_tt`) for the same seed. SVD inits
+(`--init svd_stream`, `svd`, ...) run exactly as on the MU path, on a temporary
+CuPy copy of the tensor (`sgd_init.mu_init_for_sgd`); the result enters the model
+like a warm start and the CuPy memory is freed before training. For utt, random
+init is known to stall in a frequency-only state (memory notes, 2026-10-29), so
+use an SVD init or a warm start.
+
+**Floor.** The KL log term uses `x̂ + epsilon` (absolute), not MU-TT's floor
+relative to the mean entry. Fine up to about order 5; at order 6 the mean
+entry approaches 1e-12 and this would need the relative floor.
+
 ## Not implemented (rejected with clear errors)
 
 `decomposition=cp` × sgd; `subsample_frac<1`/`max_nnz` (SGD is already
-minibatch — use `--sgd-batch-size`); `init=svd` (CuPy routine — use
-warm start); `normalize_factors`; `largedim`.
+minibatch — use `--sgd-batch-size`); `normalize_factors`; `largedim`;
+`--utt-core-power` (an MU knob).
 
 ## DDP escape hatch (documented, not built)
 

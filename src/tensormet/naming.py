@@ -88,8 +88,8 @@ def _order_tag(order: int, decomposition: str = "tucker", solver: str = "mu",
     experimental CP family, 'TT{tt_rank}b{order}D' for the Tucker-TT hybrid,
     'SGD{order}D' for the SGD solver, so the artifact families
     never collide (an SGD run can therefore never scan up MU checkpoints on
-    resume, and vice versa). 'SGDCP'/'SGDTT' are reserved but the combinations
-    are rejected at fit time.
+    resume, and vice versa). SGD prefixes the family tag: 'SGDTT{ρ}b{order}D',
+    'SGDUTT{ρ}b{order}D'; 'SGDCP' is reserved but rejected at fit time.
 
     ``tt_rank`` is required for decomposition='tt' and ignored otherwise: the
     bond dimension fixes the TT core shapes, so runs differing only in it are

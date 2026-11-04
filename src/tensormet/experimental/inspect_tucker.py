@@ -37,13 +37,14 @@ import pickle
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Optional
 import random
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 from tensormet.config import InspectionConfig, infer_ngram_order
-from tensormet.utils import DATA_DIR
+from tensormet.utils import DATA_DIR, read_best_record
 
 
 # === loading ===========================================================
@@ -65,12 +66,14 @@ def _values_for_key(key, all_its, all_sem):
 
 
 def _read_log(cfg):
+    # iter_offset / iter_stop: set on RunRefs of a stitched warm start (_warm_start_stitch).
+    off, stop = getattr(cfg, "iter_offset", 0), getattr(cfg, "iter_stop", None)
     iters, rec, sem = [], [], []
     with open(cfg.log_path, "r") as f:
         for line in f:
             m = _METRIC_RE.search(line)
-            if m:
-                iters.append(int(m.group(1)))
+            if m and (stop is None or int(m.group(1)) <= stop):
+                iters.append(int(m.group(1)) + off)
                 rec.append(float(m.group(2)))
                 sem.append(json.loads(m.group(3)))
     return iters, rec, sem
@@ -130,12 +133,13 @@ def load_metrics(*cfgs):
 
 
 def _read_times(cfg):
+    off, stop = getattr(cfg, "iter_offset", 0), getattr(cfg, "iter_stop", None)
     its, secs = [], []
     with open(cfg.log_path, "r") as f:
         for line in f:
             m = _TIME_RE.search(line)
-            if m:
-                its.append(int(m.group(1)) + 1)
+            if m and (stop is None or int(m.group(1)) + 1 <= stop):
+                its.append(int(m.group(1)) + 1 + off)
                 secs.append(float(m.group(2)))
     return its, secs
 
@@ -637,11 +641,16 @@ class RunRef:
     ``log_path`` / ``stem`` are read straight off disk, so this works for
     legacy-named runs too. ``insp`` is the reconstructed InspectionConfig for
     richer use (``load_tucker``, ...).
+
+    ``iter_offset`` shifts the logged iterations and ``iter_stop`` drops those
+    after it; both are only set when a warm start is stitched to its parent.
     """
     stem: str
     log_path: Path
     short: str
     insp: InspectionConfig
+    iter_offset: int = 0
+    iter_stop: Optional[int] = None
 
 
 def _sf_to_set(sf):
@@ -809,8 +818,11 @@ def _discover_one(dataset, data_dir):
         if solver == "sgd":
             decomp_tag = f"[SGD] {decomp_tag}"
         log_path = decomp_dir / f"{stem}_log.txt"
+        warm_start = exp.get("sgd_warm_start")
         yield {
             "stem": stem,
+            # stem of the model an SGD run warm-started from (its model file is {stem}.pt)
+            "warm_from": Path(warm_start).stem if warm_start else None,
             "dataset": dataset,
             "ref": RunRef(stem, log_path,
                           f"{decomp_tag}{dataset}|{name}|{insp.method}|{dim}d|r{rank0}|{iters}i", insp),
@@ -906,6 +918,35 @@ def _chain_key(rec):
             frozenset(insp.shared_factors or ()))
 
 
+def _warm_start_stitch(rec, refs, chains, by_stem):
+    """Put the run an SGD warm start began from in front of ``refs``.
+
+    The parent's chain is cut at the iteration its model file holds (the best
+    state, from ``{stem}_best.json``; its last iteration if that is missing),
+    and ``refs`` are shifted to continue from there. Returns ``(refs, branch)``;
+    ``branch`` is None when the run has no warm-start parent among ``by_stem``.
+    """
+    parent = by_stem.get(rec.get("warm_from"))
+    if parent is None:
+        return refs, None
+    best = read_best_record(parent["ref"].log_path.with_name(f'{parent["stem"]}_best.json')) or {}
+    branch = int(best.get("iteration") or parent["iters"])
+    head = tuple(replace(m["ref"], iter_stop=branch) for m in chains[_chain_key(parent)]
+                 if m["iters"] <= parent["iters"])
+    tail = tuple(replace(ref, iter_offset=branch) for ref in refs)
+    return head + tail, branch
+
+
+def _mark_warm_start(ax, run):
+    """Dotted line, labelled "parent → child", where a stitched warm start begins."""
+    branch = max((getattr(seg, "iter_offset", 0) for seg in run or ()), default=0)
+    if not branch:
+        return
+    ax.axvline(branch, color="0.4", linestyle=":", linewidth=1)
+    ax.text(branch, 0.98, f" {run[0].insp.name or '?'} → {run[-1].insp.name or '?'}",
+            transform=ax.get_xaxis_transform(), fontsize=8, color="0.3", va="top")
+
+
 def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                      default_sem_keys=("dim_consistency", "simlex_all_rho")):
     """Interactive faceted browser for picking and comparing two runs.
@@ -916,6 +957,9 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     ticks (a name, a list, or ``None`` for all). The *after* box hides runs
     whose snapshot predates a date, but resumed runs are still stitched to
     earlier segments (marked ``⛓×N``; untick *stitch* to see one segment).
+    With *stitch* on, an SGD warm start (``--sgd-warm-start``) is also drawn
+    after the run it started from, branching at the iteration that run's model
+    file holds (marked ``⤷`` and by a dotted line).
     *sem_keys* offers only metrics logged for the picked runs, seeded from
     ``default_sem_keys``.
 
@@ -1014,10 +1058,12 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                               layout=widgets.Layout(width="90px"))
     status = widgets.HTML()
 
-    def _label(rec, n_seg=1):
+    def _label(rec, n_seg=1, branch=None):
         when = _dt.datetime.fromtimestamp(rec["mtime"]).strftime("%b%d")
         flag = "" if rec["has_log"] else "  ⚠ no log"
         chain = f'  ⛓×{n_seg} (→{rec["iters"]}i)' if n_seg > 1 else ""
+        if branch is not None:
+            chain += f"  ⤷ warm start @{branch}"
         decomp = "" if rec["decomposition"] == "tucker" else f'[{rec["decomposition"].upper()}] '
         if rec.get("tt_rank"):
             decomp = f'[{rec["decomposition"].upper()} b={rec["tt_rank"]}] '
@@ -1135,15 +1181,21 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
     def _rebuild_ab():
         recs = _filtered()
         chains = _chain_index() if stitch_chk.value else None
+        by_stem = {m["stem"]: m for m in _dataset_recs()}
         opts = []
         for r in recs:
+            branch = None
             if chains is not None:
                 # this run plus all earlier segments of its resume chain
                 members = [m for m in chains[_chain_key(r)] if m["iters"] <= r["iters"]]
                 refs = tuple(m["ref"] for m in members)
+                n_seg = len(refs)
+                # an SGD warm start also gets the run it started from in front
+                refs, branch = _warm_start_stitch(r, refs, chains, by_stem)
             else:
                 refs = (r["ref"],)
-            opts.append((_label(r, n_seg=len(refs)), refs))
+                n_seg = 1
+            opts.append((_label(r, n_seg=n_seg, branch=branch), refs))
         for dd, extra in ((run_a, []), (run_b, [("(none)", None)])):
             cur = dd.value
             dd.options = extra + opts
@@ -1196,6 +1248,8 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
                 return
             if rec_chk.value and log_rec_chk.value:
                 ax.set_yscale("log")
+            for run in (a, b):
+                _mark_warm_start(ax, run)
             # Keep a handle on the Figure object before plt.show() closes it (under
             # the inline backend) so it can still be saved/returned afterwards.
             state["fig"] = fig

@@ -1056,6 +1056,19 @@ def torch_sparse_to_cupy(
     x: torch.Tensor,
     use_coords: Optional[bool] = None,
 ) -> Tuple[Union[cpx_sparse.coo_matrix, CoordCOO], Tuple[int, ...]]:
+    """See ``_torch_sparse_to_cupy``."""
+    # Import CuPy here, before the converter runs. On the SGD path CuPy is first
+    # imported on first use, and the import leaves a reference to its caller's frame
+    # behind: if that caller is the converter, its locals (the whole GPU copy and
+    # host copies of the tensor) outlive the call and the SGD trainer runs out of memory.
+    cp.cuda
+    return _torch_sparse_to_cupy(x, use_coords)
+
+
+def _torch_sparse_to_cupy(
+    x: torch.Tensor,
+    use_coords: Optional[bool] = None,
+) -> Tuple[Union[cpx_sparse.coo_matrix, CoordCOO], Tuple[int, ...]]:
     """
     Convert a torch sparse COO tensor to a CuPy sparse representation.
 
@@ -1551,6 +1564,7 @@ class SparseTupleTensor:
             sgd_parametrization = getattr(cfg.exp, "sgd_parametrization", "softplus")
             sgd_steps_per_iteration = getattr(cfg.exp, "sgd_steps_per_iteration", 100)
             sgd_warm_start = getattr(cfg.exp, "sgd_warm_start", None)
+            sgd_regauge_every = getattr(cfg.exp, "sgd_regauge_every", 1)
             sgd_batch_scope = getattr(cfg.exp, "sgd_batch_scope", "per_device")
             sgd_sync_every = getattr(cfg.exp, "sgd_sync_every", 1)
             sgd_micro_batch = getattr(cfg.exp, "sgd_micro_batch", None)
@@ -1608,10 +1622,15 @@ class SparseTupleTensor:
         # --- SGD guard rails: reject MU-only knobs whose semantics
         # don't carry over to a minibatch solver (reinterpretation is deferred).
         if _is_sgd:
-            if decomposition != "tucker":
+            if decomposition not in ("tucker", "tt", "utt"):
                 raise NotImplementedError(
                     f"solver='sgd' with decomposition={decomposition!r} is not implemented "
-                    "(sgd/README.md, deferred). Use decomposition='tucker'."
+                    "(sgd/README.md). Use decomposition 'tucker', 'tt' or 'utt'."
+                )
+            if decomposition == "utt" and getattr(cfg.exp, "utt_core_power", None) is not None:
+                raise ValueError(
+                    "--utt-core-power sets the exponent of the MU core step; solver='sgd' "
+                    "has no such step (its step size is --sgd-lr). Drop the flag."
                 )
             if getattr(cfg.exp, "subsample_frac", 1.0) < 1.0:
                 raise ValueError(
@@ -1622,11 +1641,6 @@ class SparseTupleTensor:
                 raise ValueError(
                     "solver='sgd' does not support max_nnz (MU per-step NNZ ceiling). "
                     "Use --sgd-batch-size instead."
-                )
-            if isinstance(init, str) and "svd" in init:
-                raise ValueError(
-                    "solver='sgd' does not support SVD init (CuPy routine). Use "
-                    "--init random or --sgd-warm-start <MU model .pt>."
                 )
             if normalize_factors:
                 raise ValueError(
@@ -1713,7 +1727,10 @@ class SparseTupleTensor:
             _sgd_resume_payload = checkpoint_tensor
             checkpoint_tensor = None
 
-        if init == "svd_stream" and not _is_sgd and checkpoint_tensor is None:
+        # SGD runs the init only on a fresh start (no resume payload, no warm start).
+        _runs_init = (checkpoint_tensor is None if not _is_sgd
+                      else _sgd_resume_payload is None and not sgd_warm_start)
+        if init == "svd_stream" and _runs_init:
             # Experimental streamed GPU SVD: pooled per tied group, all GPUs, cached.
             from tensormet.experimental.stream_svd import set_run_context
             set_run_context(cfg, tied_groups=nontrivial_linked_groups(self.shared_factors, num_factors=len(modes)),
@@ -1844,11 +1861,13 @@ class SparseTupleTensor:
                 "(CP_IMPLEMENTATION_PLAN.md §1.8 / Phase 5). Use objective='full'."
             )
 
-        # --- Tucker-TT guard rails (tt_hybrid/README.md).
-        if _is_tt and masked:
+        # --- Tucker-TT guard rails (tt_hybrid/README.md). The SGD solver
+        # implements the masked objective for every model.
+        if _is_tt and masked and not _is_sgd:
             raise NotImplementedError(
-                "decomposition='tt' does not support objective='masked' yet "
-                "(tt_hybrid/README.md, 'Not implemented'). Use objective='full'."
+                "decomposition='tt' does not support objective='masked' with the MU "
+                "solver (tt_hybrid/README.md, 'Not implemented'). Use objective='full' "
+                "or --solver sgd."
             )
 
         # --- SGD trainer construction ---
@@ -1859,8 +1878,9 @@ class SparseTupleTensor:
                 # Warm start (init from an MU model artifact) is distinct from
                 # resume: parameters start at the MU solution but the optimizer
                 # state and step counter start fresh. The artifact is a plain
-                # CPU-numpy TuckerTensor (tuple-unpackable); accept a
-                # TuckerDecomposition payload's .core/.factors as a fallback.
+                # CPU-numpy TuckerTensor (tuple-unpackable) — for tt/utt a
+                # (cores, factors) tuple; accept a TuckerDecomposition
+                # payload's .core/.factors as a fallback.
                 _ws = torch.load(sgd_warm_start, map_location="cpu", weights_only=False)
                 try:
                     _ws_core, _ws_factors = _ws
@@ -1868,6 +1888,18 @@ class SparseTupleTensor:
                     _ws_core, _ws_factors = _ws.core, _ws.factors
                 _sgd_init = (_ws_core, _ws_factors)
                 print(f"SGD warm start from {sgd_warm_start}")
+            elif _sgd_resume_payload is not None:
+                # Resume: load_payload overwrites the start, so build the model from
+                # the checkpoint's own values instead of running --init again.
+                _sgd_init = (_sgd_resume_payload["core"], _sgd_resume_payload["factors"])
+            elif _runs_init and isinstance(init, str) and init != "random":
+                # SVD inits: run as on the MU path, hand over like a warm start.
+                from tensormet.sgd.sgd_init import mu_init_for_sgd
+                _sgd_init = mu_init_for_sgd(
+                    self, decomposition, shape, rank, modes, init, random_state,
+                    tt_rank=tt_rank, thread_budget=thread_budget, epsilon=epsilon,
+                    device_ids=list(range(_n_gpus)),
+                )
             _sgd_kwargs = dict(
                 rank=rank, divergence=divergence, objective=objective,
                 lr=sgd_lr, batch_size=sgd_batch_size, optimizer=sgd_optimizer,
@@ -1878,6 +1910,8 @@ class SparseTupleTensor:
                 micro_batch=sgd_micro_batch, cuda_graph=sgd_cuda_graph,
                 eval_sample=sgd_eval_sample,
                 resume_payload=_sgd_resume_payload,
+                decomposition=decomposition, tt_rank=tt_rank,
+                regauge_every=sgd_regauge_every,
             )
             # Construction is the last silent stretch before the loop announces
             # itself, and on the sharded path it is where the collective gets
@@ -1897,6 +1931,16 @@ class SparseTupleTensor:
                 from tensormet.sgd.sgd_trainer import SGDTrainer
                 _sgd_trainer = SGDTrainer(self.tensor, **_sgd_kwargs)
             print(f"[{time.strftime('%H:%M:%S')}] SGD trainer ready", flush=True)
+
+        def _sgd_container(c, fs):
+            """Saved/returned model from SGD's host snapshots. TT/utt: a plain
+            (cores, factors) tuple of numpy arrays, as the MU TT path saves.
+            Tucker: tensorly validates the container against the ACTIVE
+            backend ("pytorch" here, whose ndim() rejects numpy), so wrap the
+            snapshots in CPU torch tensors (zero-copy, loads fine on CPU)."""
+            if _is_tt:
+                return TensorModel(([np.asarray(C) for C in c], [np.asarray(f) for f in fs]))
+            return TensorModel((torch.as_tensor(c), [torch.as_tensor(f) for f in fs]))
 
         if _n_gpus > 1 and not _is_sgd:
             _sst = ShardedSparseTensor.from_coo(
@@ -2072,12 +2116,13 @@ class SparseTupleTensor:
         # factor shapes and dtype — fixed for the run. Size it once here (after
         # the judge is resident, so its footprint is accounted for) instead of
         # once per factor update, core sweep and error pass.
+        # The SGD trainer sizes its own batches.
         _tt_batch_nnz = None
-        if _is_utt:
+        if _is_utt and not _is_sgd:
             from tensormet.experimental.uniform_tt.utt_ops import estimate_batch_nnz_utt
             with core[0].device:
                 _tt_batch_nnz = estimate_batch_nnz_utt(core, factors)
-        elif _is_tt:
+        elif _is_tt and not _is_sgd:
             from tensormet.tt_hybrid.tt_ops import estimate_batch_nnz_tt
             # _gpu_free_bytes() reads whichever device is current; pin to the one
             # the cores live on so a sharded run never sizes against a shard's GPU.
@@ -2086,7 +2131,12 @@ class SparseTupleTensor:
 
         print(divergence, rank, _subsample_frac)
         # Announce the routing family (sharding engages iff largedim and n_gpus > 1).
-        if _is_cp:
+        if _is_sgd:
+            # Before the TT branches: `core` is not bound on the SGD path.
+            _sgd_label = "" if decomposition == "tucker" else f", {decomposition}"
+            _selected_path = (f"sgd (torch{_sgd_label}, sharded×{_n_gpus})" if _n_gpus > 1
+                              else f"sgd (torch{_sgd_label})")
+        elif _is_cp:
             _selected_path = (f"cp (nnz-streaming, inner_iters={cp_inner_iters}"
                               + (f", sharded×{_n_gpus}" if _sst is not None else "")
                               + ")")
@@ -2099,9 +2149,6 @@ class SparseTupleTensor:
                               f"{[int(C.shape[2]) for C in core[:-1]]}"
                               + (f", sharded×{_n_gpus}" if _sst is not None else "")
                               + ")")
-        elif _is_sgd:
-            _selected_path = (f"sgd (torch, sharded×{_n_gpus})" if _n_gpus > 1
-                              else "sgd (torch)")
         elif _sst is not None and _largedim_selected:
             _selected_path = f"sharded×{_n_gpus}"
         elif _largedim_selected:
@@ -2419,7 +2466,8 @@ class SparseTupleTensor:
                 if _is_sgd:
                     _sem_core_np, _sem_factors_np = _sgd_trainer.materialize()
                     _eval_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    core_eval = torch.as_tensor(_sem_core_np, device=_eval_dev)
+                    core_eval = ([torch.as_tensor(C, device=_eval_dev) for C in _sem_core_np]
+                                 if _is_tt else torch.as_tensor(_sem_core_np, device=_eval_dev))
                     factors_eval = [torch.as_tensor(f, device=_eval_dev) for f in _sem_factors_np]
                 else:
                     # Zero-copy torch views of the CuPy arrays; tied modes keep one tensor.
@@ -2622,15 +2670,7 @@ class SparseTupleTensor:
                             # a GPU are available, and this file is what
                             # judge_eval/inspect_tucker later load on CPU.
                             if _is_sgd:
-                                # tensorly validates the container against the
-                                # ACTIVE backend; on the SGD path that is
-                                # "pytorch", whose ndim() rejects numpy — wrap
-                                # the host snapshots in CPU torch tensors
-                                # (zero-copy, still loads fine on CPU boxes).
-                                temp_tensor = TensorModel(
-                                    (torch.as_tensor(best_core),
-                                     [torch.as_tensor(f) for f in best_factors])
-                                )
+                                temp_tensor = _sgd_container(best_core, best_factors)
                             else:
                                 temp_tensor = TensorModel(
                                     (_as_host(best_core),
@@ -2778,21 +2818,13 @@ class SparseTupleTensor:
         last_iteration = iteration + 1  # iterations run (like checkpoint names); `iteration` is reused below
         if best_sem_iteration is not None:
             if _is_sgd:
-                # numpy snapshots + pytorch backend: see the temp-save note.
-                tensor = TensorModel(
-                    (torch.as_tensor(best_core),
-                     [torch.as_tensor(f) for f in best_factors])
-                )
+                tensor = _sgd_container(best_core, best_factors)
             else:
                 tensor = TensorModel((best_core, best_factors))
             iteration = best_sem_iteration
         elif _is_sgd:
             # `core`/`factors` are never bound on the SGD path.
-            _fin_core, _fin_factors = _sgd_trainer.materialize()
-            tensor = TensorModel(
-                (torch.as_tensor(_fin_core),
-                 [torch.as_tensor(f) for f in _fin_factors])
-            )
+            tensor = _sgd_container(*_sgd_trainer.materialize())
         else:
             tensor = TensorModel((core, factors))
         if return_errors == "simple":
