@@ -250,7 +250,7 @@ def print_elapsed_time(start_time, message=""):
     print(f"{tabs}Elapsed time: {int(minutes)} minutes and {seconds} seconds.")
     return now
 
-def select_gpu(gpu_id=None, n_gpus: int = 1):
+def select_gpu(gpu_id=None, n_gpus: int = 1, extra_gpu: Optional[int] = None):
     """
     Select GPU(s) for the current process and set CUDA_VISIBLE_DEVICES.
 
@@ -263,17 +263,29 @@ def select_gpu(gpu_id=None, n_gpus: int = 1):
     After this call, logical device indices 0…n_gpus-1 map to the selected
     physical GPUs via CUDA_VISIBLE_DEVICES remapping.
 
+    `extra_gpu` (a physical id, e.g. the judge GPU) is appended after them, so it
+    becomes logical device n_gpus. Auto-selection never picks it.
+
     Returns torch.device(0) (the primary logical device).
     """
     if torch.cuda.device_count() == 0:
         print("No GPU available.")
         return torch.device("cpu")
 
+    def _with_extra(ids):
+        if extra_gpu is None:
+            return ids
+        if extra_gpu in ids:
+            raise ValueError(f"Extra GPU {extra_gpu} is already one of the "
+                             f"decomposition GPUs {ids}; pick a different one.")
+        print(f"  judge → physical GPU {extra_gpu} (logical device {len(ids)})")
+        return ids + [extra_gpu]
+
     # --- explicit pin ---
     if gpu_id is not None:
         ids = [gpu_id] if isinstance(gpu_id, int) else list(gpu_id)
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in ids)
         print(f"Pinned to GPU(s): {ids}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in _with_extra(ids))
         return torch.device(0)
 
     # --- auto-select n_gpus least-used GPUs ---
@@ -283,6 +295,8 @@ def select_gpu(gpu_id=None, n_gpus: int = 1):
         device_count = pynvml.nvmlDeviceGetCount()
         mem_used = []
         for i in range(device_count):
+            if i == extra_gpu:
+                continue
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
             mem_used.append((mem_info.used, i))
@@ -291,12 +305,17 @@ def select_gpu(gpu_id=None, n_gpus: int = 1):
         mem_used.sort()  # ascending by used memory → least loaded first
         n_select = min(n_gpus, len(mem_used))
         selected = [idx for _, idx in mem_used[:n_select]]
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in selected)
         for rank, (used, phys) in enumerate(mem_used[:n_select]):
             print(f"  GPU rank {rank} → physical GPU {phys}  "
                   f"({used / (1024 ** 2):.0f} MB used)")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in _with_extra(selected))
         return torch.device(0)
     except Exception as e:
+        if extra_gpu is not None:
+            # Without CUDA_VISIBLE_DEVICES set, the judge's logical index would
+            # not point at extra_gpu.
+            raise RuntimeError(f"Could not select GPUs automatically ({e}); "
+                               f"pass --gpu-id explicitly together with the judge GPU.") from e
         print("Could not select GPU automatically:", e)
         return torch.device(0)
 
@@ -525,6 +544,23 @@ def read_best_record(path: Path) -> Optional[Dict[str, Any]]:
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+def replay_sem_patience(fitness_scores, sem_primary_key: str, tol: float) -> int:
+    """Semantic patience count after the logged checks, by the training loop's own rule:
+    a check counts as non-improving when it beats the best so far by less than tol."""
+    best, count = 0.0, 0
+    for score in fitness_scores:
+        value = score.get(sem_primary_key) if isinstance(score, dict) else score
+        if value is None:  # the loop skips checks without the primary key
+            continue
+        diff = float(value) - best
+        if diff > 0:
+            best = float(value)
+        count = count + 1 if diff < tol else 0
+    return count
+
+
 def utc_now_iso() -> str:
     """Returns the current UTC time in ISO 8601 format."""
     return datetime.now(UTC).isoformat()

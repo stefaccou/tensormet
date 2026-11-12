@@ -44,7 +44,7 @@ def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedi
                             masked: bool = False, decomposition: str = "tucker",
                             cp_inner_iters: int = 1,
                             cp_scooch_kappa: float = 0.0,
-                            utt_core_power=None) -> UpdateRouting:
+                            utt_core_power=None, binary=None) -> UpdateRouting:
     """Return the correct update functions for the step if logging is active.
 
     masked : bool
@@ -61,6 +61,12 @@ def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedi
         the training loop). cp_inner_iters / cp_scooch_kappa are CP-APR knobs,
         ignored for the other families.
     """
+    if binary:
+        # EXPERIMENTAL binary Tucker (experimental/binary/README.md).
+        from tensormet.experimental.binary.binary_routing import get_binary_update_routing_step
+        return get_binary_update_routing_step(divergence=divergence, dim=dim, log_step=log_step,
+                                              largedim=largedim, binary=binary)
+
     if decomposition == "tt":
         from tensormet.tt_hybrid.tt_routing import get_tt_update_routing_step
         return get_tt_update_routing_step(divergence=divergence, log_step=log_step)

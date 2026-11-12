@@ -20,7 +20,7 @@ python3 -m tensormet.scripts.nnt \
 ```
 
 With `--solver mu` (the default) every existing code path and filename is
-byte-identical. Template for this layout: the `masked` objective plumbing.
+unchanged.
 
 ## What it is
 
@@ -40,17 +40,23 @@ steps (default 100). All iteration-based knobs (`n_iter_max`,
 
 ## Files here
 
+- `sgd_model.py` — what every model shares: the parametrizations
+  (`view_from_raw` / `raw_from_view`), rank and shared-factor parsing, and
+  `SGDModelBase`, the surface the trainers use.
 - `sgd_tt.py` — `SGDTTModel` (Tucker-TT) and `sq_norm`; see "TT and utt".
 - `sgd_tucker.py` — model (`SGDTuckerModel`), deterministic `EntryBatcher`
   (pure function of (seed, step) → resume replays exact batches), objectives,
-  exact error, the standalone `sgd_non_negative_tucker` for notebooks, and
-  `GradStepper` — the per-device step body (flat gradient buffer,
-  micro-batching, optional CUDA-graph capture) both trainers run.
+  exact error, `GradStepper` — the per-device step body (flat gradient buffer,
+  micro-batching, optional CUDA-graph capture) both trainers run — and the
+  standalone `sgd_non_negative_tucker` for notebooks (a loop over `SGDTrainer`).
 - `sgd_trainer.py` — `SGDTrainer`, the loop-facing surface:
   `run_block(iteration, log_step)`, `materialize()`, `checkpoint_payload()`,
-  `load_payload()`, `sync()`. Owns Adam moments, raw params, and the step
-  counter — state the `UpdateRouting` seam cannot express, which is why the
-  loop branches on the solver instead of routing kernels.
+  `load_payload()`, `sync()`, plus the helpers it shares with the sharded
+  trainer. Owns Adam moments, raw params, and the step counter — state the
+  `UpdateRouting` seam cannot express, which is why the loop branches on the
+  solver instead of routing kernels.
+- `sgd_init.py` — `mu_init_for_sgd`: the MU path's SVD inits on a temporary
+  CuPy copy of the tensor.
 - `collectives.py` — the `Collective` seam: `NcclSingleProcess`
   (`torch.cuda.nccl.all_reduce`, single-process multi-device — no process
   group, no spawn), `HostReduce` (preallocated pinned staging, the fallback
@@ -150,8 +156,8 @@ detached views with persistent gradient buffers and one chain-rule pass at the
 end pushes the total back through softplus — exact, and verified by gradient
 parity across chunk counts in `0_tests/test_sgd_solver.ipynb` §6.
 
-**Not implemented: core sharding** (`sgd_core_shard`). Once micro-batching
-lands, order 4 / rank 100 is compute-bound with roughly a 50:1
+**Not implemented: core sharding** (`sgd_core_shard`). Order 4 / rank 100 is
+compute-bound with roughly a 50:1
 compute-to-zero-entry ratio and a replicated core fits in 80 GB, so plain data
 parallelism is sufficient. Splitting the core along the mode-1 rank axis makes
 the model an additive sum of G lower-rank Tucker models sharing modes 2…N; the
@@ -280,7 +286,10 @@ in softplus's linear range take additive rather than relative steps.
 (`initialize_tucker_tt` / `initialize_uniform_tt`) for the same seed. SVD inits
 (`--init svd_stream`, `svd`, ...) run exactly as on the MU path, on a temporary
 CuPy copy of the tensor (`sgd_init.mu_init_for_sgd`); the result enters the model
-like a warm start and the CuPy memory is freed before training. For utt, random
+like a warm start and the CuPy memory is freed before training. A Tucker SVD
+init's core is first rescaled so that Σ_all x̂ = Σx: the projected core starts
+orders of magnitude too large, which MU's first step absorbs but Adam does not
+(TT/utt inits already rescale). For utt, random
 init is known to stall in a frequency-only state (memory notes, 2026-10-29), so
 use an SVD init or a warm start.
 

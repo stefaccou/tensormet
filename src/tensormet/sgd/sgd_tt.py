@@ -1,11 +1,9 @@
 """
 sgd_tt.py — SGD/Adam model for the Tucker-TT hybrid (``--decomposition tt``).
 
-Same surface as ``SGDTuckerModel`` (nonneg_views / predict_from /
-total_sum_from / total_sq_norm_from / project_ / regauge_ / materialize /
-entry_width), so ``GradStepper``, both trainers, the batcher and the
-collectives run on it unchanged. The model is the one in
-``tt_hybrid/tt_chain.py``:
+Same surface as ``SGDTuckerModel`` (``sgd_model.SGDModelBase``), so
+``GradStepper``, both trainers and the collectives run on it unchanged. The
+model is the one in ``tt_hybrid/tt_chain.py``:
 
     X̂[i_0 … i_{N-1}] = Σ_r C_0[:, r_0, :] ⋯ C_{N-1}[:, r_{N-1}, :] · Π_n A_n[i_n, r_n]
 
@@ -35,10 +33,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
-from tensormet.sgd.sgd_tucker import (
-    _EPS, PARAMETRIZATIONS, _as_rank_tuple, _parse_shared_factors,
-    raw_from_view, view_from_raw,
-)
+from tensormet.sgd.sgd_model import _EPS, SGDModelBase, raw_from_view, view_from_raw
 from tensormet.tt_hybrid.tt_chain import chain_values, core_shapes
 
 
@@ -81,7 +76,7 @@ def _to_tensor(x, dtype, device) -> torch.Tensor:
 # model
 # ---------------------------------------------------------------------------
 
-class SGDTTModel(torch.nn.Module):
+class SGDTTModel(SGDModelBase):
     """Non-negative Tucker-TT model: Tucker factors, TT cores in place of the
     dense core. ``core`` views are the list of TT cores (ρ_k, R_k, ρ_{k+1})."""
 
@@ -100,26 +95,10 @@ class SGDTTModel(torch.nn.Module):
         sum_x: Optional[float] = None,
     ):
         super().__init__()
-        self.shape = tuple(int(s) for s in shape)
-        self.order = len(self.shape)
+        device = self._setup(shape, rank, parametrization, shared_factors, eps, device)
         if self.order < 2:
             raise ValueError("decomposition='tt' needs order >= 2.")
-        self.rank = _as_rank_tuple(rank, self.order)
         self.tt_rank = int(tt_rank)
-        if parametrization not in PARAMETRIZATIONS:
-            raise ValueError(f"parametrization must be one of {PARAMETRIZATIONS}.")
-        self.parametrization = parametrization
-        self.eps = float(eps)
-        self.owner = _parse_shared_factors(shared_factors, self.order)
-        for m, o in enumerate(self.owner):
-            if (self.shape[m], self.rank[m]) != (self.shape[o], self.rank[o]):
-                raise ValueError(
-                    f"shared modes {o} and {m} differ in (dim, rank): "
-                    f"{(self.shape[o], self.rank[o])} vs {(self.shape[m], self.rank[m])}"
-                )
-        device = torch.device(device) if device is not None else torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
         self.core_shapes = [tuple(int(d) for d in s)
                             for s in core_shapes(self.rank, self.tt_rank)]
         self.entry_width = chain_entry_width(self.core_shapes, self.rank)
@@ -185,10 +164,6 @@ class SGDTTModel(torch.nn.Module):
         return cores, factors
 
     # --- non-negative views -------------------------------------------------
-    @property
-    def device(self) -> torch.device:
-        return self._core_raw[0].device
-
     def nonneg_views(self) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """``(tt_cores, factors)``, the parametrization applied once per raw
         parameter; tied modes share one factor tensor object."""
@@ -203,9 +178,6 @@ class SGDTTModel(torch.nn.Module):
         """x̂ at ``indices`` (an ``(order, B)`` long tensor)."""
         rows = [factors[m][indices[m]] for m in range(self.order)]
         return chain_values(cores, rows, torch)
-
-    def predict_entries(self, indices: torch.Tensor) -> torch.Tensor:
-        return self.predict_from(*self.nonneg_views(), indices)
 
     @staticmethod
     def _sum_all(cores, factors) -> torch.Tensor:
@@ -226,20 +198,7 @@ class SGDTTModel(torch.nn.Module):
         cores64 = [C.to(torch.float64) for C in cores]
         return sq_norm(cores64, grams, torch).to(cores[0].dtype)
 
-    def total_sum(self) -> torch.Tensor:
-        return self.total_sum_from(*self.nonneg_views())
-
-    def total_sq_norm(self) -> torch.Tensor:
-        return self.total_sq_norm_from(*self.nonneg_views())
-
-    # --- after-step maintenance --------------------------------------------
-    def project_(self):
-        """'clamp' parametrization only: project onto [eps, ∞) after a step."""
-        if self.parametrization == "clamp":
-            with torch.no_grad():
-                for p in self.parameters():
-                    p.clamp_(min=self.eps)
-
+    # --- gauge ----------------------------------------------------------------
     @torch.no_grad()
     def regauge_(self, bond_sweeps: int = 3):
         """Move to the fixed gauge (see module docstring). x̂ is unchanged."""

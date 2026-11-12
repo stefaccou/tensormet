@@ -426,7 +426,8 @@ def tt_kl_compute_errors(vec_tensor, shape, core, factors,
 # ---------------------------------------------------------------------------
 
 def initialize_tucker_tt(sparse_tensor, shape, rank, modes, init, random_state,
-                         tt_rank=100, thread_budget=None, epsilon=1e-12):
+                         tt_rank=100, thread_budget=None, epsilon=1e-12,
+                         core_init="random"):
     """Initialize ``(tt_cores, factors)`` for the hybrid.
 
     Factors come from the existing Tucker init (``sparse_ops.initialize_nonnegative_tucker``,
@@ -437,6 +438,9 @@ def initialize_tucker_tt(sparse_tensor, shape, rank, modes, init, random_state,
     closed-form chain sum past fp32 at order ≥ 6. The TT cores start
     uniform-random and the Σ_all x̂ = Σ x rescale is spread evenly over all N of
     them, so none carries an extreme magnitude.
+
+    ``core_init="markov"`` (EXPERIMENTAL) builds the cores from the data instead:
+    a class-Markov chain over the factor columns (experimental/tt_markov_init.py).
 
     Returns
     -------
@@ -469,8 +473,17 @@ def initialize_tucker_tt(sparse_tensor, shape, rank, modes, init, random_state,
     factors = [f / cp.clip(cp.sum(f, axis=0, keepdims=True), a_min=epsilon, a_max=None)
                for f in factors]
     dtype = factors[0].dtype
-    tt_cores = [cp.asarray(rng.random_sample(s) + 0.01, dtype=dtype)
-                for s in core_shapes(rank, tt_rank)]
+    if core_init == "markov":
+        import time
+        from tensormet.experimental.tt_markov_init import markov_tt_cores
+        t0 = time.perf_counter()
+        tt_cores = markov_tt_cores(sparse_tensor, shape, factors, rank, tt_rank, rng)
+        print(f"[TT-init] markov cores from pair statistics ({time.perf_counter() - t0:.1f}s)", flush=True)
+    elif core_init == "random":
+        tt_cores = [cp.asarray(rng.random_sample(s) + 0.01, dtype=dtype)
+                    for s in core_shapes(rank, tt_rank)]
+    else:
+        raise ValueError(f"core_init must be 'random' or 'markov'; got {core_init!r}")
 
     _idxs, vals = coo_to_coords(sparse_tensor, tuple(int(s) for s in shape))
     sum_x = cp.clip(cp.sum(vals), a_min=epsilon, a_max=None)
@@ -478,7 +491,7 @@ def initialize_tucker_tt(sparse_tensor, shape, rank, modes, init, random_state,
     if not bool(cp.isfinite(sum_all)) or float(sum_all) <= 0.0:
         raise FloatingPointError(
             f"TT init chain sum is {float(sum_all)!r} (columns ℓ1-normalized, "
-            f"cores ~U[0.01, 1.01]); cannot rescale. Check rank/tt_rank/shape."
+            f"core_init={core_init!r}); cannot rescale. Check rank/tt_rank/shape."
         )
     scale = (sum_x / sum_all) ** (1.0 / len(tt_cores))
     for k in range(len(tt_cores)):

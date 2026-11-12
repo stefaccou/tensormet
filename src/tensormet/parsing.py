@@ -135,7 +135,16 @@ def _none_if_missing(value, sentinel=None):
 
 def _parse_utt_core_power(s: str):
     """--utt-core-power: a fixed exponent (float) or "auto" (backtracking)."""
-    return "auto" if s.strip().lower() == "auto" else float(s)
+    if s.strip().lower() == "auto":
+        return "auto"
+    try:
+        gamma = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--utt-core-power: expected a number or 'auto', got {s!r}")
+    # 0 freezes the core, above 1 overshoots by construction.
+    if not 0.0 < gamma <= 1.0:
+        raise argparse.ArgumentTypeError(f"--utt-core-power must be in (0, 1] or 'auto'; got {s!r}")
+    return gamma
 
 
 def _parse_gpu_id(s: str):
@@ -395,12 +404,33 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="TT only: bond dimension of the tensor-train core (default 100). "
                              "Part of the artifact name ('TT{tt_rank}b{order}D'), so runs at "
                              "different bonds never share files.")
+    parser.add_argument("--svd-power-iter", type=int, dest="svd_power_iter", default=None,
+                        help="init svd_stream only: power iterations of the randomized SVD (default 2). "
+                             "More iterations sharpen columns whose eigenvalue is clearly above the "
+                             "cut-off; cost grows linearly.")
+    parser.add_argument("--svd-oversampling", type=int, dest="svd_oversampling", default=None,
+                        help="init svd_stream only: extra sketch columns beyond the rank (default 10). "
+                             "More columns fix the last kept columns when the spectrum is flat "
+                             "around the rank; cost grows linearly.")
+    parser.add_argument("--tt-core-init", type=str, dest="tt_core_init", default=None,
+                        choices=["random", "markov"],
+                        help="tt/utt only (EXPERIMENTAL): how the TT cores start. 'random' "
+                             "(default): uniform draws. 'markov': built from the data as a "
+                             "class-Markov chain over the factor columns, so the same factors "
+                             "give the same cores (pair with --init svd_stream).")
     parser.add_argument("--utt-core-power", type=_parse_utt_core_power, dest="utt_core_power",
                         default=None,
                         help="UTT only: exponent of the shared-core MU step (default 1 = undamped; "
                              "1/order guarantees the KL error never increases, but moves slowly). "
                              "'auto' starts at 1 and halves the exponent (down to 1/order) whenever "
                              "a core step raises the KL on the iteration's window, undoing that step.")
+    parser.add_argument("--binary", type=str, dest="binary", default=None,
+                        choices=["factors", "both"],
+                        help="EXPERIMENTAL (experimental/binary/README.md): 'factors' = 0/1 "
+                             "factor with k bits per word and a learned word scale; 'both' = "
+                             "also a 0/1 core (λ·M plus a background cell). Other settings come "
+                             "from TENSORMET_BINARY_* environment variables; --name must "
+                             "contain their tag, e.g. bin3.")
     parser.add_argument("--cp-inner-iters", type=int, dest="cp_inner_iters", default=None,
                         help="CP only: CP-APR inner iterations per mode per sweep (default 1).")
     parser.add_argument("--cp-scooch-kappa", type=float, dest="cp_scooch_kappa", default=None,
@@ -418,21 +448,27 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--sem-fitness-target", type=int, dest="sem_fitness_target", default=None)
     parser.add_argument("--dim-consistency", type=_parse_bool, dest="dim_consistency", default=None,
                         help="Enable LLM-as-judge dimension-consistency scoring at each semantic "
-                             "check (default: false). Loads a small judge model (~1 GB fp16) on "
-                             "the GPU at the first check.")
+                             "check (default: false). Loads the judge model (fp16, ~4 GB for "
+                             "the default Qwen3.5-2B) before training starts, on the "
+                             "decomposition's GPU unless --judge-gpu is given.")
     parser.add_argument("--dim-consistency-words", type=int, dest="dim_consistency_words", default=None,
                         help="Number of top words per dimension shown to the judge (default: 5).")
     parser.add_argument("--dim-consistency-diversity", type=_parse_bool, dest="dim_consistency_diversity",
                         default=None,
                         help="Rescale the score by top-word diversity across dimensions (default: true).")
     parser.add_argument("--dim-consistency-model", type=str, dest="dim_consistency_model", default=None,
-                        help="HF model id of the judge (default: Qwen/Qwen2.5-0.5B-Instruct).")
+                        help="HF model id of the judge (default: Qwen/Qwen3.5-2B).")
     parser.add_argument("--dim-consistency-method", type=str, dest="dim_consistency_method", default=None,
                         choices=["score", "similarity", "both"],
                         help="Which DimConsistencyJudge method(s) to run at each semantic check: "
                              "'score' (per-dimension outlier task), 'similarity' "
                              "(nearest-neighbour outlier task via score_similarity_consistency()), "
                              "or 'both'.")
+    parser.add_argument("--judge-gpu", type=int, dest="judge_gpu", default=None,
+                        help="Physical GPU to dedicate to the dimension-consistency judge, "
+                             "e.g. --judge-gpu 2. Must differ from --gpu-id. The judge then "
+                             "uses large batches sized to that GPU. Default: share the "
+                             "decomposition's GPU.")
     parser.add_argument("--remove-oov", type=_parse_bool, dest="remove_OOV", default=None)
     parser.add_argument("--time-iteration", type=_parse_bool, dest="time_iteration", default=None)
     parser.add_argument("--save-intermediate", type=_parse_bool, dest="save_intermediate", default=None)
@@ -467,8 +503,8 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                   "random_state", "epsilon", "init", "normalize_factors",
                   "shared_factors", "subsample_frac", "max_nnz", "objective",
                   "decomposition", "cp_inner_iters", "cp_scooch_kappa", "tt_rank",
-                  "utt_core_power",
-                  "solver", "sgd_lr", "sgd_batch_size", "sgd_optimizer",
+                  "utt_core_power", "svd_power_iter", "svd_oversampling", "tt_core_init",
+                  "binary", "solver", "sgd_lr", "sgd_batch_size", "sgd_optimizer",
                   "sgd_parametrization", "sgd_steps_per_iteration", "sgd_warm_start",
                   "sgd_regauge_every", "sgd_batch_scope", "sgd_sync_every", "sgd_micro_batch",
                   "sgd_cuda_graph", "sgd_comm_backend", "sgd_eval_sample"):
@@ -529,6 +565,7 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "dim_consistency_diversity",
         "dim_consistency_model",
         "dim_consistency_method",
+        "judge_gpu",
         "remove_OOV",
         "time_iteration",
         "save_intermediate",

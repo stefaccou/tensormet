@@ -211,7 +211,12 @@ def launch_nnt_decomposition(cfg):
     thread_budget = ThreadBudget(n_threads=compute_num_threads(cfg.train.max_cpu_frac))
     _n_gpus = getattr(cfg.train, "n_gpus", 1)
     _gpu_id = getattr(cfg.train, "gpu_id", None)
-    select_gpu(gpu_id=_gpu_id, n_gpus=_n_gpus)
+    _judge_gpu = getattr(cfg.eval, "judge_gpu", None)
+    if _judge_gpu is not None and not getattr(cfg.eval, "dim_consistency", False):
+        print(f"Warning: --judge-gpu {_judge_gpu} ignored (--dim-consistency is off); "
+              f"not reserving it.")
+        _judge_gpu = None
+    select_gpu(gpu_id=_gpu_id, n_gpus=_n_gpus, extra_gpu=_judge_gpu)
 
     # load in GPU sensitive modules only AFTER device has been set!
     import torch

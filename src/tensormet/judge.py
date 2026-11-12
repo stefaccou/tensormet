@@ -60,17 +60,20 @@ class DimConsistencyJudge:
     TuckerDecomposition via the outlier-detection task.
 
     Constructing the judge is free: the model/tokenizer are only loaded on the
-    first call to score(). The decomposition GPU is typically near-full with
-    CuPy pools at that point, so the caller should trim those pools right
-    before the first score() (see non_negative_tucker_with_similarity); on CUDA
-    OOM the judge falls back to CPU with a warning instead of failing the run.
+    first call to score(). When it shares the decomposition GPU, that GPU is
+    typically near-full with CuPy pools, so the caller should trim those pools
+    right before the first score() (see non_negative_tucker_with_similarity); on
+    CUDA OOM the judge falls back to CPU with a warning instead of failing the run.
+
+    On a GPU of its own (`--judge-gpu`), pass chunk=None: batches are then sized
+    to that GPU's free memory alone, with no fixed row cap.
     """
 
     def __init__(self,
                  model_name: str = DEFAULT_JUDGE_MODEL,
                  num_dim_words: int = 5,
                  diversity_aware: bool = True,
-                 chunk: int = 64,
+                 chunk: Optional[int] = 64,
                  device=None,
                  messages: Optional[list[dict]] = None):
         self.model_name = model_name
@@ -211,8 +214,9 @@ class DimConsistencyJudge:
         tracked per row, so one batch can mix prompts from different dimensions.
         Right-padding is safe under a causal model + attention mask.
 
-        Windows are capped at ``self.chunk`` rows and shrink to fit free VRAM
-        (``_estimate_chunk_rows``) when a batch holds unusually long sequences.
+        Windows are capped at ``self.chunk`` rows (no cap when None) and shrink to
+        fit free VRAM (``_estimate_chunk_rows``) when a batch holds unusually long
+        sequences.
         """
         # Every candidate of a task repeats that task's prompt, so only `rank` of
         # the `rank * (k+1)` strings are distinct.
@@ -234,16 +238,19 @@ class DimConsistencyJudge:
 
         out = [0.0] * len(prompts)
         n = len(prompts)
+        # No cap on GPU means the free-memory estimate alone bounds the window;
+        # on CPU (OOM fallback) there is no estimate, so keep the old 64.
+        cap = self.chunk or (n if is_cuda else 64)
         s = 0
         while s < n:
             if is_cuda:
-                probe_end = min(s + self.chunk, n)
+                probe_end = min(s + cap, n)
                 probe_L = max(row_lens[s:probe_end])
                 free_b = _gpu_free_bytes(self.device)
                 max_rows = _estimate_chunk_rows(vocab_size, probe_L, free_b)
-                window = max(1, min(self.chunk, max_rows))
+                window = max(1, min(cap, max_rows))
             else:
-                window = self.chunk
+                window = cap
             e = min(s + window, n)
 
             pref = prefix_ids[s:e]

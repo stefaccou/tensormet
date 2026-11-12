@@ -1,5 +1,5 @@
 """
-sharded_sgd.py — single-process multi-GPU SGD Tucker trainer.
+sharded_sgd.py — single-process multi-GPU SGD trainer (Tucker, TT, utt).
 
 Parallel counterpart of ``sgd_trainer.SGDTrainer`` (``--n_gpus > 1``), in one
 process like ``sharded_sparse.ShardedSparseTensor``: no torch.distributed, so
@@ -26,19 +26,24 @@ import numpy as np
 import torch
 
 from tensormet.sgd.collectives import make_collective
-from tensormet.sgd.sgd_trainer import make_sgd_model
+from tensormet.sgd.sgd_trainer import (
+    check_common_args,
+    check_sgd_payload,
+    checkpoint_payload,
+    coalesced_input,
+    loss_norm_const,
+    make_optimizer,
+    make_sgd_model,
+)
 from tensormet.sgd.sgd_tucker import (
     _EPS,
     EntryBatcher,
     GradStepper,
-    _default_eval_chunk,
+    _rank_derived_chunk,
     make_eval_subset,
-    sampled_loss,
+    nnz_term_sum,
 )
 from tensormet.utils import SparseCOOTensor
-
-# Alias kept for the multi-GPU notebook, which imports it from here.
-_sampled_loss = sampled_loss
 
 
 class ShardedSGDTrainer:
@@ -75,8 +80,7 @@ class ShardedSGDTrainer:
         tt_rank: Optional[int] = None,
         regauge_every: int = 1,
     ):
-        if objective not in ("full", "masked"):
-            raise ValueError(f"objective must be 'full' or 'masked', got {objective!r}")
+        self.steps_per_iteration = check_common_args(objective, steps_per_iteration)
         if divergence not in ("kl", "fr"):
             raise ValueError(f"divergence must be 'kl' or 'fr', got {divergence!r}")
         if batch_scope not in ("per_device", "global"):
@@ -86,9 +90,6 @@ class ShardedSGDTrainer:
             )
         self.divergence = divergence
         self.masked = objective == "masked"
-        self.steps_per_iteration = int(steps_per_iteration)
-        if self.steps_per_iteration < 1:
-            raise ValueError("steps_per_iteration must be >= 1")
         self.batch_scope = batch_scope
         self.sync_every = max(1, int(sync_every))
         # Blocks between gauge resets (0 = never); a no-op for Tucker.
@@ -99,13 +100,7 @@ class ShardedSGDTrainer:
         if n_shards < 2:
             raise ValueError("ShardedSGDTrainer needs >= 2 devices; use SGDTrainer.")
 
-        # See SGDTrainer: SparseCOOTensor stands in for a torch sparse COO
-        # wherever prod(shape) overflows torch's numel, and covers the four
-        # methods used below.
-        if not (isinstance(sparse_coo, (torch.Tensor, SparseCOOTensor))
-                and sparse_coo.is_sparse):
-            raise TypeError("ShardedSGDTrainer expects a torch sparse COO tensor.")
-        t = sparse_coo.coalesce()
+        t = coalesced_input(sparse_coo, "ShardedSGDTrainer")
         indices_all = t.indices()
         values_all = t.values().to(dtype=dtype)
         if divergence == "kl" and bool((values_all < 0).any()):
@@ -113,43 +108,33 @@ class ShardedSGDTrainer:
         self.nnz = int(values_all.shape[0])
         if self.nnz == 0:
             raise ValueError("sparse tensor has no nonzero entries.")
+        # (Σx, Σx²) over the whole tensor: the error denominators.
+        self._totals = (float(values_all.sum()), float(values_all.pow(2).sum()))
+        self.norm_const = loss_norm_const(divergence, *self._totals)
 
-        # One full replica + optimizer per device. Device 0 is the "master" only
-        # in the checkpointing sense; the optimizer step runs redundantly on all
-        # of them off the same all-reduced gradient (see module docstring), so
-        # there is no per-step parameter broadcast.
-        sum_x = float(values_all.sum())
+        # One full replica + optimizer per device. The optimizer step runs on
+        # every device off the same all-reduced gradient, so there is no
+        # per-step parameter broadcast.
         self._models = [
             make_sgd_model(
                 decomposition, shape=t.shape, rank=rank, tt_rank=tt_rank,
                 parametrization=parametrization, shared_factors=shared_factors,
                 init=init, random_state=random_state, device=dev, dtype=dtype,
-                eps=epsilon, sum_x=sum_x,
+                eps=epsilon, sum_x=self._totals[0],
             )
             for dev in self.devices
         ]
         self.master = self._models[0]
         self.replicas = self._models[1:]
-        # Before anything runs a matmul or a backward concurrently — including
-        # the CUDA-graph capture below, which must not record a lazy cubin load.
+        # Before anything runs a matmul or a backward concurrently, including
+        # the CUDA-graph capture below.
         self._warm_up_devices(dtype)
 
-        # Global normalization constants (identical to the single-GPU trainer).
-        # ``_totals`` are the error denominators; computed once here rather than
-        # re-reduced over every shard on every eval.
-        self._totals = (float(values_all.sum()), float(values_all.pow(2).sum()))
-        if divergence == "kl":
-            self.norm_const = max(self._totals[0], _EPS)
-        else:
-            self.norm_const = max(self._totals[1], _EPS)
-
         # Contiguous NNZ shards, one per device, with per-shard batchers seeded
-        # like sharded_sparse (base * 1000 + shard). No device holds the full
-        # permutation.
+        # like sharded_sparse (base * 1000 + shard).
         bounds = np.linspace(0, self.nnz, n_shards + 1, dtype=np.int64)
         if batch_scope == "per_device":
-            # G devices sample G x batch_size entries per step: the effective
-            # batch now actually grows with G, and per-device work is constant.
+            # G devices sample G x batch_size entries per step.
             shard_batch = int(batch_size)
         else:
             shard_batch = max(1, int(batch_size) // n_shards)
@@ -168,15 +153,14 @@ class ShardedSGDTrainer:
                                    seed=int(random_state) * 1000 + g, device=dev)
             self.batchers.append(batcher)
             if self.sync_every > 1:
-                # Local SGD: each device optimizes the FULL objective alone, so
-                # it scales to the global nnz and adds the zero-entry term
-                # itself. Parameter averaging, not gradient summing, combines
-                # the devices.
+                # Local SGD: each device optimizes the FULL objective alone (scaled
+                # to the global nnz, with the zero-entry term); parameter
+                # averaging combines the devices.
                 scale = self.nnz / batcher.batch_size
                 include_zero = True
             else:
-                # Gradients are summed every step, so each device carries only
-                # its shard's nnz term and exactly one device carries Z.
+                # Gradients are summed every step: each device carries its own
+                # shard's nnz term and exactly one device carries the zero term.
                 scale = nnz_g / batcher.batch_size
                 include_zero = g == 0
             self.scales.append(scale)
@@ -188,11 +172,10 @@ class ShardedSGDTrainer:
             ))
         self.micro_batch = self.steppers[0].micro_batch
 
-        self.eval_chunk = eval_chunk or _default_eval_chunk(
+        self.eval_chunk = eval_chunk or _rank_derived_chunk(
             self.master.rank, width=self.master.entry_width)
-        # Per-shard eval subsets, sized proportionally so the union is a uniform
-        # sample of the whole tensor and each shard's rescaled accumulator is an
-        # unbiased estimate of its own nnz term (see make_eval_subset).
+        # Per-shard eval subsets, sized in proportion to the shards so their
+        # union is a uniform sample of the whole tensor.
         self.eval_indices: List[torch.Tensor] = []
         self.eval_values: List[torch.Tensor] = []
         self.eval_scales: List[float] = []
@@ -210,28 +193,18 @@ class ShardedSGDTrainer:
         self.eval_sample = (None if all(s == 1.0 for s in self.eval_scales)
                             else sum(int(v.shape[0]) for v in self.eval_values))
 
-        if optimizer == "adam":
-            self._opts = [torch.optim.Adam(m.parameters(), lr=lr) for m in self._models]
-        elif optimizer == "sgd":
-            self._opts = [torch.optim.SGD(m.parameters(), lr=lr, momentum=0.9)
-                          for m in self._models]
-        else:
-            raise ValueError(f"optimizer must be 'adam' or 'sgd', got {optimizer!r}")
+        self._opts = [make_optimizer(m.parameters(), optimizer, lr) for m in self._models]
         self.opt = self._opts[0]
 
-        # Announced, not silent: the auto backend can legitimately fall back to
-        # HostReduce (NCCL missing, no peer mesh, or a probe that failed/hung),
-        # and that changes the meaning of every timing this run produces. A
-        # benchmark that silently measured the host path would be
-        # indistinguishable in the log from one that measured NCCL.
+        # Printed, because 'auto' can fall back to HostReduce, which changes
+        # what every timing of this run means.
         print(f"[{time.strftime('%H:%M:%S')}] building SGD collective "
               f"(requested backend={comm_backend!r})...", flush=True)
         self.collective = make_collective(self.devices, backend=comm_backend)
         print(f"[{time.strftime('%H:%M:%S')}] SGD collective: {self.collective!r}",
               flush=True)
 
-        # Precomputed (src, dst) tensor pairs for the cold-path broadcast — the
-        # old code rebuilt two OrderedDicts per call, and called it every step.
+        # (master tensor, replica tensor) pairs for the cold-path broadcast.
         with torch.no_grad():
             master_state = self.master.state_dict()
             self._bcast_pairs: List[List[Tuple[torch.Tensor, torch.Tensor]]] = [
@@ -239,15 +212,13 @@ class ShardedSGDTrainer:
                 for rep in self.replicas
             ]
 
-        # Persistent pool: threads (and their cuBLAS handles) live for the
-        # lifetime of this object. Re-creating a pool per step causes thread-ID
-        # recycling in Python 3.13, leaving stale cuBLAS handles — the same
-        # failure sharded_sparse documents at its own pool construction.
+        # Persistent pool: the threads (and their cuBLAS handles) live as long
+        # as this object. A pool per step recycles thread IDs in Python 3.13 and
+        # leaves stale cuBLAS handles (as documented in sharded_sparse).
         self._pool = ThreadPoolExecutor(max_workers=n_shards)
 
-        # Lazily allocated: one flat parameter vector per device, for the
-        # sync_every averaging and the drift check. Skipped entirely for
-        # sync_every == 1 runs that never hit a log step.
+        # One flat parameter vector per device for the sync_every averaging and
+        # the drift check; allocated on first use.
         self._param_bufs: Optional[List[torch.Tensor]] = None
 
         if resume_payload is not None:
@@ -258,14 +229,9 @@ class ShardedSGDTrainer:
     # --- device plumbing ------------------------------------------------------
 
     def _warm_up_devices(self, dtype: torch.dtype) -> None:
-        """Load cuBLAS/autograd kernels into every device context up front.
-
-        CUDA 12 loads cubins lazily, so without this the G worker threads issue
-        their first matmul (and their first backward) on their own devices
-        *concurrently* in step 1, and those one-time loads race. MU hit this as
-        an intermittent CUBLAS_STATUS_NOT_INITIALIZED with plenty of free VRAM;
-        doing it serially here, before the pool goes live, is the same fix.
-        """
+        """Load cuBLAS/autograd kernels on every device, one device at a time.
+        CUDA loads kernels lazily, and concurrent first loads from the worker
+        threads race (seen in MU as CUBLAS_STATUS_NOT_INITIALIZED)."""
         for dev in self.devices:
             with torch.cuda.device(dev):
                 a2 = torch.ones((8, 8), device=dev, dtype=dtype)
@@ -279,11 +245,9 @@ class ShardedSGDTrainer:
     def _fan_out(self, fn: Callable, *args) -> None:
         """Run ``fn(g, *args)`` on every device, concurrently, and wait.
 
-        ``torch.cuda.set_device`` is re-applied per task rather than once per
-        worker: ``ThreadPoolExecutor`` gives no guarantee that shard *g* lands
-        on the same thread twice, and the call is a thread-local driver write.
-        Exceptions surface here via ``future.result()`` instead of being
-        swallowed into a hung barrier.
+        ``torch.cuda.set_device`` is applied per task: the pool does not
+        guarantee shard *g* the same thread twice. Worker exceptions are
+        re-raised here.
         """
         def _task(g):
             torch.cuda.set_device(self.devices[g])
@@ -300,13 +264,8 @@ class ShardedSGDTrainer:
             raise errors[0]
 
     def sync(self) -> None:
-        """Block until every device is idle.
-
-        ``run_block`` deliberately returns without synchronizing on non-log
-        steps (queued work is the point), so any benchmark timing it must call
-        this around the timed region or it will attribute work to the wrong
-        block — which is what made the original 1-vs-2-GPU sweep non-monotonic.
-        """
+        """Block until every device is idle. ``run_block`` returns with work
+        still queued on non-log steps, so timings must bracket it with this."""
         for dev in self.devices:
             torch.cuda.synchronize(dev)
 
@@ -319,9 +278,7 @@ class ShardedSGDTrainer:
     # --- parameter plumbing ---------------------------------------------------
 
     def _broadcast_params(self) -> None:
-        """device 0 raw params -> replicas. Cold path only (construction and
-        resume): the per-step broadcast is gone, replaced by the redundant
-        optimizer step on the all-reduced gradient."""
+        """Device 0 raw params -> replicas (construction and resume only)."""
         with torch.no_grad():
             for pairs in self._bcast_pairs:
                 for src, dst in pairs:
@@ -347,23 +304,12 @@ class ShardedSGDTrainer:
         self._fan_out(self._unpack_scaled, 1.0 / len(self.devices))
 
     def _check_replica_drift(self) -> None:
-        """Assert every device holds bit-identical parameters.
+        """Raise unless every device holds bit-identical parameters.
 
-        The redundant optimizer step — the thing that lets the per-step
-        parameter broadcast go away — is only valid if the all-reduce returns
-        the same value on every rank and the optimizer kernels are
-        deterministic. Both should hold (NCCL's ring reduction is
-        bit-reproducible across ranks, and the ``foreach`` Adam kernels are
-        deterministic), so this exists purely to make a violation loud instead
-        of leaving it to surface as a subtly wrong final model.
-
-        The comparison is exact rather than a checksum: a checksum that misses
-        cancelling drift would defeat the point. It costs one parameter-sized
-        device-0 scratch plus a G-1 transfer, at the caller's log-step cadence,
-        not per step.
+        Stepping each replica on the same all-reduced gradient is only valid if
+        they stay identical; this makes a violation loud. Exact comparison, at
+        the log-step cadence.
         """
-        if len(self.devices) < 2:
-            return
         bufs = self._ensure_param_bufs()
         self._fan_out(self._pack_params)
         ref = bufs[0]
@@ -411,10 +357,9 @@ class ShardedSGDTrainer:
                 self.collective.all_reduce([s.flat_grad for s in self.steppers])
                 self._fan_out(self._apply_step)
         else:
-            # The sync cadence is clipped at the block boundary so parameters
-            # are always averaged before an eval or a checkpoint. Pick
-            # steps_per_iteration as a multiple of sync_every to avoid a short
-            # final chunk each block.
+            # The sync cadence is clipped at the block boundary, so parameters
+            # are averaged before every eval and checkpoint. Pick
+            # steps_per_iteration as a multiple of sync_every.
             step = first
             while step < end:
                 n = min(self.sync_every, end - step)
@@ -422,8 +367,8 @@ class ShardedSGDTrainer:
                 self._average_params()
                 step += n
 
-        # Replicas hold identical parameters here, and the reset is
-        # deterministic, so they stay bit-identical after it.
+        # Replicas are identical here and the reset is deterministic, so they
+        # stay identical after it.
         if self.regauge_every and (iteration + 1) % self.regauge_every == 0:
             self._fan_out(self._regauge)
 
@@ -432,52 +377,31 @@ class ShardedSGDTrainer:
         self._check_replica_drift()
         return self._full_relative_error()
 
-    # --- exact error (sharded) ------------------------------------------------
+    # --- error (sharded) ------------------------------------------------------
 
     @torch.no_grad()
     def _shard_error_terms(self, g: int, out: list, exact: bool) -> None:
-        eps = _EPS
-        model = self._models[g]
         if exact:
             indices, values, scale = (self.shard_indices[g],
                                       self.shard_values[g], 1.0)
         else:
             indices, values, scale = (self.eval_indices[g],
                                       self.eval_values[g], self.eval_scales[g])
-        # One parametrization pass for the whole shard, not one per chunk.
+        model = self._models[g]
         core, factors = model.nonneg_views()
-        shard_acc = values.new_zeros(())
-        for s in range(0, values.shape[0], self.eval_chunk):
-            idx = indices[:, s:s + self.eval_chunk]
-            x = values[s:s + self.eval_chunk]
-            x_hat = model.predict_from(core, factors, idx)
-            if self.divergence == "kl":
-                x_safe = x.clamp_min(eps)
-                term = x_safe * torch.log(x_safe / (x_hat + eps)) - x
-                if self.masked:
-                    term = term + x_hat
-            else:
-                term = (x - x_hat) ** 2
-                if not self.masked:
-                    term = term - x_hat ** 2
-            shard_acc = shard_acc + term.sum()
-        out[g] = float(shard_acc) * scale
+        acc = nnz_term_sum(model, core, factors, indices, values, self.divergence,
+                           self.masked, self.eval_chunk, _EPS)
+        out[g] = float(acc) * scale
 
     def final_relative_error(self) -> float:
-        """The exact error over all nnz, whatever ``eval_sample`` is set to —
-        same contract as ``SGDTrainer.final_relative_error``."""
+        """The exact error over all nnz, whatever ``eval_sample`` is."""
         return self._full_relative_error(exact=True)
 
     @torch.no_grad()
     def _full_relative_error(self, exact: bool = False) -> float:
-        """Per-shard chunked accumulation of the nnz term (one worker per
-        device), host-summed; the analytic zero-entry term is added once. Same
-        normalization as ``sgd_tucker.full_relative_error`` / the MU error
-        kernels.
-
-        Subsampled when ``eval_sample`` is set — each shard rescales its own
-        accumulator, so the host sum stays an unbiased estimate of the whole nnz
-        term. ``exact=True`` forces the full pass over every shard."""
+        """Each device sums its shard's nnz term (rescaled when subsampled);
+        the host adds them and the exact zero-entry term. Same normalization as
+        ``sgd_tucker.full_relative_error``."""
         eps = _EPS
         sinks: list = [None] * len(self.devices)
         self._fan_out(self._shard_error_terms, sinks, exact)
@@ -496,51 +420,25 @@ class ShardedSGDTrainer:
         return self.master.materialize()
 
     def checkpoint_payload(self, iteration: int) -> dict:
-        """Device-0 payload, byte-compatible with ``SGDTrainer``'s. Every
-        replica holds the same parameters at a block boundary (asserted by
-        ``_check_replica_drift`` on log steps), so device 0 is the whole
-        model, not a shard of it."""
-        core, factors = self.materialize()
-        raw_state = {k: v.detach().cpu() for k, v in self.master.state_dict().items()}
-        optim_state = self.opt.state_dict()
-        optim_state["state"] = {
-            k: {kk: (vv.detach().cpu() if isinstance(vv, torch.Tensor) else vv)
-                for kk, vv in v.items()}
-            for k, v in optim_state.get("state", {}).items()
-        }
-        return {
-            "solver": "sgd",
-            "iteration": int(iteration),
-            "core": core,
-            "factors": factors,
-            "raw_state_dict": raw_state,
-            "optim_state": optim_state,
-        }
+        """Device 0's payload, the same format as ``SGDTrainer``'s: replicas are
+        identical at a block boundary."""
+        return checkpoint_payload(self.master, self.opt, iteration)
 
     def load_payload(self, payload: dict) -> None:
-        if payload.get("solver") != "sgd":
-            raise ValueError(
-                "checkpoint payload is not an SGD checkpoint; refusing to load "
-                f"(got solver={payload.get('solver')!r})."
-            )
+        check_sgd_payload(payload)
         self.master.load_state_dict(payload["raw_state_dict"])
         self._broadcast_params()
         # Every device steps, so every optimizer needs the restored moments.
-        # The deepcopy is load-bearing: Adam keeps ``step`` on the host, where
-        # ``.to()`` returns the same object, so without it all G optimizers
-        # share one ``step`` tensor, increment it concurrently, and diverge.
+        # The deepcopy matters: Adam keeps ``step`` on the host, where ``.to()``
+        # returns the same object, so without it all optimizers would share one
+        # ``step`` tensor and increment it concurrently.
         for opt in self._opts:
             opt.load_state_dict(copy.deepcopy(payload["optim_state"]))
         self._check_optimizer_state_disjoint()
 
     def _check_optimizer_state_disjoint(self) -> None:
-        """No optimizer state tensor may be shared between two replicas.
-
-        Cheap (one dict of ids, at resume only) and pointed: shared state is
-        silent until the replicas have stepped, at which point it surfaces as
-        drift a whole block away from its cause. See ``load_payload`` for the
-        aliasing this guards against.
-        """
+        """No optimizer state tensor may be shared between two replicas (see
+        ``load_payload``); checked once, at resume."""
         owner: dict = {}
         for g, opt in enumerate(self._opts):
             for st in opt.state.values():

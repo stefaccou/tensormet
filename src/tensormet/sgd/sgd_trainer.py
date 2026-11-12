@@ -1,21 +1,17 @@
 """
-sgd_trainer.py — stateful SGD trainer for the production loop.
-
-``SGDTrainer`` packages ``sgd_tucker``'s model/batcher/objective into the
-narrow surface ``non_negative_tucker_with_similarity`` consumes when
-``cfg.exp.solver == "sgd"``:
+sgd_trainer.py — the SGD trainer the production loop drives
+(``cfg.exp.solver == "sgd"``), plus the helpers it shares with
+``ShardedSGDTrainer``:
 
     trainer = SGDTrainer(torch_coo, rank=..., divergence=..., ...)
     rel_err = trainer.run_block(iteration, log_step)   # K optimizer steps
-    core, factors = trainer.materialize()              # CPU numpy, lazily
+    core, factors = trainer.materialize()              # CPU numpy
     payload = trainer.checkpoint_payload(iteration)    # resumable dict
 
 One loop "iteration" is a block of ``steps_per_iteration`` optimizer steps;
 batches are a pure function of (seed, step), so resume replays them exactly.
-
-The step body is ``sgd_tucker.GradStepper``, shared with ``ShardedSGDTrainer``.
-Parameter ``.grad``s are views into its flat buffer, so never call
-``zero_grad(set_to_none=True)`` here.
+The step body is ``sgd_tucker.GradStepper``; parameter ``.grad``s are views
+into its flat buffer, so never call ``zero_grad(set_to_none=True)``.
 """
 from __future__ import annotations
 
@@ -59,6 +55,81 @@ def make_sgd_model(decomposition: str = "tucker", *, shape, rank, tt_rank=None,
     return SGDUTTModel(tt_rank=tt_rank, sum_x=sum_x, **common)
 
 
+# ---------------------------------------------------------------------------
+# helpers shared with ShardedSGDTrainer
+# ---------------------------------------------------------------------------
+
+def coalesced_input(sparse_coo, who: str):
+    """The coalesced input tensor. SparseCOOTensor is load_from_disk's stand-in
+    where prod(shape) overflows torch's numel; it has every method used here
+    (.coalesce, .indices, .values, .shape)."""
+    if not (isinstance(sparse_coo, (torch.Tensor, SparseCOOTensor))
+            and sparse_coo.is_sparse):
+        raise TypeError(f"{who} expects a torch sparse COO tensor.")
+    return sparse_coo.coalesce()
+
+
+def check_common_args(objective: str, steps_per_iteration: int) -> int:
+    if objective not in ("full", "masked"):
+        raise ValueError(f"objective must be 'full' or 'masked', got {objective!r}")
+    steps = int(steps_per_iteration)
+    if steps < 1:
+        raise ValueError("steps_per_iteration must be >= 1")
+    return steps
+
+
+def loss_norm_const(divergence: str, sum_x: float, sum_x_sq: float) -> float:
+    """The loss is divided by the relative error's own denominator, so lr
+    defaults transfer across datasets."""
+    if divergence == "kl":
+        return max(sum_x, _EPS)
+    if divergence == "fr":
+        return max(sum_x_sq, _EPS)
+    raise ValueError(f"divergence must be 'kl' or 'fr', got {divergence!r}")
+
+
+def make_optimizer(params, name: str, lr: float) -> torch.optim.Optimizer:
+    if name == "adam":
+        return torch.optim.Adam(params, lr=lr)
+    if name == "sgd":
+        return torch.optim.SGD(params, lr=lr, momentum=0.9)
+    raise ValueError(f"optimizer must be 'adam' or 'sgd', got {name!r}")
+
+
+def checkpoint_payload(model, opt, iteration: int) -> dict:
+    """Resumable checkpoint. ``core``/``factors`` are the non-negative views
+    (host numpy) for CPU-only tooling; ``raw_state_dict``/``optim_state`` hold
+    the trainable state (host tensors)."""
+    core, factors = model.materialize()
+    raw_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    optim_state = opt.state_dict()
+    optim_state["state"] = {
+        k: {kk: (vv.detach().cpu() if isinstance(vv, torch.Tensor) else vv)
+            for kk, vv in v.items()}
+        for k, v in optim_state.get("state", {}).items()
+    }
+    return {
+        "solver": "sgd",
+        "iteration": int(iteration),
+        "core": core,
+        "factors": factors,
+        "raw_state_dict": raw_state,
+        "optim_state": optim_state,
+    }
+
+
+def check_sgd_payload(payload: dict) -> None:
+    if payload.get("solver") != "sgd":
+        raise ValueError(
+            "checkpoint payload is not an SGD checkpoint; refusing to load "
+            f"(got solver={payload.get('solver')!r})."
+        )
+
+
+# ---------------------------------------------------------------------------
+# single-GPU trainer
+# ---------------------------------------------------------------------------
+
 class SGDTrainer:
     """Minibatch SGD/Adam trainer over a torch sparse COO tensor."""
 
@@ -89,24 +160,13 @@ class SGDTrainer:
         tt_rank: Optional[int] = None,
         regauge_every: int = 1,
     ):
-        if objective not in ("full", "masked"):
-            raise ValueError(f"objective must be 'full' or 'masked', got {objective!r}")
+        self.steps_per_iteration = check_common_args(objective, steps_per_iteration)
         self.divergence = divergence
         self.masked = objective == "masked"
-        self.steps_per_iteration = int(steps_per_iteration)
-        if self.steps_per_iteration < 1:
-            raise ValueError("steps_per_iteration must be >= 1")
         self.eval_chunk = eval_chunk
         # Blocks between gauge resets (0 = never); a no-op for Tucker.
         self.regauge_every = max(0, int(regauge_every))
-
-        # SparseCOOTensor is load_from_disk's stand-in wherever prod(shape)
-        # overflows torch's numel (order 5 at dim 10000). Only .coalesce() /
-        # .indices() / .values() / .shape are used below, which it provides.
-        if not (isinstance(sparse_coo, (torch.Tensor, SparseCOOTensor))
-                and sparse_coo.is_sparse):
-            raise TypeError("SGDTrainer expects a torch sparse COO tensor.")
-        t = sparse_coo.coalesce()
+        t = coalesced_input(sparse_coo, "SGDTrainer")
 
         self.model = make_sgd_model(
             decomposition, shape=t.shape, rank=rank, tt_rank=tt_rank,
@@ -128,10 +188,8 @@ class SGDTrainer:
                                     device=self.device)
         self.scale = self.nnz / self.batcher.batch_size
 
-        # The error pass costs the same per entry as a training step, so at
-        # nnz >> batch_size * steps_per_iteration * check_every it dominates the
-        # run. eval_sample trades it for a fixed random subset (see
-        # make_eval_subset); None keeps the exact pass.
+        # The logged error costs a training step per entry; eval_sample swaps
+        # the exact pass for a fixed random subset (None keeps it exact).
         (self._eval_indices, self._eval_values,
          self._eval_scale, self._eval_totals) = make_eval_subset(
             self.indices, self.values, eval_sample, random_state
@@ -139,25 +197,9 @@ class SGDTrainer:
         self.eval_sample = (None if self._eval_scale == 1.0
                             else int(self._eval_values.shape[0]))
 
-        # Loss normalized by the data scale (same constants the relative errors
-        # use) so lr defaults transfer across datasets.
-        if divergence == "kl":
-            self.norm_const = float(self.values.sum().clamp_min(_EPS))
-        elif divergence == "fr":
-            self.norm_const = float(self.values.pow(2).sum().clamp_min(_EPS))
-        else:
-            raise ValueError(f"divergence must be 'kl' or 'fr', got {divergence!r}")
+        self.norm_const = loss_norm_const(divergence, *self._eval_totals)
+        self.opt = make_optimizer(self.model.parameters(), optimizer, lr)
 
-        if optimizer == "adam":
-            self.opt = torch.optim.Adam(self.model.parameters(), lr=lr)
-        elif optimizer == "sgd":
-            self.opt = torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
-        else:
-            raise ValueError(f"optimizer must be 'adam' or 'sgd', got {optimizer!r}")
-
-        # The step body (micro-batching, the flat gradient buffer, the optional
-        # captured graph) is the same object the sharded trainer runs per
-        # device; only the collective around it differs.
         self.stepper = GradStepper(
             self.model, self.indices, self.values, self.batcher,
             scale=self.scale, divergence=self.divergence, masked=self.masked,
@@ -173,7 +215,7 @@ class SGDTrainer:
 
     def run_block(self, iteration: int, log_step: bool) -> Optional[float]:
         """Run optimizer steps ``iteration*K .. (iteration+1)*K - 1``; return
-        the exact relative error over all nnz on log steps, else None."""
+        the relative error on log steps, else None."""
         k = self.steps_per_iteration
         for step in range(iteration * k, (iteration + 1) * k):
             self.stepper.compute_grads(step)
@@ -187,26 +229,18 @@ class SGDTrainer:
         return self._full_relative_error()
 
     def sync(self) -> None:
-        """Block until the device is idle.
-
-        ``run_block`` returns with work still queued on non-log steps, so a
-        benchmark timing it must call this around the timed region — otherwise
-        it attributes one block's kernels to the next block's wall clock.
-        Mirrors ``ShardedSGDTrainer.sync``.
-        """
+        """Block until the device is idle. ``run_block`` returns with work still
+        queued on non-log steps, so timings must bracket it with this."""
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
     def final_relative_error(self) -> float:
-        """The exact error over all nnz, whatever ``eval_sample`` is set to.
-
-        The loop calls this once at the end so a run whose logged curve is
-        subsampled still reports an exact final number."""
+        """The exact error over all nnz, whatever ``eval_sample`` is."""
         return self._full_relative_error(exact=True)
 
     def _full_relative_error(self, exact: bool = False) -> float:
-        """The loop's logged error. Subsampled when ``eval_sample`` is set;
-        ``exact=True`` forces the full pass (used for the final report)."""
+        """The logged error: on the eval subset when ``eval_sample`` is set,
+        unless ``exact``."""
         if exact or self._eval_scale == 1.0:
             return full_relative_error(
                 self.model, self.indices, self.values, self.divergence,
@@ -226,33 +260,10 @@ class SGDTrainer:
         return self.model.materialize()
 
     def checkpoint_payload(self, iteration: int) -> dict:
-        """Fully resumable checkpoint. ``core``/``factors`` are the
-        non-negative views (host numpy) so CPU-only tooling can peek without
-        knowing about parametrizations; ``raw_state_dict``/``optim_state``
-        carry the actual trainable state (host tensors)."""
-        core, factors = self.materialize()
-        raw_state = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
-        optim_state = self.opt.state_dict()
-        optim_state["state"] = {
-            k: {kk: (vv.detach().cpu() if isinstance(vv, torch.Tensor) else vv)
-                for kk, vv in v.items()}
-            for k, v in optim_state.get("state", {}).items()
-        }
-        return {
-            "solver": "sgd",
-            "iteration": int(iteration),
-            "core": core,
-            "factors": factors,
-            "raw_state_dict": raw_state,
-            "optim_state": optim_state,
-        }
+        return checkpoint_payload(self.model, self.opt, iteration)
 
     def load_payload(self, payload: dict) -> None:
-        if payload.get("solver") != "sgd":
-            raise ValueError(
-                "checkpoint payload is not an SGD checkpoint; refusing to load "
-                f"(got solver={payload.get('solver')!r})."
-            )
+        check_sgd_payload(payload)
         self.model.load_state_dict(payload["raw_state_dict"])
         # load_state_dict moves optimizer state to each param's device.
         self.opt.load_state_dict(payload["optim_state"])

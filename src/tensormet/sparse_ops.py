@@ -912,8 +912,8 @@ def _randomised_svd_worker(row_np, col_np, data_np, sp_shape, rank_i, random_sta
     """Top-level worker for ProcessPoolExecutor: randomised truncated SVD on one
     mode unfolding, with a deterministic operation count.
 
-    CPU port of _gpu_top_k_eig applied to the implicit Gram operator A @ A.T:
-    randomized subspace iteration + CholeskyQR + Rayleigh-Ritz. Unlike ARPACK
+    Randomized subspace iteration + CholeskyQR + Rayleigh-Ritz on the implicit
+    Gram operator A @ A.T. Unlike ARPACK
     (init="svd"), the total work is fixed in advance — see
     _rsvd_gram_matvec_total — so the main process can give tqdm a real total.
 
@@ -955,15 +955,13 @@ def _randomised_svd_worker(row_np, col_np, data_np, sp_shape, rank_i, random_sta
             col_norms = np.sqrt(np.sum(Y.astype(np.float64) ** 2, axis=0, keepdims=True))
             Y = (Y / np.maximum(col_norms, 1e-100)).astype(dtype)
 
-        # CholeskyQR; tiny (p × p) algebra in float64 like the GPU path
+        # CholeskyQR; tiny (p × p) algebra in float64
         G = (Y.astype(np.float64).T @ Y.astype(np.float64))
         G = (G + G.T) * 0.5
         G += np.eye(p) * (np.abs(np.diag(G)).mean() * 1e-10 + 1e-100)
         L = scipy.linalg.cholesky(G, lower=True)
         L_inv = scipy.linalg.solve_triangular(L, np.eye(p), lower=True)
-        # Y^T Y = L L^T  ⇒  Q = Y L^{-T} is orthonormal (Rayleigh-Ritz below
-        # relies on this; note _gpu_top_k_eig uses Y @ L^{-1}, which only
-        # preserves the span).
+        # Y^T Y = L L^T  ⇒  Q = Y L^{-T} is orthonormal (Rayleigh-Ritz below relies on it)
         Q = (Y @ L_inv.T.astype(dtype))                    # (m, p) orthonormal
 
         # Rayleigh-Ritz: one more Gram application, then a tiny eigh
@@ -1124,103 +1122,6 @@ def _compute_tucker_core_batched(sparse_tensor, shape, factors, modes):
     return core
 
 
-def _gpu_top_k_eig(C, k, n_oversampling=10, n_power_iter=3, seed=None):
-    """Top-k eigenpairs of a symmetric PSD matrix C (m × m) using only cuBLAS.
-
-    Algorithm: randomized subspace iteration + CholeskyQR + Rayleigh-Ritz.
-    cuSOLVER is never called. The only CPU work is a (k+p)×(k+p) Cholesky
-    and eigh — matrices of size ~60×60 for typical ranks, negligible cost.
-
-    Steps:
-      1. Y = C @ Ω          random projection           (cuBLAS, float64)
-      2. Y = C @ (C @ Y)    power iterations with column normalisation
-      3. Q = CholeskyQR(Y)  tiny CPU Cholesky on (p×p) + GPU matmul
-      4. B = Q.T @ C @ Q    Rayleigh-Ritz               (cuBLAS, result tiny)
-      5. eigh(B)            on CPU, B is (p×p)
-      6. U = Q @ V          map eigenvectors back         (cuBLAS)
-
-    Column normalisation after each power iteration is essential: without it,
-    the dominant eigenvalue is amplified as λ^(2t+1) per iteration, overflowing
-    float32 (and even float64) for large Gram matrices. Normalisation preserves
-    the column span — which is all that matters — while keeping values finite.
-    All power-iteration arithmetic is done in float64 to prevent cancellation.
-    """
-    import scipy.linalg
-
-    m = C.shape[0]
-    p = k + n_oversampling
-    orig_dtype = C.dtype
-
-    # Upcast to float64 for numerical stability throughout
-    C64 = C.astype(cp.float64)
-
-    rng = cp.random.RandomState(seed)
-    Y = rng.standard_normal((m, p))   # float64
-
-    Y = C64 @ Y
-    for _ in range(n_power_iter):
-        Y = C64 @ (C64 @ Y)
-        # Normalise columns to prevent overflow/underflow across iterations.
-        # The column span of Y is unchanged by this scaling.
-        col_norms = cp.sqrt(cp.sum(Y ** 2, axis=0, keepdims=True))
-        Y /= cp.maximum(col_norms, 1e-100)
-
-    # CholeskyQR: Y.T @ Y is (p×p). After column normalisation the diagonal
-    # is ≈ 1 so G is well-conditioned and Cholesky succeeds reliably.
-    G_cpu = cp.asnumpy(Y.T @ Y)
-    G_cpu = (G_cpu + G_cpu.T) * 0.5                         # symmetrize
-    G_cpu += np.eye(p) * (np.abs(np.diag(G_cpu)).mean() * 1e-10 + 1e-100)
-    L = scipy.linalg.cholesky(G_cpu, lower=True)
-    L_inv = scipy.linalg.solve_triangular(L, np.eye(p), lower=True)
-    Q = Y @ cp.asarray(L_inv)                               # (m, p) float64
-
-    # Rayleigh-Ritz: project C onto the p-dim subspace
-    B_cpu = cp.asnumpy(Q.T @ C64 @ Q)                      # (p, p) — tiny
-    B_cpu = (B_cpu + B_cpu.T) * 0.5
-    eigvals_cpu, eigvecs_cpu = np.linalg.eigh(B_cpu)
-
-    # Top-k in descending order; cast back to original dtype
-    eigvals = eigvals_cpu[-k:][::-1].copy()
-    V = cp.asarray(np.ascontiguousarray(eigvecs_cpu[:, -k:][:, ::-1]))
-    U = (Q @ V).astype(orig_dtype)                          # (m, k)
-    s = cp.sqrt(cp.maximum(cp.asarray(eigvals), 0.0)).astype(orig_dtype)
-    return U, s
-
-
-def _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state, with_core=True):
-    """Tucker init via Gram-matrix eigendecomposition (GPU path).
-
-    Computes A @ A.T for each mode unfolding A via cuSPARSE spgemm, then
-    extracts the top-k eigenpairs with _gpu_top_k_eig (randomized subspace
-    iteration — cuBLAS only, no cuSOLVER). Core is computed via the same
-    NNZ-batched accumulation used by kl_core_update_largedim.
-    """
-    factors = []
-    for i, mode in enumerate(modes):
-        unfolded = unfold_from_vectorized_sparse(sparse_tensor, shape, mode, to_dense=False)
-        A = unfolded.tocsr()
-        del unfolded
-
-        # A @ A.T: (I_mode × I_mode) via cuSPARSE spgemm — never touches prod_other densely
-        C = A @ A.T
-        del A
-        if cpx_sparse.isspmatrix(C):
-            C = C.toarray()
-
-        k = rank[i]
-        U, s = _gpu_top_k_eig(C, k, seed=random_state + i)
-        del C
-
-        factors.append(_nndsvd_factors_gpu(U, s))
-
-    core = None
-    if with_core:
-        core = _compute_tucker_core_batched(sparse_tensor, shape, factors, modes)
-        core = cp.clip(cp.abs(core), a_min=1e-30, a_max=None)
-    factors = [cp.clip(cp.abs(f), a_min=1e-30, a_max=None) for f in factors]
-    return core, factors
-
-
 def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, random_state,
                                    thread_budget=None, with_core=True):
     """with_core=False returns (None, factors) and skips the core computation —
@@ -1243,13 +1144,13 @@ def initialize_nonnegative_tucker(sparse_tensor, shape, rank, modes, init, rando
         return _initialize_svd_tucker_cpu(sparse_tensor, shape, rank, modes, random_state,
                                           thread_budget=thread_budget, variant=variant,
                                           with_core=with_core)
-    elif init == "svd_gpu":
-        return _initialize_svd_tucker_gpu(sparse_tensor, shape, rank, modes, random_state,
-                                          with_core=with_core)
     elif init == "svd_stream":
         from tensormet.experimental.stream_svd import initialize_svd_stream
         return initialize_svd_stream(sparse_tensor, shape, rank, modes, random_state,
                                      with_core=with_core)
+    elif isinstance(init, str):
+        raise ValueError(f"unknown init {init!r}; use 'random', 'svd', 'svd_cpu', 'svd_loose', "
+                         "'randomised_svd' or 'svd_stream', or pass (core, factors)")
     else:
         core, factors = init
 

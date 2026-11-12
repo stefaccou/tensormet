@@ -1,62 +1,28 @@
 """
-sgd_tucker.py — SGD/Adam-based non-negative Tucker decomposition.
+sgd_tucker.py — SGD/Adam non-negative Tucker, plus the pieces every SGD model
+uses: the batcher, the objectives, the per-device step (``GradStepper``) and
+the error. See sgd/README.md for costs, multi-GPU knobs and integration.
 
-Stochastic-gradient alternative to the MU loop in
-``tucker_tensor.non_negative_tucker_with_similarity``. Pure PyTorch. Per-step
-cost is O(batch), plus the exact zero-entry term for ``objective="full"``;
-memory is bounded by the two-group contraction (``_contraction_plan``). See
-sgd/README.md for costs, multi-GPU knobs and integration.
+Model: X̂ = G ×_1 A^(1) ×_2 … ×_N A^(N), kept non-negative by a
+parametrization (``sgd_model.PARAMETRIZATIONS``). The TT and utt models
+(``sgd_tt.py``, ``experimental/uniform_tt/utt_sgd.py``) have the same surface;
+``sgd_trainer.make_sgd_model`` picks one.
 
-Model
------
-X̂ = G ×_1 A^(1) ×_2 … ×_N A^(N), with non-negativity enforced through a
-parametrization (default ``softplus``: A = softplus(θ) + eps, so positivity is
-structural and gradients never die at the boundary; ``clamp`` stores the
-factors directly and projects onto [eps, ∞) after each optimizer step, which
-is closer in spirit to MU's clip but can zero-lock; ``exp`` stores log-values,
-so every step is relative — see ``PARAMETRIZATIONS``).
+Objectives (the MU path's divergences). The zero-entry part is exact and in
+closed form, so no negative sampling is needed:
 
-The TT and utt models (``sgd_tt.py``, ``experimental/uniform_tt/utt_sgd.py``)
-implement the same surface; ``sgd_trainer.make_sgd_model`` picks one.
+  KL  full :  Σ_nz [x·log(x/x̂) − x]          (sampled, rescaled by nnz/batch)
+              + sum(X̂)                       (exact: core ⨯ column sums)
+  KL  mask :  Σ_nz [x·log(x/x̂) − x + x̂]     (sampled, rescaled)
+  FR  full :  Σ_nz [(x − x̂)² − x̂²]           (sampled, rescaled)
+              + ‖X̂‖²                         (exact: core ⨯ factor Grams)
+  FR  mask :  Σ_nz (x − x̂)²                   (sampled, rescaled)
 
-Objectives (matching the MU path's divergences and error normalizations)
-------------------------------------------------------------------------
-The key trick that makes *full* (non-masked) objectives SGD-able without
-negative sampling: the zero-entry contribution is analytic for a Tucker model.
+Reported errors are KL / Σx and ‖X−X̂‖ / ‖X‖, as in ``distance.py``.
 
-  KL  full :  Σ_nz [x·log(x/x̂) − x]                 (sampled, rescaled by 1/p)
-              + sum(X̂)                              (EXACT: core ⨯ column sums)
-  KL  mask :  Σ_nz [x·log(x/x̂) − x + x̂]            (sampled, rescaled)
-  FR  full :  Σ_nz [(x − x̂)² − x̂²]                  (sampled, rescaled)
-              + ‖X̂‖²                                (EXACT: core ⨯ factor Grams)
-  FR  mask :  Σ_nz (x − x̂)²                          (sampled, rescaled)
-
-Reported errors use the same normalization as ``distance.kl_compute_errors``
-(KL / Σx) and ``distance.fr_compute_errors`` (‖X−X̂‖ / ‖X‖) so convergence
-curves are directly comparable with the MU baseline.
-
-Sampling & reproducibility
---------------------------
-``EntryBatcher`` mirrors ``stochastic_sparse.CooSubsampler``: every batch is a
-pure function of (seed, step), so resume replays identical batches. The
-backward scatter-adds are nondeterministic on CUDA; pass
-``deterministic=True`` for bitwise reproducibility.
-
-Usage (standalone)
-------------------
-    from tensormet.sgd.sgd_tucker import sgd_non_negative_tucker
-
-    out = sgd_non_negative_tucker(
-        sparse_tensor,            # torch sparse COO (or SparseTupleTensor with .tensor)
-        rank=100,
-        divergence="kl",          # or "fr"
-        objective="full",         # or "masked"
-        n_steps=20_000,
-        batch_size=4096,
-        lr=1e-2,
-    )
-    core, factors = out["tensor"]  # tensorly TuckerTensor payload, CPU numpy
-    # → TuckerDecomposition(core, factors, vocab) for the eval stack.
+Batches are a pure function of (seed, step), so resume replays them exactly.
+The backward scatter-adds are nondeterministic on CUDA; pass
+``deterministic=True`` to ``sgd_non_negative_tucker`` for bitwise reproducibility.
 """
 from __future__ import annotations
 
@@ -66,106 +32,52 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from tensorly import backend_context
 from tensorly.tucker_tensor import TuckerTensor
 
-from tensormet.utils import SparseCOOTensor, einsum_letters, resolve_shared_factors
-
-_EPS = 1e-12
+# _EPS, PARAMETRIZATIONS and the helpers below moved to sgd_model.py; imported
+# here too so older imports from this module keep working.
+from tensormet.sgd.sgd_model import (  # noqa: F401
+    _EPS,
+    PARAMETRIZATIONS,
+    SGDModelBase,
+    _as_rank_tuple,
+    _parse_shared_factors,
+    raw_from_view,
+    view_from_raw,
+)
+from tensormet.utils import SparseCOOTensor, einsum_letters
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
-def _as_rank_tuple(rank: Union[int, Sequence[int]], order: int) -> Tuple[int, ...]:
-    if isinstance(rank, int):
-        return (rank,) * order
-    rank = tuple(int(r) for r in rank)
-    if len(rank) != order:
-        raise ValueError(f"rank has {len(rank)} entries for an order-{order} tensor.")
-    return rank
-
-
-def _parse_shared_factors(shared_factors, order: int) -> List[int]:
-    """Return owner[mode] — the canonical (lowest) mode each mode's factor
-    aliases to. Accepts the same specs as the main package: None/False,
-    True → {(1, 2)}, "all", or a set/sequence of (i, j) pairs."""
-    pairs = resolve_shared_factors(shared_factors, order) or ()
-
-    owner = list(range(order))
-
-    def find(i):
-        while owner[i] != i:
-            owner[i] = owner[owner[i]]
-            i = owner[i]
-        return i
-
-    for a, b in pairs:
-        ra, rb = find(a), find(b)
-        lo, hi = min(ra, rb), max(ra, rb)
-        owner[hi] = lo
-    return [find(i) for i in range(order)]
-
-
 def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
     # softplus⁻¹(y) = log(expm1(y)); clamp keeps the log finite for tiny inits.
     return torch.log(torch.expm1(y.clamp_min(1e-6)))
 
 
-# Non-negativity parametrizations: raw parameter θ -> non-negative view.
-#   softplus  softplus(θ) + eps
-#   clamp     θ itself, projected onto [eps, ∞) after each step
-#   exp       exp(θ): a rescale of the view is an additive shift of θ, which is
-#             what lets the TT/utt models re-gauge without spoiling Adam's state
-PARAMETRIZATIONS = ("softplus", "clamp", "exp")
-
-
-def view_from_raw(raw: torch.Tensor, parametrization: str, eps: float) -> torch.Tensor:
-    if parametrization == "softplus":
-        return F.softplus(raw) + eps
-    if parametrization == "exp":
-        return torch.exp(raw)
-    return raw
-
-
-def raw_from_view(view: torch.Tensor, parametrization: str, eps: float) -> torch.Tensor:
-    """Inverse of ``view_from_raw``, exact down to the dtype's ``tiny``.
-
-    Unlike ``_inv_softplus`` there is no 1e-6 clamp: ℓ1-normalized TT factors
-    have entries around 1/V, far below it. softplus⁻¹(y) = y + log(-expm1(-y)),
-    the overflow-free form of log(expm1(y))."""
-    tiny = torch.finfo(view.dtype).tiny
-    if parametrization == "softplus":
-        y = (view - eps).clamp_min(tiny)
-        return y + torch.log(-torch.expm1(-y))
-    if parametrization == "exp":
-        return torch.log(view.clamp_min(tiny))
-    return view
-
-
 def _contraction_plan(rank: Sequence[int]) -> Tuple[int, bool, int]:
     """``(split, gemm_left, width)`` for the two-group entry contraction.
 
-    The modes are split at ``split`` into a left and right group; each group's
-    gathered rows form a row-wise Khatri-Rao product, and the two meet the core
-    reshaped to ``(prod(rank[:split]), prod(rank[split:]))`` — one via a GEMM
-    (``gemm_left`` says which), the other elementwise. ``width`` is the largest
-    intermediate per entry:
+    The modes are split at ``split`` into a left and a right group; each
+    group's gathered rows form a row-wise Khatri-Rao product, and the two meet
+    the core reshaped to ``(prod(rank[:split]), prod(rank[split:]))``, one via a
+    GEMM (``gemm_left`` says which) and the other elementwise. ``width`` is the
+    largest intermediate per entry:
 
         width(s, gemm_left)  = max(kr_left, prod(rank[s:]))   if gemm_left
                              = max(kr_right, prod(rank[:s]))  otherwise
 
-    minimised over both (~sqrt(prod(rank)) for uniform ranks). The split is
-    contiguous, so it is never worse than peeling one mode from either end.
-    Flops are ``B · prod(rank)`` under every plan: this only trades memory.
+    minimised over both (~sqrt(prod(rank)) for uniform ranks). Flops are
+    ``B · prod(rank)`` under every plan: this only trades memory.
     """
     r = [int(x) for x in rank]
     n = len(r)
     if n < 2:
-        # A single mode contracts as one dot product; there is no intermediate
-        # beyond the gathered rows, which every plan allocates anyway.
+        # A single mode contracts as one dot product; no intermediate beyond
+        # the gathered rows.
         return 0, True, 1
     best = None
     for s in range(1, n):
@@ -180,45 +92,23 @@ def _contraction_plan(rank: Sequence[int]) -> Tuple[int, bool, int]:
     return s, gemm_left, max(int(w), 1)
 
 
-def _intermediate_width(rank: Sequence[int]) -> int:
-    """Elements of the largest ``predict_entries`` intermediate *per entry*."""
-    return _contraction_plan(rank)[2]
-
-
 def _rank_derived_chunk(rank: Sequence[int], budget: int = 1 << 26,
                         width: Optional[int] = None) -> int:
-    """Largest entry count whose forward intermediate fits ``budget`` elements.
+    """Largest entry count whose forward intermediate fits ``budget`` elements
+    (2^26 ≈ 256 MB fp32), within [64, 2^20].
 
-    ``budget`` defaults to 2^26 elements (~256 MB fp32). Under the two-group
-    contraction the width is ``~sqrt(prod(rank))``, so this returns the full
-    batch for everything up to about order 4 / rank 200 and micro-batching
-    becomes a no-op there. The 64 floor still exists for the regimes where the
-    width genuinely cannot be brought down (order 5+), where it binds and the
-    budget is exceeded on purpose — a chunk of 1 would be unusable, but it means
-    very large orders want an explicit ``--sgd-micro-batch``.
-
-    ``width`` overrides the per-entry intermediate size; models other than
-    Tucker pass their own (``model.entry_width``).
+    ``width`` is the per-entry intermediate (``model.entry_width``); None
+    derives Tucker's from the rank. The 64 floor only binds at order 5+, where
+    an explicit ``--sgd-micro-batch`` is the better choice.
     """
     if width is None:
-        width = _intermediate_width(rank)
+        width = _contraction_plan(rank)[2]
     return int(max(64, min(1 << 20, budget // max(1, int(width)))))
 
 
-def _default_eval_chunk(rank: Sequence[int], budget: int = 1 << 26,
-                        width: Optional[int] = None) -> int:
-    """Entries per chunk in ``full_relative_error`` (see ``_rank_derived_chunk``)."""
-    return _rank_derived_chunk(rank, budget, width=width)
-
-
 def _row_khatri_rao(rows: Sequence[torch.Tensor]) -> torch.Tensor:
-    """Row-wise Khatri-Rao of ``(B, R_i)`` matrices → ``(B, prod R_i)``.
-
-    Row ``z`` of the result is the flattened outer product of row ``z`` of each
-    input, so it indexes exactly like the corresponding flattened block of core
-    rank axes (C order, matching ``core.reshape``). A single-element input is
-    returned untouched, which is what makes a one-mode group free.
-    """
+    """Row-wise Khatri-Rao of ``(B, R_i)`` matrices → ``(B, prod R_i)``, in the
+    C order of ``core.reshape``. A single input is returned untouched."""
     out = rows[0]
     for nxt in rows[1:]:
         out = (out.unsqueeze(2) * nxt.unsqueeze(1)).reshape(out.shape[0], -1)
@@ -237,25 +127,16 @@ def resolve_micro_batch(
 ) -> int:
     """Entries per forward/backward inside one optimizer step.
 
-    A step's sampled loss is a *sum* over its entries, so splitting the batch
-    into micro-batches and letting gradients accumulate is mathematically
-    identical to one big backward — purely a memory transformation. Since the
-    two-group contraction landed this is rarely needed: at order 4 / rank 100
-    the derived value is the whole batch. It still binds at order 5+, and an
-    explicit setting remains available for tight-VRAM runs.
-
-    ``micro_batch=None`` derives the value from the rank on the same budget
-    ``_default_eval_chunk`` uses. An explicit value is honoured but still
-    checked against ``ceiling_bytes``, so an over-large request fails with a
-    message naming the knob instead of a bare CUDA OOM.
-
-    ``width`` is the model's per-entry intermediate size (``model.entry_width``);
-    None derives Tucker's from the rank.
+    The sampled loss is a sum over entries, so splitting a batch and
+    accumulating the gradients is exact. ``micro_batch=None`` derives the value
+    from the per-entry ``width`` (None: Tucker's, from the rank). An explicit
+    value is checked against ``ceiling_bytes``, so an over-large request fails
+    with a message naming the knob instead of a CUDA OOM.
     """
     batch_size = int(batch_size)
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-    inter = _intermediate_width(rank) if width is None else max(1, int(width))
+    inter = _contraction_plan(rank)[2] if width is None else max(1, int(width))
     itemsize = torch.empty((), dtype=dtype).element_size()
 
     if micro_batch is None:
@@ -304,24 +185,14 @@ class EntryBatcher:
         return torch.cat([self._perm[start:], self._perm[: end - self.nnz]])
 
     def new_buffer(self) -> torch.Tensor:
-        """A ``(batch_size,)`` buffer ``batch_into`` can write into.
-
-        Zeroed, not ``empty``: the buffer is always filled by ``batch_into``
-        before use, but reading it beforehand (calling ``GradStepper._body``
-        directly, as a test might) would otherwise index the NNZ arrays with
-        uninitialized int64 garbage and raise from deep inside the forward.
-        Valid-but-wrong indices fail loudly at the assertion instead."""
+        """A ``(batch_size,)`` index buffer for ``batch_into``. Zeroed, so a read
+        before the first fill still indexes valid entries."""
         return torch.zeros(self.batch_size, dtype=self.dtype, device=self.device)
 
     def batch_into(self, step: int, out: torch.Tensor) -> torch.Tensor:
-        """``batch(step)`` written into a caller-owned buffer.
-
-        Same window, no allocation and no ``torch.cat`` on wrap-around. The
-        CUDA-graph path needs the batch indices to live at a *fixed* address
-        across steps, and this is how they get there: the window offset is a
-        host-side value, so the copy must happen outside any captured region
-        while everything downstream of ``out`` stays capturable.
-        """
+        """``batch(step)`` written into ``out`` without allocating. The CUDA-graph
+        path needs the indices at a fixed address; this copy runs outside the
+        captured region."""
         start = (step * self.batch_size) % self.nnz
         end = start + self.batch_size
         if end <= self.nnz:
@@ -337,9 +208,9 @@ class EntryBatcher:
 # model
 # ---------------------------------------------------------------------------
 
-class SGDTuckerModel(torch.nn.Module):
-    """Non-negative Tucker model with entry-wise prediction and the two
-    analytic whole-tensor statistics the full objectives need."""
+class SGDTuckerModel(SGDModelBase):
+    """Non-negative Tucker model with entry-wise prediction and the two exact
+    whole-tensor statistics the full objectives need."""
 
     def __init__(
         self,
@@ -354,29 +225,12 @@ class SGDTuckerModel(torch.nn.Module):
         eps: float = _EPS,
     ):
         super().__init__()
-        self.shape = tuple(int(s) for s in shape)
-        self.order = len(self.shape)
+        device = self._setup(shape, rank, parametrization, shared_factors, eps, device)
         if self.order > 25:
             raise ValueError("einsum-letter scheme supports order <= 25.")
-        self.rank = _as_rank_tuple(rank, self.order)
-        if parametrization not in PARAMETRIZATIONS:
-            raise ValueError(f"parametrization must be one of {PARAMETRIZATIONS}.")
-        self.parametrization = parametrization
-        self.eps = float(eps)
-        self.owner = _parse_shared_factors(shared_factors, self.order)
-        for m, o in enumerate(self.owner):
-            if (self.shape[m], self.rank[m]) != (self.shape[o], self.rank[o]):
-                raise ValueError(
-                    f"shared modes {o} and {m} differ in (dim, rank): "
-                    f"{(self.shape[o], self.rank[o])} vs {(self.shape[m], self.rank[m])}"
-                )
 
-        device = torch.device(device) if device is not None else torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-
-        # --- init (mirrors sparse_ops.initialize_nonnegative_tucker 'random',
-        # or accepts a (core, factors) warm start, e.g. from an MU checkpoint) ---
+        # --- init: sparse_ops.initialize_nonnegative_tucker's 'random', or a
+        # (core, factors) warm start, e.g. from an MU model ---
         if init == "random":
             rng = np.random.default_rng(int(random_state))
             core0 = torch.as_tensor(
@@ -410,7 +264,7 @@ class SGDTuckerModel(torch.nn.Module):
             for m in range(self.order) if self.owner[m] == m
         })
 
-        # --- contraction plan for predict_entries, chosen once ---
+        # --- contraction plan for predict_from, chosen once ---
         self._split, self._gemm_left, self._width = _contraction_plan(self.rank)
         self._left_width = math.prod(self.rank[:self._split]) if self._split else 0
         self._right_width = math.prod(self.rank[self._split:]) if self._split else 0
@@ -430,10 +284,6 @@ class SGDTuckerModel(torch.nn.Module):
 
     # --- non-negative views -------------------------------------------------
     @property
-    def device(self) -> torch.device:
-        return self._core_raw.device
-
-    @property
     def core(self) -> torch.Tensor:
         return view_from_raw(self._core_raw, self.parametrization, self.eps)
 
@@ -446,17 +296,10 @@ class SGDTuckerModel(torch.nn.Module):
         return self.nonneg_views()[1]
 
     def nonneg_views(self) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """``(core, factors)`` with the parametrization applied exactly ONCE
-        per distinct raw parameter.
-
-        Every read of ``.core`` runs a softplus over the whole core — 4·10^8
-        bytes of traffic at order 4 / rank 100 — so callers that need the views
-        more than once in a step (a micro-batch loop, or a sampled term plus a
-        zero-entry term) must take them from here and pass them down rather
-        than reading the properties repeatedly. Aliased modes under
-        ``shared_factors`` share one tensor *object*, so their softplus is
-        evaluated once and the gather reads one buffer.
-        """
+        """``(core, factors)`` with the parametrization applied once per raw
+        parameter. Tied modes share one factor tensor object. Callers needing
+        the views more than once in a step take them from here: each read of
+        ``.core`` is a pass over the whole core."""
         core = self.core
         by_owner = {o: self.factor(o) for o in sorted(set(self.owner))}
         return core, [by_owner[self.owner[m]] for m in range(self.order)]
@@ -469,7 +312,7 @@ class SGDTuckerModel(torch.nn.Module):
         indices: torch.Tensor,
     ) -> torch.Tensor:
         """x̂ at ``indices`` (an ``(order, B)`` long tensor) from explicit
-        non-negative views — see ``_contraction_plan`` for the scheme."""
+        non-negative views; see ``_contraction_plan``."""
         rows = [factors[m][indices[m]] for m in range(self.order)]  # (B, R_m)
         if self.order == 1:
             return rows[0] @ core
@@ -483,11 +326,6 @@ class SGDTuckerModel(torch.nn.Module):
             return ((left @ mat) * right).sum(dim=1)
         return ((right @ mat.T) * left).sum(dim=1)
 
-    def predict_entries(self, indices: torch.Tensor) -> torch.Tensor:
-        """x̂ at the given entries. ``indices``: (order, B) long tensor."""
-        core, factors = self.nonneg_views()
-        return self.predict_from(core, factors, indices)
-
     def total_sum_from(self, core, factors) -> torch.Tensor:
         """sum(X̂) over ALL entries — the exact KL zero-entry term."""
         col_sums = [factors[m].sum(dim=0) for m in range(self.order)]
@@ -497,24 +335,6 @@ class SGDTuckerModel(torch.nn.Module):
         """‖X̂‖² over ALL entries — the exact Frobenius zero-entry term."""
         grams = [f.T @ f for f in factors]
         return torch.einsum(self._eq_sqnorm, core, *grams, core)
-
-    def total_sum(self) -> torch.Tensor:
-        return self.total_sum_from(*self.nonneg_views())
-
-    def total_sq_norm(self) -> torch.Tensor:
-        return self.total_sq_norm_from(*self.nonneg_views())
-
-    def project_(self):
-        """'clamp' parametrization only: project onto [eps, ∞) after a step."""
-        if self.parametrization == "clamp":
-            with torch.no_grad():
-                self._core_raw.clamp_(min=self.eps)
-                for p in self._factor_raw.values():
-                    p.clamp_(min=self.eps)
-
-    def regauge_(self):
-        """No-op: the trainers call this on every model; only the chain
-        models (sgd_tt, utt_sgd) have a gauge to fix."""
 
     def materialize(self) -> Tuple[np.ndarray, List[np.ndarray]]:
         """Detached CPU numpy (core, factors) — TuckerDecomposition-ready."""
@@ -528,34 +348,40 @@ class SGDTuckerModel(torch.nn.Module):
 # objectives
 # ---------------------------------------------------------------------------
 
-def sampled_loss(x, x_hat, scale, divergence, masked, eps=_EPS):
-    """The *sampled* (nnz) half of the objective, rescaled to full-tensor scale.
-
-    A pure sum over the given entries, which is what makes micro-batching and
-    NNZ sharding exact rather than approximate: splitting the entries and adding
-    the partial losses reproduces the whole term. ``scale`` = nnz / batch.
-    """
+def _entry_terms(x, x_hat, divergence, masked, eps=_EPS):
+    """Per-entry objective over the nnz: KL x·log(x/x̂) − x (+ x̂ if masked);
+    FR (x − x̂)² (− x̂² for the full objective, whose zero-entry term adds ‖X̂‖²)."""
     if divergence == "kl":
         x_safe = x.clamp_min(eps)
-        nz = x_safe * torch.log(x_safe / (x_hat + eps)) - x
-        if masked:
-            return scale * (nz + x_hat).sum()
-        return scale * nz.sum()
+        terms = x_safe * torch.log(x_safe / (x_hat + eps)) - x
+        return terms + x_hat if masked else terms
     if divergence == "fr":
         sq = (x - x_hat) ** 2
-        if masked:
-            return scale * sq.sum()
-        return scale * (sq - x_hat ** 2).sum()
+        return sq if masked else sq - x_hat ** 2
     raise ValueError(f"divergence must be 'kl' or 'fr', got {divergence!r}")
 
 
-def _distinct_views(core, factors) -> List[torch.Tensor]:
-    """``[core] + factors`` in first-occurrence order, aliased modes collapsed.
+def sampled_loss(x, x_hat, scale, divergence, masked, eps=_EPS):
+    """The sampled (nnz) half of the objective, rescaled to full-tensor scale
+    (``scale`` = nnz / batch). A plain sum over entries, so splitting them
+    (micro-batches, NNZ shards) and adding the parts is exact."""
+    return scale * _entry_terms(x, x_hat, divergence, masked, eps).sum()
 
-    ``nonneg_views`` hands back one tensor object per distinct raw parameter, so
-    identity is the right key here — this is the list whose gradients map
-    one-to-one onto the model's trainable parameters. ``core`` may be a list
-    (the TT cores, or utt's [C, α, ω])."""
+
+@torch.no_grad()
+def nnz_term_sum(model, core, factors, indices, values, divergence, masked, chunk, eps=_EPS):
+    """Σ of the per-entry terms over the given entries, ``chunk`` at a time (0-d)."""
+    acc = values.new_zeros(())
+    for s in range(0, values.shape[0], chunk):
+        x_hat = model.predict_from(core, factors, indices[:, s:s + chunk])
+        acc = acc + _entry_terms(values[s:s + chunk], x_hat, divergence, masked, eps).sum()
+    return acc
+
+
+def _distinct_views(core, factors) -> List[torch.Tensor]:
+    """``[core] + factors`` in first-occurrence order, aliased modes collapsed:
+    one tensor per trainable parameter. ``core`` may be a list (TT cores, or
+    utt's [C, α, ω])."""
     out = list(core) if isinstance(core, (list, tuple)) else [core]
     seen = {id(t) for t in out}
     for f in factors:
@@ -566,12 +392,9 @@ def _distinct_views(core, factors) -> List[torch.Tensor]:
 
 
 def zero_entry_term(model, divergence, views=None):
-    """The EXACT closed-form zero-entry half — a function of the parameters
-    only, so it is added once per step no matter how the entries are split.
-
-    ``views`` is an optional ``(core, factors)`` pair from
-    ``SGDTuckerModel.nonneg_views``; passing it avoids re-running the
-    parametrization when the caller has already materialized it."""
+    """The exact closed-form zero-entry half: a function of the parameters only,
+    so it is added once per step however the entries are split. ``views`` is an
+    optional ``(core, factors)`` from ``model.nonneg_views()``."""
     core, factors = model.nonneg_views() if views is None else views
     if divergence == "kl":
         return model.total_sum_from(core, factors)
@@ -581,7 +404,7 @@ def zero_entry_term(model, divergence, views=None):
 
 
 def _batch_loss(model, x, x_hat, scale, divergence, masked, eps=_EPS, views=None):
-    """Unbiased estimate of the total objective. ``scale`` = nnz / batch."""
+    """Unbiased estimate of the total objective (used by the multi-GPU test notebook)."""
     loss = sampled_loss(x, x_hat, scale, divergence, masked, eps=eps)
     if masked:
         return loss
@@ -593,40 +416,22 @@ def _batch_loss(model, x, x_hat, scale, divergence, masked, eps=_EPS, views=None
 # ---------------------------------------------------------------------------
 
 class GradStepper:
-    """Everything needed to fill one model's gradients for one step, on one
-    device — the unit both ``SGDTrainer`` and ``ShardedSGDTrainer`` build on.
+    """Fills one model's gradients for one step on one device; both trainers
+    build on it.
 
-    Three things live here rather than in the trainers:
-
-    **A flat gradient buffer.** Every parameter's ``.grad`` is a *view* into one
-    contiguous tensor, so the sharded trainer's cross-device reduction is a
-    single collective over a single buffer (instead of one allocation per
-    parameter per replica per step) and zeroing is one kernel. Nothing copies.
-    The wiring means ``zero_grad(set_to_none=True)`` must never be called on
-    these models — use :meth:`zero_grad_`.
-
-    **Micro-batching.** The batch is split into chunks whose forward
-    intermediate fits a memory budget, with gradients accumulating across them.
-    Exact, not approximate (see ``sampled_loss``); the zero-entry term and the
-    parametrization are each evaluated once per step, outside the loop, because
-    they depend only on the parameters. Since the two-group contraction landed
-    the split is usually empty — one chunk up to about order 4 / rank 200 — and
-    ``_body`` takes a simpler path when that is the case.
-
-    **Optional CUDA-graph capture.** The step body is fixed-shape, so it
-    captures cleanly; the one dynamic input, the batch window offset, is handled
-    by writing indices into a static buffer *outside* the capture. This was
-    added when the order-3 step measured ~50x off its arithmetic roofline —
-    Python dispatch, kernel launch and autograd-node overhead, not math. Two of
-    the three causes of that kernel count are now gone (a step is one chunk, not
-    62, and the forward is three kernels rather than an N-operand einsum
-    decomposition), so re-measure before assuming the capture still pays: the
-    number to beat is in ``0_tests/test_sgd_multigpu.ipynb`` §5.
+    - Flat gradient buffer: every parameter's ``.grad`` is a view into
+      ``flat_grad``, so the sharded all-reduce is one collective and zeroing is
+      one kernel. Never call ``zero_grad(set_to_none=True)`` on these models.
+    - Micro-batching: the batch is split into chunks that fit a memory budget
+      and the gradients accumulate (exact, see ``sampled_loss``). Up to about
+      order 4 / rank 200 there is a single chunk.
+    - Optional CUDA-graph capture of the fixed-shape step body; the batch
+      indices are copied into a static buffer outside the capture.
     """
 
     def __init__(
         self,
-        model: SGDTuckerModel,
+        model: SGDModelBase,
         indices: torch.Tensor,
         values: torch.Tensor,
         batcher: EntryBatcher,
@@ -648,9 +453,8 @@ class GradStepper:
         self.divergence = divergence
         self.masked = bool(masked)
         self.norm_const = float(norm_const)
-        # A masked objective has no zero-entry term at all; a sharded trainer
-        # additionally suppresses it on all but one device when gradients are
-        # summed every step (adding it G times would count it G times).
+        # A masked objective has no zero-entry term. The sharded trainer also
+        # turns it off on all but one device when gradients are summed.
         self.include_zero_term = bool(include_zero_term) and not self.masked
         self.eps = float(eps)
         self.device = values.device
@@ -677,10 +481,8 @@ class GradStepper:
         ]
         self._sel = batcher.new_buffer()
 
-        # Staging for the parametrization hoist (see ``_body``). Only allocated
-        # when the step is actually split: these buffers are core-sized, and a
-        # single-chunk step gets the same "one softplus per step" guarantee for
-        # free by keeping everything on one graph.
+        # Gradient buffers for the views; only needed (and only allocated) when
+        # the step is split into several chunks.
         self._view_grads: Optional[List[torch.Tensor]] = None
         if len(self._slices) > 1:
             with torch.no_grad():
@@ -696,13 +498,8 @@ class GradStepper:
     # --- gradient plumbing ---------------------------------------------------
 
     def zero_grad_(self) -> None:
-        """Zero in place. NOT ``set_to_none``: the grads are views into
-        ``flat_grad`` and detaching them would break the collective's buffer."""
+        """Zero in place, never ``set_to_none``: the grads are views into ``flat_grad``."""
         self.flat_grad.zero_()
-
-    @property
-    def param_numel(self) -> int:
-        return int(self.flat_grad.numel())
 
     def new_param_buffer(self) -> torch.Tensor:
         """A buffer ``pack_params_`` fits, laid out like ``flat_grad``."""
@@ -710,8 +507,7 @@ class GradStepper:
 
     @torch.no_grad()
     def pack_params_(self, out: torch.Tensor) -> torch.Tensor:
-        """Parameters -> one contiguous vector (off the hot path: parameter
-        averaging under ``sgd_sync_every`` and the replica-drift check)."""
+        """Parameters -> one contiguous vector (parameter averaging, drift check)."""
         offset = 0
         for p in self.params:
             n = p.numel()
@@ -730,24 +526,15 @@ class GradStepper:
     # --- the step body -------------------------------------------------------
 
     def _body(self) -> None:
-        """Fill ``flat_grad`` from the indices currently in ``self._sel``.
-
-        The parametrization is evaluated exactly ONCE per step in both branches
-        below. That is not a micro-optimization: ``model.core`` is a softplus
-        over the whole core (400 MB at order 4 / rank 100), and reading it per
-        chunk — which is what calling ``predict_entries`` in the loop does —
-        costs more memory traffic than the arithmetic the step exists to do.
-
-        Capturable: fixed shapes, no host syncs, no allocations that depend on
-        a host-side value.
-        """
+        """Fill ``flat_grad`` from the indices in ``self._sel``. The
+        parametrization runs once per step in both branches (it is a pass over
+        the whole core). Capturable: fixed shapes, no host syncs."""
         self.flat_grad.zero_()
         model = self.model
         core, factors = model.nonneg_views()
 
         if self._view_grads is None:
-            # One chunk: the sampled term and the zero-entry term share a single
-            # graph rooted at the raw parameters, so one backward does it all.
+            # One chunk: one graph from the raw parameters, one backward.
             lo, hi = self._slices[0]
             sel = self._sel[lo:hi]
             x_hat = model.predict_from(core, factors, self.indices[:, sel])
@@ -759,14 +546,10 @@ class GradStepper:
             (loss / self.norm_const).backward()
             return
 
-        # Several chunks. Each chunk's graph has to be freed before the next one
-        # runs (that is the whole point of splitting), so the chunks cannot
-        # share the parametrization's graph directly. Instead they differentiate
-        # against DETACHED views with persistent, pre-zeroed gradient buffers —
-        # so a chunk's backward stops at the views and accumulates there — and
-        # one chain-rule pass at the end pushes the total back through softplus
-        # into the raw parameters. Exact, and one softplus instead of one per
-        # chunk.
+        # Several chunks: each chunk's graph is freed before the next, so the
+        # chunks differentiate against detached views whose gradients collect
+        # in persistent buffers; one backward at the end pushes the total
+        # through the parametrization into the raw parameters.
         outs = _distinct_views(core, factors)
         leaves = []
         for src, gbuf in zip(outs, self._view_grads):
@@ -807,9 +590,8 @@ class GradStepper:
             raise ValueError("sgd_cuda_graph requires a CUDA device.")
         self.batcher.batch_into(0, self._sel)
         with torch.cuda.device(self.device):
-            # Warm up on a side stream: lazy cubin loads, autograd node
-            # allocation and cuBLAS workspace grabs must all have happened
-            # before the capture, or they get recorded (or refuse to record).
+            # Warm up on a side stream so lazy kernel loads and workspace
+            # allocations happen before the capture.
             side = torch.cuda.Stream(device=self.device)
             side.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(side):
@@ -820,9 +602,8 @@ class GradStepper:
 
             graph = torch.cuda.CUDAGraph()
             try:
-                # thread_local, not the default global mode: the sharded
-                # trainer captures one graph per device and other devices'
-                # worker threads must not be able to invalidate the capture.
+                # thread_local: the sharded trainer captures one graph per
+                # device, and other devices' threads must not invalidate it.
                 with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                     self._body()
             except RuntimeError as exc:
@@ -836,6 +617,10 @@ class GradStepper:
         self._graph = graph
 
 
+# ---------------------------------------------------------------------------
+# error
+# ---------------------------------------------------------------------------
+
 @torch.no_grad()
 def make_eval_subset(
     indices: torch.Tensor,
@@ -845,24 +630,11 @@ def make_eval_subset(
 ) -> Tuple[torch.Tensor, torch.Tensor, float, Tuple[float, float]]:
     """``(indices, values, sample_scale, totals)`` for ``full_relative_error``.
 
-    ``eval_sample=None`` (or ``>= nnz``) keeps the exact pass and returns the
-    inputs untouched. Otherwise a fixed uniform subset of that many entries is
-    drawn once — host-side, from a seed derived from ``random_state`` so it is
-    reproducible and independent of the batcher's shuffle — and gathered into
-    contiguous buffers the eval reuses every call.
-
-    *Fixed* rather than redrawn per eval, deliberately: ``tol``/``patience``
-    compare *successive* errors, and a subset that moved between evals would put
-    sampling noise directly into that difference. Held fixed, the estimate is a
-    consistent proxy whose step-to-step changes track the model's, which is what
-    the early-stopping contract actually needs.
-
-    Sampling is with replacement (an O(n) draw rather than an O(nnz)
-    permutation); each draw is uniform, so the estimator is unbiased either way
-    and duplicates are negligible at ``n << nnz``.
-
-    ``totals`` is ``(Σx, Σx²)`` over the FULL tensor — the error denominators,
-    computed once here instead of re-reduced over all nnz on every eval.
+    ``eval_sample=None`` (or ``>= nnz``) returns the inputs: the exact error.
+    Otherwise a fixed uniform subset of that many entries (with replacement,
+    seeded from ``random_state``), drawn once: tol/patience compare successive
+    errors, so the subset must not move between evals. ``totals`` is
+    ``(Σx, Σx²)`` over the full tensor, the error denominators.
     """
     nnz = int(values.shape[0])
     totals = (float(values.sum()), float(values.pow(2).sum()))
@@ -879,7 +651,7 @@ def make_eval_subset(
 
 @torch.no_grad()
 def full_relative_error(
-    model: SGDTuckerModel,
+    model: SGDModelBase,
     indices: torch.Tensor,
     values: torch.Tensor,
     divergence: str,
@@ -889,44 +661,18 @@ def full_relative_error(
     sample_scale: float = 1.0,
     totals: Optional[Tuple[float, float]] = None,
 ) -> float:
-    """Objective over the passed nnz (chunked), normalized like distance.py:
-    KL / Σx  (kl_compute_errors) or ‖X−X̂‖/‖X‖ (fr_compute_errors).
+    """Relative error over the given nnz, normalized as in distance.py: KL / Σx
+    or ‖X−X̂‖ / ‖X‖. The zero-entry part is exact.
 
-    With the defaults this is the exact error over all nnz. The cost is
-    ``nnz · prod(rank)`` flops — the same per-entry cost as a training step, so
-    an eval is worth ``nnz / (3 · batch_size)`` steps of compute and can easily
-    dominate the run (MU gets away with it because one MU iteration already
-    touches every nnz; a block of SGD steps does not).
-
-    ``sample_scale`` and ``totals`` are the lever for that: pass a random SUBSET
-    of the entries as ``indices``/``values``, ``sample_scale = nnz/len(subset)``
-    and ``totals = (Σx, Σx²)`` over the FULL tensor. The nnz half of the
-    objective is then rescaled to full-tensor scale and the zero-entry half
-    stays exact, giving an unbiased estimate of the KL numerator / the squared
-    FR numerator (the FR error itself, being a square root, is consistent
-    rather than unbiased). The subset must be *random* — a contiguous slice of
-    a coalesced tensor is sorted by index, not a sample.
+    For a random subset of the entries, pass ``sample_scale = nnz / len(subset)``
+    and ``totals = (Σx, Σx²)`` of the full tensor (``make_eval_subset``): the
+    nnz part is then rescaled, which is unbiased for the KL numerator and for
+    the squared FR numerator. Costs as much per entry as a training step.
     """
     if chunk is None:
-        chunk = _default_eval_chunk(model.rank, width=model.entry_width)
+        chunk = _rank_derived_chunk(model.rank, width=model.entry_width)
     core, factors = model.nonneg_views()
-    nnz = values.shape[0]
-    acc = values.new_zeros(())
-    for s in range(0, nnz, chunk):
-        idx = indices[:, s:s + chunk]
-        x = values[s:s + chunk]
-        x_hat = model.predict_from(core, factors, idx)
-        if divergence == "kl":
-            x_safe = x.clamp_min(eps)
-            term = x_safe * torch.log(x_safe / (x_hat + eps)) - x
-            if masked:
-                term = term + x_hat
-            acc = acc + term.sum()
-        else:
-            term = (x - x_hat) ** 2
-            if not masked:
-                term = term - x_hat ** 2
-            acc = acc + term.sum()
+    acc = nnz_term_sum(model, core, factors, indices, values, divergence, masked, chunk, eps)
     if sample_scale != 1.0:
         acc = acc * sample_scale
 
@@ -941,7 +687,7 @@ def full_relative_error(
 
 
 # ---------------------------------------------------------------------------
-# standalone training loop (notebook use; production goes through SGDTrainer)
+# standalone training loop (notebook use; production drives SGDTrainer)
 # ---------------------------------------------------------------------------
 
 def sgd_non_negative_tucker(
@@ -969,39 +715,25 @@ def sgd_non_negative_tucker(
     verbose: bool = True,
     return_model: bool = False,
 ):
-    """Fit a non-negative Tucker model by minibatch SGD/Adam.
+    """Fit a non-negative Tucker model by minibatch SGD/Adam: a step-by-step
+    loop over ``SGDTrainer`` with early stopping.
 
     Parameters mirror the MU loop where they overlap (divergence, objective,
-    tol/patience early stopping on the exact relative error, random_state,
-    shared_factors); the optimizer knobs (lr, batch_size, optimizer,
-    parametrization) are the new surface SGD introduces.
+    tol/patience on the logged error, random_state, shared_factors).
+    ``eval_sample`` logs the error on a fixed random subset of that many nnz
+    (``make_eval_subset``); ``final_error`` is always exact.
 
-    ``eval_chunk`` sizes the error pass; None derives it from the rank so the
-    per-chunk intermediate stays bounded (see ``_default_eval_chunk``).
-    ``eval_sample`` evaluates on a fixed random subset of that many nnz instead
-    of all of them — the error pass costs the same per entry as a training step,
-    so on a large tensor it otherwise dominates the run (see
-    ``make_eval_subset`` / ``full_relative_error``). ``final_error`` is always
-    computed exactly, whatever ``eval_sample`` says.
+    ``sparse_tensor``: a torch sparse COO tensor, or an object whose
+    ``.tensor`` holds one (e.g. a SparseTupleTensor before any CuPy conversion).
 
-    ``sparse_tensor``: a torch sparse COO tensor, or anything with a
-    ``.tensor`` attribute holding one (e.g. SparseTupleTensor with
-    sparsity_type='torch' — BEFORE any CuPy conversion).
-
-    Returns a dict shaped like the MU loop's ``return_errors='full'`` output:
-    {"tensor": TuckerTensor((core, factors)) on CPU/numpy, "errors": [...],
-     "iterations", "final_error", "decomp_seconds"}. ``final_error`` is always
-    populated (computed at the end when no eval step fired). Pass
-    ``return_model=True`` to also get the live module under ``"model"`` (pins
-    device memory for as long as the caller holds the dict).
+    Returns ``{"tensor": TuckerTensor (CPU numpy), "errors", "iterations",
+    "final_error", "decomp_seconds"}``; ``return_model=True`` adds the live
+    ``"model"`` (which keeps its device memory alive).
     """
-    if objective not in ("full", "masked"):
-        raise ValueError(f"objective must be 'full' or 'masked', got {objective!r}")
-    masked = objective == "masked"
+    from tensormet.sgd.sgd_trainer import SGDTrainer
 
-    # torch.use_deterministic_algorithms is process-global; restore on exit so
-    # the flag never leaks into whatever else runs in this process.
-    _det_prev = torch.are_deterministic_algorithms_enabled()
+    # torch.use_deterministic_algorithms is process-global; restore it on exit.
+    det_prev = torch.are_deterministic_algorithms_enabled()
     if deterministic:
         torch.use_deterministic_algorithms(True)
     try:
@@ -1011,43 +743,15 @@ def sgd_non_negative_tucker(
                 "sgd_non_negative_tucker expects a torch sparse COO tensor "
                 "(or an object with .tensor holding one)."
             )
-        t = t.coalesce()
-
-        model = SGDTuckerModel(
-            shape=t.shape, rank=rank, parametrization=parametrization,
-            shared_factors=shared_factors, init=init, random_state=random_state,
-            device=device, dtype=dtype,
+        # One optimizer step per block, so the error can be logged at any step.
+        trainer = SGDTrainer(
+            t, rank=rank, divergence=divergence, objective=objective, lr=lr,
+            batch_size=batch_size, optimizer=optimizer,
+            parametrization=parametrization, shared_factors=shared_factors,
+            init=init, random_state=random_state, steps_per_iteration=1,
+            device=device, dtype=dtype, eval_chunk=eval_chunk,
+            eval_sample=eval_sample,
         )
-        dev = model._core_raw.device
-
-        indices = t.indices().to(dev)
-        values = t.values().to(dev, dtype=dtype)
-        if divergence == "kl" and bool((values < 0).any()):
-            raise ValueError("KL divergence requires non-negative tensor values.")
-        nnz = values.shape[0]
-        if nnz == 0:
-            raise ValueError("sparse tensor has no nonzero entries.")
-
-        batcher = EntryBatcher(nnz, batch_size, seed=random_state, device=dev)
-        scale = nnz / batcher.batch_size
-
-        ev_idx, ev_val, ev_scale, ev_totals = make_eval_subset(
-            indices, values, eval_sample, random_state
-        )
-
-        # Normalize the loss by the data scale so lr defaults transfer across
-        # datasets (same constants the relative errors use).
-        if divergence == "kl":
-            norm_const = float(values.sum().clamp_min(_EPS))
-        else:
-            norm_const = float(values.pow(2).sum().clamp_min(_EPS))
-
-        if optimizer == "adam":
-            opt = torch.optim.Adam(model.parameters(), lr=lr)
-        elif optimizer == "sgd":
-            opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
-        else:
-            raise ValueError(f"optimizer must be 'adam' or 'sgd', got {optimizer!r}")
 
         errors: List[float] = []
         last_err: Optional[float] = None
@@ -1056,61 +760,40 @@ def sgd_non_negative_tucker(
         step = -1
 
         for step in range(n_steps):
-            sel = batcher.batch(step)
-            idx = indices[:, sel]
-            x = values[sel]
+            log_step = eval_every > 0 and (step + 1) % eval_every == 0
+            rel = trainer.run_block(step, log_step)
+            if not log_step:
+                continue
+            errors.append(rel)
+            if verbose:
+                delta = f" (Δ={last_err - rel:+.3e})" if last_err is not None else ""
+                print(f"step {step + 1}: relative error={rel:.6f}{delta}")
+            # Same patience contract as the MU loop's reconstruction check.
+            if last_err is not None and step >= warmup_steps:
+                if abs(last_err - rel) < tol:
+                    no_improve += 1
+                    if no_improve >= patience:
+                        if verbose:
+                            print(
+                                f"Stopped after {no_improve} non-improving checks "
+                                f"(patience={patience}) at step {step + 1}."
+                            )
+                        break
+                else:
+                    no_improve = 0
+            last_err = rel
 
-            opt.zero_grad(set_to_none=True)
-            # One parametrization pass for the whole step: the sampled term and
-            # the zero-entry term share these views instead of each running a
-            # softplus over the core.
-            views = model.nonneg_views()
-            x_hat = model.predict_from(views[0], views[1], idx)
-            loss = _batch_loss(model, x, x_hat, scale, divergence, masked,
-                               views=views) / norm_const
-            loss.backward()
-            opt.step()
-            model.project_()
-
-            if eval_every > 0 and (step + 1) % eval_every == 0:
-                rel = full_relative_error(model, ev_idx, ev_val, divergence,
-                                          masked=masked, chunk=eval_chunk,
-                                          sample_scale=ev_scale, totals=ev_totals)
-                errors.append(rel)
-                if verbose:
-                    delta = f" (Δ={last_err - rel:+.3e})" if last_err is not None else ""
-                    print(f"step {step + 1}: relative error={rel:.6f}{delta}")
-                # Same patience contract as the MU loop's reconstruction check.
-                if last_err is not None and step >= warmup_steps:
-                    if abs(last_err - rel) < tol:
-                        no_improve += 1
-                        if no_improve >= patience:
-                            if verbose:
-                                print(
-                                    f"Stopped after {no_improve} non-improving checks "
-                                    f"(patience={patience}) at step {step + 1}."
-                                )
-                            break
-                    else:
-                        no_improve = 0
-                last_err = rel
-
-        if errors and ev_scale == 1.0:
+        if errors and trainer.eval_sample is None:
             final_error = errors[-1]
         elif step >= 0:
-            # Either no eval step fired (n_steps < eval_every) or the tracked
-            # errors are subsampled estimates — either way the reported final
-            # error is computed exactly, over all nnz, once.
-            final_error = full_relative_error(model, indices, values, divergence,
-                                              masked=masked, chunk=eval_chunk)
+            # No eval fired, or the logged errors are subsampled: exact, once.
+            final_error = trainer.final_relative_error()
         else:
             final_error = None
         decomp_seconds = time.time() - start
-        core, factors = model.materialize()
-        # materialize() hands back CPU numpy, but the active tensorly backend is
-        # typically "pytorch" here; TuckerTensor validates through the dispatched
-        # tl.ndim, which on the torch backend calls .dim() and rejects numpy. Build
-        # the container under the numpy backend to keep the CPU-numpy payload.
+        core, factors = trainer.materialize()
+        # TuckerTensor validates through the active tensorly backend (often
+        # "pytorch" here, which rejects numpy), so build it under numpy.
         with backend_context("numpy"):
             tucker = TuckerTensor((core, factors))
         out = {
@@ -1121,7 +804,7 @@ def sgd_non_negative_tucker(
             "decomp_seconds": decomp_seconds,
         }
         if return_model:
-            out["model"] = model
+            out["model"] = trainer.model
         return out
     finally:
-        torch.use_deterministic_algorithms(_det_prev)
+        torch.use_deterministic_algorithms(det_prev)

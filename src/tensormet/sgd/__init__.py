@@ -1,11 +1,11 @@
-"""Torch minibatch SGD Tucker solver (see README.md for the integration points).
+"""Torch minibatch SGD solver for Tucker, TT and utt (see README.md).
 
-Deliberately lazy, like the root tensormet package itself: importing this
-package must not drag in torch until a symbol is actually used (submit.py runs
-from login nodes without GPU stacks).
+Lazy, like the root tensormet package: importing this package must not pull in
+torch until a symbol is used (submit.py runs on login nodes without GPU stacks).
 """
 
 _SUBMODULE_BY_NAME = {
+    "SGDModelBase": "sgd_model",
     "SGDTuckerModel": "sgd_tucker",
     "EntryBatcher": "sgd_tucker",
     "GradStepper": "sgd_tucker",

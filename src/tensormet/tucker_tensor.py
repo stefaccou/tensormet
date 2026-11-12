@@ -23,6 +23,7 @@ from pathlib import Path
 from tensormet.utils import (DATA_DIR,
                             date_run,
                             write_best_record,
+                            replay_sem_patience,
                             torch_or_pickle_load,
                             readonly_dispatch,
                             tree_to_device,
@@ -1545,6 +1546,11 @@ class SparseTupleTensor:
             tt_rank = getattr(cfg.exp, "tt_rank", 100)
             # EXPERIMENTAL shared-core TT (experimental/uniform_tt/README.md).
             utt_core_power = getattr(cfg.exp, "utt_core_power", None)
+            # EXPERIMENTAL data-built TT cores (experimental/tt_markov_init.py).
+            tt_core_init = getattr(cfg.exp, "tt_core_init", "random")
+            if tt_core_init != "random" and decomposition not in ("tt", "utt"):
+                raise ValueError(f"--tt-core-init {tt_core_init} needs decomposition 'tt' or "
+                                 f"'utt'; got {decomposition!r}")
             if decomposition not in ("tucker", "cp", "tt", "utt"):
                 raise ValueError(
                     f"cfg.exp.decomposition must be 'tucker', 'cp', 'tt' or 'utt'; got {decomposition!r}"
@@ -1553,6 +1559,11 @@ class SparseTupleTensor:
                 # One controller for the whole run: its exponent carries across iterations.
                 from tensormet.experimental.uniform_tt.utt_ops import AdaptiveCorePower
                 utt_core_power = AdaptiveCorePower()
+            # EXPERIMENTAL binary Tucker (experimental/binary/README.md).
+            binary = getattr(cfg.exp, "binary", None)
+            if binary:
+                from tensormet.experimental.binary import check_binary
+                check_binary(cfg)
 
             # SGD solver (sgd/README.md). getattr for the same deserialized-config
             # back-compat reason as above: pre-SGD records carry none of these
@@ -1587,6 +1598,7 @@ class SparseTupleTensor:
             dim_consistency_diversity = getattr(cfg.eval, "dim_consistency_diversity", True)
             dim_consistency_model = getattr(cfg.eval, "dim_consistency_model", None)
             dim_consistency_method = getattr(cfg.eval, "dim_consistency_method", "score")
+            judge_gpu = getattr(cfg.eval, "judge_gpu", None)
             if dim_consistency_method not in ("score", "similarity", "both"):
                 raise ValueError(
                     f"cfg.eval.dim_consistency_method must be one of "
@@ -1631,6 +1643,11 @@ class SparseTupleTensor:
                 raise ValueError(
                     "--utt-core-power sets the exponent of the MU core step; solver='sgd' "
                     "has no such step (its step size is --sgd-lr). Drop the flag."
+                )
+            if tt_core_init != "random" and init == "random":
+                raise ValueError(
+                    f"solver='sgd' with init='random' draws its own cores; --tt-core-init "
+                    f"{tt_core_init} only applies to SVD inits (e.g. --init svd_stream)."
                 )
             if getattr(cfg.exp, "subsample_frac", 1.0) < 1.0:
                 raise ValueError(
@@ -1734,7 +1751,9 @@ class SparseTupleTensor:
             # Experimental streamed GPU SVD: pooled per tied group, all GPUs, cached.
             from tensormet.experimental.stream_svd import set_run_context
             set_run_context(cfg, tied_groups=nontrivial_linked_groups(self.shared_factors, num_factors=len(modes)),
-                            device_ids=list(range(getattr(cfg.train, "n_gpus", 1))))
+                            device_ids=list(range(getattr(cfg.train, "n_gpus", 1))),
+                            power_iter=getattr(cfg.exp, "svd_power_iter", None),
+                            oversampling=getattr(cfg.exp, "svd_oversampling", None))
 
         if _is_sgd:
             # Init (random or warm start) lives inside SGDTrainer; `core` and
@@ -1763,6 +1782,13 @@ class SparseTupleTensor:
                         f"{[tuple(C.shape) for C in core]}; expected {expected} "
                         f"for rank={rank}, tt_rank={tt_rank}. Delete it or match the config."
                     )
+                # Train in the data's dtype: a float64 checkpoint would run ~4x slower.
+                _dt = self.tensor.data.dtype
+                if any(x.dtype != _dt for x in core + factors):
+                    print(f"utt resume: casting the checkpoint from "
+                          f"{sorted({str(x.dtype) for x in core + factors})} to {_dt}.")
+                    core = [C.astype(_dt, copy=False) for C in core]
+                    factors = [f.astype(_dt, copy=False) for f in factors]
             elif _is_tt:
                 from tensormet.tt_hybrid.tt_chain import core_shapes
                 expected = core_shapes(rank, tt_rank)
@@ -1793,6 +1819,7 @@ class SparseTupleTensor:
             core, factors = initialize_uniform_tt(
                 self.tensor, shape, rank, modes, init, random_state,
                 tt_rank=tt_rank, thread_budget=thread_budget, epsilon=epsilon,
+                core_init=tt_core_init,
             )
         elif _is_tt:
             from tensormet.tt_hybrid.tt_ops import initialize_tucker_tt
@@ -1800,10 +1827,14 @@ class SparseTupleTensor:
             core, factors = initialize_tucker_tt(
                 self.tensor, shape, rank, modes, init, random_state,
                 tt_rank=tt_rank, thread_budget=thread_budget, epsilon=epsilon,
+                core_init=tt_core_init,
             )
         else:
             core, factors = initialize_nonnegative_tucker(self.tensor, shape, rank, modes, init,
                                                            random_state, thread_budget=thread_budget)
+            if binary:
+                from tensormet.experimental.binary import prepare_binary
+                core, factors = prepare_binary(cfg, core, factors, self.tensor, shape)
 
         # --- multi-GPU shard initialisation ---
 
@@ -1898,6 +1929,7 @@ class SparseTupleTensor:
                 _sgd_init = mu_init_for_sgd(
                     self, decomposition, shape, rank, modes, init, random_state,
                     tt_rank=tt_rank, thread_budget=thread_budget, epsilon=epsilon,
+                    core_init=tt_core_init,
                     device_ids=list(range(_n_gpus)),
                 )
             _sgd_kwargs = dict(
@@ -2066,6 +2098,11 @@ class SparseTupleTensor:
         else:
             sem_primary_key = sem_error_type
 
+        # Resume: pick the semantic patience count up where the old run left it.
+        if start_iteration > 0 and fitness_scores:
+            sem_no_rec_improve_steps = replay_sem_patience(fitness_scores, sem_primary_key, tol)
+            print(f"Resume: semantic patience restored at {sem_no_rec_improve_steps}/{patience}.")
+
         simlex_pairs = None
         if _SIMLEX_PATH.exists():
             try:
@@ -2082,19 +2119,35 @@ class SparseTupleTensor:
         # the pool is grown to fill the GPU before the first check), OOMing the next
         # factor update. Loading up-front makes every batch estimate account for it.
         # Import is deferred so runs without the flag never touch transformers.
+        # With --judge-gpu, select_gpu() appended the judge's GPU after the
+        # decomposition's, so it is logical device _n_gpus. The judge then needs no
+        # pool trimming and no fixed batch cap (chunk=None): its batches are sized
+        # to that GPU's free memory alone.
         _dim_judge = None
+        _judge_dedicated = False
         if dim_consistency:
             from tensormet.judge import DimConsistencyJudge, DEFAULT_JUDGE_MODEL
             _judge_model_name = dim_consistency_model or DEFAULT_JUDGE_MODEL
+            if judge_gpu is not None:
+                if torch.cuda.device_count() > _n_gpus:
+                    _judge_dedicated = True
+                else:
+                    print(f"Warning: judge GPU {judge_gpu} is not visible to this process "
+                          f"(launched without select_gpu?); sharing the decomposition's GPU.")
             _dim_judge = DimConsistencyJudge(
                 model_name=_judge_model_name,
                 num_dim_words=dim_consistency_words,
                 diversity_aware=dim_consistency_diversity,
+                **({"device": torch.device("cuda", _n_gpus), "chunk": None}
+                   if _judge_dedicated else {}),
             )
+            _where = (f"dedicated GPU {judge_gpu} (cuda:{_n_gpus}), batch sized to fit"
+                      if _judge_dedicated else
+                      f"decomposition's GPU, batch <= {_dim_judge.chunk}")
             print(
                 f"Dimension-consistency scoring enabled (method={dim_consistency_method!r}, "
                 f"judge={_judge_model_name!r}, words/dim={dim_consistency_words}, "
-                f"diversity_aware={dim_consistency_diversity}). "
+                f"diversity_aware={dim_consistency_diversity}, on {_where}). "
                 f"Loading the judge now so the decomposition's batch sizing "
                 f"accounts for its (model-dependent) GPU footprint from the first iteration."
             )
@@ -2102,7 +2155,9 @@ class SparseTupleTensor:
             # real headroom, then load the model before the loop begins. The SGD
             # path never allocates through CuPy; its equivalent is torch's own
             # caching allocator, which the judge shares anyway.
-            if _is_sgd:
+            if _judge_dedicated:
+                pass
+            elif _is_sgd:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             elif _sst is not None:
@@ -2220,7 +2275,8 @@ class SparseTupleTensor:
                                                   decomposition=decomposition,
                                                   cp_inner_iters=cp_inner_iters,
                                                   cp_scooch_kappa=cp_scooch_kappa,
-                                                  utt_core_power=utt_core_power)
+                                                  utt_core_power=utt_core_power,
+                                                  binary=binary)
                 # --- multi-GPU routing override (largedim variants only) ---
                 # Sharding engages iff largedim is selected and n_gpus > 1. CP and
                 # TT have a single kernel family, so _largedim_selected doesn't apply.
@@ -2246,6 +2302,14 @@ class SparseTupleTensor:
                     )
                     routing = get_sharded_tt_update_routing_step(
                         _sst, divergence=divergence, log_step=log_step,
+                    )
+                elif binary and _sst is not None:
+                    # EXPERIMENTAL binary Tucker (experimental/binary/README.md).
+                    from tensormet.experimental.binary.binary_routing import (
+                        get_sharded_binary_update_routing_step,
+                    )
+                    routing = get_sharded_binary_update_routing_step(
+                        _sst, divergence=divergence, log_step=log_step, binary=binary,
                     )
                 elif _sst is not None and _largedim_selected:
                     if divergence == "kl":
@@ -2553,7 +2617,10 @@ class SparseTupleTensor:
                         # driver, so PyTorch's allocator can still fail to cudaMalloc
                         # room for the judge's activations. Trim the pools right
                         # before scoring so that memory is actually available to torch.
-                        if _is_sgd:
+                        # A judge on its own GPU needs none of this.
+                        if _judge_dedicated:
+                            pass
+                        elif _is_sgd:
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
                         elif _sst is not None:
@@ -2581,7 +2648,8 @@ class SparseTupleTensor:
                             # headroom the NEXT core update assumed was free,
                             # OOMing CuPy even though the judge is done with the
                             # memory. Give it back right after scoring.
-                            if _dim_judge.device is not None and _dim_judge.device.type == "cuda":
+                            if (not _judge_dedicated and _dim_judge.device is not None
+                                    and _dim_judge.device.type == "cuda"):
                                 torch.cuda.empty_cache()
                         if isinstance(sem_out, dict):
                             sem_out = {**sem_out, **_dim_out}

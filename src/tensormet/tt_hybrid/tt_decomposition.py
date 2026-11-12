@@ -90,7 +90,12 @@ class TuckerTTDecomposition(TuckerDecomposition):
 
     def update_from_path(self, path=None):
         resolved = resolve_checkpoint_path(path, self.decomp_path)
-        tt_cores, factors = torch.load(resolved, map_location="cpu", weights_only=False)
+        tensor = torch.load(resolved, map_location="cpu", weights_only=False)
+        # SGD checkpoints are dict payloads (see SGDTrainer.checkpoint_payload).
+        if isinstance(tensor, dict):
+            tt_cores, factors = tensor["core"], tensor["factors"]
+        else:
+            tt_cores, factors = tensor
         self.tt_cores = np_dispatch(list(tt_cores))
         self.factors = np_dispatch(list(factors))
         self._core_cache = None

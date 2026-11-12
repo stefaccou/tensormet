@@ -149,6 +149,9 @@ class EvalConfig:
     # "score" (per-dimension outlier task) | "similarity" (nearest-neighbour
     # outlier task) | "both"
     dim_consistency_method: str = "both"
+    # Physical GPU reserved for the judge (None = share the decomposition's GPU).
+    # On its own GPU the judge sizes its batches to fill that GPU.
+    judge_gpu: Optional[int] = None
     remove_OOV: bool = False # whether to set OOV in test set to OOV token (false ignores the sentences)
     time_iteration: bool = True # whether to print the time taken by an iteration
     save_intermediate: bool = True # whether to save the current best model (safety for interrupted code)
@@ -190,6 +193,16 @@ class ExperimentConfig:
     # None = 1 (undamped), "auto" = backtracking in [1/order, 1].
     # Not part of the stem or the resume check.
     utt_core_power: Optional[Union[float, str]] = None
+    # init="svd_stream" only (EXPERIMENTAL): power iterations and extra sketch columns
+    # of the randomized SVD; None = 2 and 10. Part of the init cache key, not of the stem.
+    svd_power_iter: Optional[int] = None
+    svd_oversampling: Optional[int] = None
+    # tt/utt only (EXPERIMENTAL): "random" | "markov" (cores built from the data,
+    # experimental/tt_markov_init.py). Part of the resume check, not of the stem.
+    tt_core_init: str = "random"
+    # EXPERIMENTAL binary Tucker (experimental/binary/README.md): None | "factors" | "both".
+    # Its other knobs are TENSORMET_BINARY_* environment variables, recorded in the run name.
+    binary: Optional[str] = None
     # "mu" | "sgd" (torch minibatch trainer for tucker, tt and utt; see sgd/README.md).
     solver: str = "mu"
     # SGD-only knobs. One loop iteration = sgd_steps_per_iteration steps.
@@ -388,6 +401,8 @@ class RunConfig:
                     _as_dim_tuple(old_exp.get("dim", [])) == _as_dim_tuple(self.exp.dim) and
                     tuple(old_exp.get("rank", [])) == tuple(self.exp.rank) and
                     old_exp.get("init") == self.exp.init and
+                    old_exp.get("tt_core_init", "random") ==
+                    getattr(self.exp, "tt_core_init", "random") and
                     int(old_exp.get("random_state", 1)) == int(self.exp.random_state) and
                     _canonical_shared_factors(old_exp.get("shared_factors")) ==
                     _canonical_shared_factors(self.exp.shared_factors) and

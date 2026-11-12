@@ -1,6 +1,5 @@
 """
-collectives.py — cross-device sum-reductions for the
-single-process SGD trainers.
+collectives.py — cross-device sum-reductions for the single-process SGD trainer.
 
 A ``Collective`` sums G tensors (one per device) in place, leaving the result
 on every device. It is also the seam a DDP backend would slot into (see
@@ -11,11 +10,9 @@ Backends
 ``NcclSingleProcess``  ``torch.cuda.nccl.all_reduce`` (single-process,
                        multi-device). Preferred.
 ``HostReduce``         Pinned host staging; fallback when NCCL or peer access
-                       is missing. Costs ``(G-1) x buffer`` pinned bytes.
-``SingleDevice``       No-op, so both trainers share one code path.
-
-Buffers are cached by ``(numel, dtype)``, so nothing is allocated in steady
-state.
+                       is missing. Costs ``(G-1) x buffer`` pinned bytes,
+                       allocated once per ``(numel, dtype)``.
+``SingleDevice``       No-op, for G == 1.
 """
 from __future__ import annotations
 
@@ -32,61 +29,24 @@ NCCL_PROBE_TIMEOUT_S = float(os.environ.get("TENSORMET_NCCL_PROBE_TIMEOUT", "30"
 
 
 class Collective:
-    """Sum-reduce one tensor per device, in place, result on every device.
-
-    Subclasses implement ``all_reduce``; ``all_reduce_scalar`` and
-    ``broadcast_`` have generic implementations that only the no-op backend
-    bothers to override.
-    """
+    """Sum-reduce one tensor per device, in place, result on every device."""
 
     #: devices this collective spans, in order (index == replica index)
     devices: List[torch.device]
-
-    @property
-    def n_devices(self) -> int:
-        return len(self.devices)
 
     def all_reduce(self, tensors: Sequence[torch.Tensor]) -> None:
         """``tensors[g]`` lives on ``devices[g]``; all become the sum."""
         raise NotImplementedError
 
-    def all_reduce_scalar(self, tensors: Sequence[torch.Tensor]) -> None:
-        """Same contract for tiny (0-d / 1-element) tensors.
-
-        Split out because Phase 4 (core sharding) reduces a scalar per step
-        while the gradient path reduces hundreds of megabytes, and a backend
-        may reasonably want different staging for the two.
-        """
-        self.all_reduce(tensors)
-
-    def broadcast_(self, tensors: Sequence[torch.Tensor]) -> None:
-        """``tensors[0]`` -> every other device. Only needed off the hot path
-        (resume, and the periodic parameter averaging of ``sgd_sync_every``)."""
-        src = tensors[0]
-        for dst in tensors[1:]:
-            dst.copy_(src, non_blocking=True)
-
-    def sync(self) -> None:
-        """Block until every device is idle. Used around timing and checkpoints."""
-        for dev in self.devices:
-            torch.cuda.synchronize(dev)
-
 
 class SingleDevice(Collective):
-    """G == 1: every collective is a no-op."""
+    """G == 1: the reduction is a no-op."""
 
     def __init__(self, device: torch.device):
         self.devices = [torch.device(device)]
 
     def all_reduce(self, tensors: Sequence[torch.Tensor]) -> None:
         return
-
-    def broadcast_(self, tensors: Sequence[torch.Tensor]) -> None:
-        return
-
-    def sync(self) -> None:
-        if self.devices[0].type == "cuda":
-            torch.cuda.synchronize(self.devices[0])
 
     def __repr__(self) -> str:
         return f"SingleDevice({self.devices[0]})"
