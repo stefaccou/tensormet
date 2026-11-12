@@ -231,7 +231,8 @@ def launch_nnt_decomposition(cfg):
         print(f"[{time.strftime('%H:%M:%S')}] importing cupy...", flush=True)
         import cupy as cp
     print(f"[{time.strftime('%H:%M:%S')}] importing tucker_tensor...", flush=True)
-    from tensormet.tucker_tensor import SparseTupleTensor, _as_host
+    from tensormet.tucker_tensor import SparseTupleTensor
+    from tensormet.solvers import _as_host
     print(f"[{time.strftime('%H:%M:%S')}] importing similarity...", flush=True)
     from tensormet.similarity import load_eval_sentences_cached_parquet, ensure_vocab
     print(f"[{time.strftime('%H:%M:%S')}] all deferred imports done", flush=True)

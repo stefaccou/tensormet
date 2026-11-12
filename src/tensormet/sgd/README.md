@@ -30,7 +30,7 @@ sampled nnz term rescaled to full-tensor scale plus an **exact closed-form
 zero-entry term** (`sum(X̂)` for KL via column sums, `‖X̂‖²` for FR via Grams) —
 no negative sampling. Errors are normalized exactly like
 `distance.kl/fr_compute_errors`, so curves are directly comparable with MU
-runs. Algorithm details: `sgd_tucker.py` module docstring and
+runs. Algorithm details: `sgd_step.py` module docstring and
 `reviews/sgd-tucker-training-signal-2026-07-27.md`.
 
 **Step mapping**: one loop *iteration* = `sgd_steps_per_iteration` optimizer
@@ -44,17 +44,26 @@ steps (default 100). All iteration-based knobs (`n_iter_max`,
   (`view_from_raw` / `raw_from_view`), rank and shared-factor parsing, and
   `SGDModelBase`, the surface the trainers use.
 - `sgd_tt.py` — `SGDTTModel` (Tucker-TT) and `sq_norm`; see "TT and utt".
-- `sgd_tucker.py` — model (`SGDTuckerModel`), deterministic `EntryBatcher`
-  (pure function of (seed, step) → resume replays exact batches), objectives,
-  exact error, `GradStepper` — the per-device step body (flat gradient buffer,
-  micro-batching) both trainers run — and the
-  standalone `sgd_non_negative_tucker` for notebooks (a loop over `SGDTrainer`).
-- `sgd_trainer.py` — `SGDTrainer`, the loop-facing surface:
-  `run_block(iteration, log_step)`, `materialize()`, `checkpoint_payload()`,
-  `load_payload()`, `sync()`, plus the helpers it shares with the sharded
-  trainer. Owns Adam moments, raw params, and the step counter — state the
-  `UpdateRouting` seam cannot express, which is why the loop branches on the
-  solver instead of routing kernels.
+- `sgd_tucker.py` — the Tucker model (`SGDTuckerModel`) and the two-group
+  contraction it uses.
+- `sgd_step.py` — what every model shares per step: the deterministic
+  `EntryBatcher` (pure function of (seed, step) → resume replays exact
+  batches), the objectives, the exact error, memory sizing
+  (`resolve_micro_batch`) and `GradStepper`, the per-device step body (flat
+  gradient buffer, micro-batching).
+- `sgd_trainer.py` — `SGDTrainer(tensor, devices=[...], ...)`, the loop-facing
+  surface, for one device or several: `run_block(iteration, log_step)`,
+  `materialize()`, `checkpoint_payload()`, `load_payload()`, `sync()`. Single-process
+  data parallelism: contiguous NNZ shards + per-shard batchers (seeded
+  `random_state*1000+g`; one device keeps `random_state`), a full model +
+  optimizer + `GradStepper` per device, a persistent thread-per-GPU pool, **one**
+  flattened gradient all-reduce per step and a redundant optimizer step — so
+  there is no parameter broadcast at all. One device is the same code without
+  the collective, pool and replica check. Device-0 checkpoints. Owns Adam moments,
+  raw params and the step counter — state the `UpdateRouting` seam cannot
+  express, which is why the loop has a separate SGD solver instead of routing
+  kernels.
+- `standalone.py` — `sgd_non_negative_tucker` for notebooks (a loop over `SGDTrainer`).
 - `sgd_init.py` — `mu_init_for_sgd`: the MU path's SVD inits on a temporary
   CuPy copy of the tensor.
 - `collectives.py` — the `Collective` seam: `NcclSingleProcess`
@@ -67,12 +76,6 @@ steps (default 100). All iteration-based knobs (`n_iter_max`,
   failed probe and falls back to `HostReduce`. The resolved backend is printed
   at construction, so a run that silently measured the host path is visible in
   the log rather than hiding in the timings.
-- `sharded_sgd.py` — `ShardedSGDTrainer` for `--n_gpus > 1`: single-process
-  data parallelism (contiguous NNZ shards + per-shard batchers seeded
-  `random_state*1000+g`, a full model + optimizer + `GradStepper` per device,
-  a persistent thread-per-GPU pool, **one** flattened gradient all-reduce per
-  step and a redundant optimizer step — so there is no parameter broadcast at
-  all). Device-0 checkpoints, byte-compatible with the single-GPU trainer's.
 
 ## Multi-GPU knobs and how to set them
 

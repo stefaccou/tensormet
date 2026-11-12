@@ -173,10 +173,9 @@ class ExperimentConfig:
     tt_rank: int = 100
     # UTT only (shared-core TT): exponent of the core MU step;
     # None = 1 (undamped), "auto" = backtracking in [1/order, 1].
-    # Not part of the stem or the resume check.
     utt_core_power: Optional[Union[float, str]] = None
-    # init="svd_stream" only: power iterations and extra sketch columns
-    # of the randomized SVD; None = 2 and 10. Part of the init cache key, not of the stem.
+    # init="svd_stream" only: power iterations and extra sketch columns of the randomized SVD
+    # Part of the init cache key, not of the stem.
     svd_power_iter: Optional[int] = None
     svd_oversampling: Optional[int] = None
     # tt/utt only (EXPERIMENTAL): "random" | "markov" (cores built from the data,

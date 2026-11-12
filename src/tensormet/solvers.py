@@ -445,14 +445,11 @@ class SGDSolver:
         # built — historically the place a run could stall with no output.
         print(f"[{time.strftime('%H:%M:%S')}] constructing SGD trainer "
               f"(n_gpus={self.n_gpus})...", flush=True)
-        if self.n_gpus > 1:
-            from tensormet.sgd.sharded_sgd import ShardedSGDTrainer
-            self.trainer = ShardedSGDTrainer(
-                tensor.tensor, device_ids=list(range(self.n_gpus)),
-                comm_backend=e.sgd_comm_backend, **kwargs)
-        else:
-            from tensormet.sgd.sgd_trainer import SGDTrainer
-            self.trainer = SGDTrainer(tensor.tensor, **kwargs)
+        from tensormet.sgd.sgd_trainer import SGDTrainer
+        # One GPU is the default device, as launch.py selected it.
+        self.trainer = SGDTrainer(
+            tensor.tensor, devices=list(range(self.n_gpus)) if self.n_gpus > 1 else None,
+            comm_backend=e.sgd_comm_backend, **kwargs)
         print(f"[{time.strftime('%H:%M:%S')}] SGD trainer ready", flush=True)
 
     def size_batches(self):

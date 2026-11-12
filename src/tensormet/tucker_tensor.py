@@ -6,7 +6,6 @@ import torch
 import json
 import math
 import numpy as np
-from tensorly.tucker_tensor import TuckerTensor
 from typing import ClassVar, List, Optional, Union, Tuple
 from datetime import datetime, UTC
 from pathlib import Path
@@ -43,8 +42,6 @@ from tensormet.naming import (
     populated_filename,
     populated_filename_legacy,
 )
-from tensormet.similarity import SIMLEX_PATH as _SIMLEX_PATH
-from tensormet.solvers import _as_host  # noqa: F401  (launch.py imports it from here)
 
 cp, cpx_sparse = make_lazy_cupy_pair()
 
