@@ -5,7 +5,7 @@ the error. See sgd/README.md for costs, multi-GPU knobs and integration.
 
 Model: X̂ = G ×_1 A^(1) ×_2 … ×_N A^(N), kept non-negative by a
 parametrization (``sgd_model.PARAMETRIZATIONS``). The TT and utt models
-(``sgd_tt.py``, ``experimental/uniform_tt/utt_sgd.py``) have the same surface;
+(``sgd_tt.py``, ``uniform_tt/utt_sgd.py``) have the same surface;
 ``sgd_trainer.make_sgd_model`` picks one.
 
 Objectives (the MU path's divergences). The zero-entry part is exact and in
@@ -35,14 +35,9 @@ import torch
 from tensorly import backend_context
 from tensorly.tucker_tensor import TuckerTensor
 
-# _EPS, PARAMETRIZATIONS and the helpers below moved to sgd_model.py; imported
-# here too so older imports from this module keep working.
-from tensormet.sgd.sgd_model import (  # noqa: F401
+from tensormet.sgd.sgd_model import (
     _EPS,
-    PARAMETRIZATIONS,
     SGDModelBase,
-    _as_rank_tuple,
-    _parse_shared_factors,
     raw_from_view,
     view_from_raw,
 )
@@ -52,11 +47,6 @@ from tensormet.utils import SparseCOOTensor, einsum_letters
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
-    # softplus⁻¹(y) = log(expm1(y)); clamp keeps the log finite for tiny inits.
-    return torch.log(torch.expm1(y.clamp_min(1e-6)))
-
 
 def _contraction_plan(rank: Sequence[int]) -> Tuple[int, bool, int]:
     """``(split, gemm_left, width)`` for the two-group entry contraction.
@@ -174,8 +164,6 @@ class EntryBatcher:
         self.batch_size = min(int(batch_size), self.nnz)
         perm_np = np.random.default_rng(int(seed)).permutation(self.nnz)
         self._perm = torch.from_numpy(perm_np).to(device)
-        self.device = self._perm.device
-        self.dtype = self._perm.dtype
 
     def batch(self, step: int) -> torch.Tensor:
         start = (step * self.batch_size) % self.nnz
@@ -183,25 +171,6 @@ class EntryBatcher:
         if end <= self.nnz:
             return self._perm[start:end]
         return torch.cat([self._perm[start:], self._perm[: end - self.nnz]])
-
-    def new_buffer(self) -> torch.Tensor:
-        """A ``(batch_size,)`` index buffer for ``batch_into``. Zeroed, so a read
-        before the first fill still indexes valid entries."""
-        return torch.zeros(self.batch_size, dtype=self.dtype, device=self.device)
-
-    def batch_into(self, step: int, out: torch.Tensor) -> torch.Tensor:
-        """``batch(step)`` written into ``out`` without allocating. The CUDA-graph
-        path needs the indices at a fixed address; this copy runs outside the
-        captured region."""
-        start = (step * self.batch_size) % self.nnz
-        end = start + self.batch_size
-        if end <= self.nnz:
-            out.copy_(self._perm[start:end])
-        else:
-            head = self.nnz - start
-            out[:head].copy_(self._perm[start:])
-            out[head:].copy_(self._perm[: end - self.nnz])
-        return out
 
 
 # ---------------------------------------------------------------------------
@@ -251,16 +220,10 @@ class SGDTuckerModel(SGDModelBase):
                 for f in factors0
             ]
 
-        if parametrization == "softplus":
-            to_raw = _inv_softplus
-        elif parametrization == "exp":
-            to_raw = torch.log
-        else:
-            to_raw = lambda t: t  # noqa: E731
-        self._core_raw = torch.nn.Parameter(to_raw(core0))
+        self._core_raw = torch.nn.Parameter(raw_from_view(core0, parametrization, self.eps))
         # Only owner modes hold a Parameter; aliased modes read the owner's.
         self._factor_raw = torch.nn.ParameterDict({
-            str(m): torch.nn.Parameter(to_raw(factors0[m]))
+            str(m): torch.nn.Parameter(raw_from_view(factors0[m], parametrization, self.eps))
             for m in range(self.order) if self.owner[m] == m
         })
 
@@ -403,14 +366,6 @@ def zero_entry_term(model, divergence, views=None):
     raise ValueError(f"divergence must be 'kl' or 'fr', got {divergence!r}")
 
 
-def _batch_loss(model, x, x_hat, scale, divergence, masked, eps=_EPS, views=None):
-    """Unbiased estimate of the total objective (used by the multi-GPU test notebook)."""
-    loss = sampled_loss(x, x_hat, scale, divergence, masked, eps=eps)
-    if masked:
-        return loss
-    return loss + zero_entry_term(model, divergence, views=views)
-
-
 # ---------------------------------------------------------------------------
 # one step's gradient, shared by the single-GPU and sharded trainers
 # ---------------------------------------------------------------------------
@@ -425,8 +380,6 @@ class GradStepper:
     - Micro-batching: the batch is split into chunks that fit a memory budget
       and the gradients accumulate (exact, see ``sampled_loss``). Up to about
       order 4 / rank 200 there is a single chunk.
-    - Optional CUDA-graph capture of the fixed-shape step body; the batch
-      indices are copied into a static buffer outside the capture.
     """
 
     def __init__(
@@ -442,7 +395,6 @@ class GradStepper:
         norm_const: float,
         include_zero_term: bool = True,
         micro_batch: Optional[int] = None,
-        cuda_graph: bool = False,
         eps: float = _EPS,
     ):
         self.model = model
@@ -479,7 +431,6 @@ class GradStepper:
             (lo, min(lo + self.micro_batch, self.batch_size))
             for lo in range(0, self.batch_size, self.micro_batch)
         ]
-        self._sel = batcher.new_buffer()
 
         # Gradient buffers for the views; only needed (and only allocated) when
         # the step is split into several chunks.
@@ -491,44 +442,19 @@ class GradStepper:
                     for t in _distinct_views(*model.nonneg_views())
                 ]
 
-        self._graph: Optional["torch.cuda.CUDAGraph"] = None
-        if cuda_graph:
-            self._capture()
-
     # --- gradient plumbing ---------------------------------------------------
 
     def zero_grad_(self) -> None:
         """Zero in place, never ``set_to_none``: the grads are views into ``flat_grad``."""
         self.flat_grad.zero_()
 
-    def new_param_buffer(self) -> torch.Tensor:
-        """A buffer ``pack_params_`` fits, laid out like ``flat_grad``."""
-        return torch.empty_like(self.flat_grad)
-
-    @torch.no_grad()
-    def pack_params_(self, out: torch.Tensor) -> torch.Tensor:
-        """Parameters -> one contiguous vector (parameter averaging, drift check)."""
-        offset = 0
-        for p in self.params:
-            n = p.numel()
-            out[offset:offset + n].copy_(p.detach().reshape(-1))
-            offset += n
-        return out
-
-    @torch.no_grad()
-    def unpack_params_(self, flat: torch.Tensor) -> None:
-        offset = 0
-        for p in self.params:
-            n = p.numel()
-            p.copy_(flat[offset:offset + n].view_as(p))
-            offset += n
-
     # --- the step body -------------------------------------------------------
 
-    def _body(self) -> None:
-        """Fill ``flat_grad`` from the indices in ``self._sel``. The
+    def compute_grads(self, step: int) -> None:
+        """Gradients of step ``step``'s objective, into ``flat_grad``. The
         parametrization runs once per step in both branches (it is a pass over
-        the whole core). Capturable: fixed shapes, no host syncs."""
+        the whole core)."""
+        batch = self.batcher.batch(step)
         self.flat_grad.zero_()
         model = self.model
         core, factors = model.nonneg_views()
@@ -536,7 +462,7 @@ class GradStepper:
         if self._view_grads is None:
             # One chunk: one graph from the raw parameters, one backward.
             lo, hi = self._slices[0]
-            sel = self._sel[lo:hi]
+            sel = batch[lo:hi]
             x_hat = model.predict_from(core, factors, self.indices[:, sel])
             loss = sampled_loss(self.values[sel], x_hat, self.scale,
                                 self.divergence, self.masked, eps=self.eps)
@@ -563,7 +489,7 @@ class GradStepper:
         factors_l = [leaf_of[id(f)] for f in factors]
 
         for lo, hi in self._slices:
-            sel = self._sel[lo:hi]
+            sel = batch[lo:hi]
             x_hat = model.predict_from(core_l, factors_l, self.indices[:, sel])
             loss = sampled_loss(self.values[sel], x_hat, self.scale,
                                 self.divergence, self.masked,
@@ -574,47 +500,6 @@ class GradStepper:
                                 views=(core_l, factors_l)) / self.norm_const
             z.backward()
         torch.autograd.backward(outs, [l.grad for l in leaves])
-
-    def compute_grads(self, step: int) -> None:
-        """Gradients of step ``step``'s objective, into ``flat_grad``."""
-        self.batcher.batch_into(step, self._sel)
-        if self._graph is not None:
-            self._graph.replay()
-        else:
-            self._body()
-
-    # --- CUDA graph capture --------------------------------------------------
-
-    def _capture(self, warmup: int = 3) -> None:
-        if self.device.type != "cuda":
-            raise ValueError("sgd_cuda_graph requires a CUDA device.")
-        self.batcher.batch_into(0, self._sel)
-        with torch.cuda.device(self.device):
-            # Warm up on a side stream so lazy kernel loads and workspace
-            # allocations happen before the capture.
-            side = torch.cuda.Stream(device=self.device)
-            side.wait_stream(torch.cuda.current_stream(self.device))
-            with torch.cuda.stream(side):
-                for _ in range(max(1, int(warmup))):
-                    self._body()
-            torch.cuda.current_stream(self.device).wait_stream(side)
-            torch.cuda.synchronize(self.device)
-
-            graph = torch.cuda.CUDAGraph()
-            try:
-                # thread_local: the sharded trainer captures one graph per
-                # device, and other devices' threads must not invalidate it.
-                with torch.cuda.graph(graph, capture_error_mode="thread_local"):
-                    self._body()
-            except RuntimeError as exc:
-                raise RuntimeError(
-                    "CUDA graph capture of the SGD step failed "
-                    f"({exc}). Re-run with --sgd-cuda-graph false; the capture "
-                    "is an optimization, not a requirement."
-                ) from exc
-            torch.cuda.synchronize(self.device)
-        self.flat_grad.zero_()
-        self._graph = graph
 
 
 # ---------------------------------------------------------------------------
@@ -698,7 +583,6 @@ def sgd_non_negative_tucker(
     n_steps: int = 20_000,
     batch_size: int = 4096,
     lr: float = 1e-2,
-    optimizer: str = "adam",
     parametrization: str = "softplus",
     shared_factors=None,
     init: Union[str, Tuple] = "random",
@@ -746,8 +630,7 @@ def sgd_non_negative_tucker(
         # One optimizer step per block, so the error can be logged at any step.
         trainer = SGDTrainer(
             t, rank=rank, divergence=divergence, objective=objective, lr=lr,
-            batch_size=batch_size, optimizer=optimizer,
-            parametrization=parametrization, shared_factors=shared_factors,
+            batch_size=batch_size, parametrization=parametrization, shared_factors=shared_factors,
             init=init, random_state=random_state, steps_per_iteration=1,
             device=device, dtype=dtype, eval_chunk=eval_chunk,
             eval_sample=eval_sample,

@@ -21,6 +21,8 @@ Three layers, smallest to largest:
   interactively (requires ``ipywidgets``). :func:`make_run_ranker` is the same
   faceted picker wired to :func:`find_best`: choose criteria, get the top runs
   on a metric as a table plus an optional overlay plot.
+  :func:`make_benchmark_browser` compares sessions of ``benchmark.json`` (the
+  benchmark driver's output), filtered by solver, method, GPU count and date.
 
 The plotting/comparison functions duck-type on their config argument: they only
 touch ``.log_path`` / ``.stem`` / ``.vocab_path``, so both :class:`InspectionConfig`
@@ -31,10 +33,12 @@ for legacy-named runs too) are accepted interchangeably.
 from __future__ import annotations
 
 import datetime as _dt
+import html
 import json
 import operator
 import pickle
 import re
+import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
@@ -673,7 +677,7 @@ _MN_STEM_RE = re.compile(r"_(\d+)mn(?=_|$)")
 # bare "..._3D_..." tag instead.
 _DECOMP_STEM_RE = re.compile(r"_CP\d+D(?=_|$)")
 _TT_STEM_RE = re.compile(r"_TT(\d+)b\d+D(?=_|$)")
-# "..._UTT50b3D_...": the shared-core TT (experimental/uniform_tt) at bond 50.
+# "..._UTT50b3D_...": the shared-core TT (uniform_tt) at bond 50.
 _UTT_STEM_RE = re.compile(r"_UTT(\d+)b\d+D(?=_|$)")
 
 # "..._SGD3D_..." marks the SGD solver (naming._order_tag with
@@ -2088,6 +2092,292 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
                        table_out, plot_row, plot_out])
     ui.get_figure = lambda: state["fig"]
     ui.get_ranking = lambda: state["ranked"]
+    display(ui)
+    return ui
+
+
+# === benchmark sessions ===============================================
+#
+# benchmark.json (written by scripts/benchmarking.sh) is a list of sessions. A
+# session holds metadata keys plus one entry per combo: a result dict, or
+# "CRASH" / "TIMEOUT".
+
+_BENCH_META_KEYS = {"time", "n_gpus", "solver", "method", "sgd_config", "cp_config",
+                    "tt_config", "utt_config", "init", "name"}
+_BENCH_FAILED = ("CRASH", "TIMEOUT")
+# Session fields the browser can filter on.
+_BENCH_FACETS = [("Solver", "solver"), ("Method", "method"), ("GPUs", "n_gpus")]
+# Sessions from before the SGD solver have no 'solver' key; they are all MU.
+_BENCH_FACET_DEFAULTS = {"solver": "mu"}
+
+
+def _bench_facet(session, key):
+    return session.get(key, _BENCH_FACET_DEFAULTS.get(key, "?"))
+
+
+def _bench_label(i, session):
+    s = session
+    label = (f"{s.get('time', f'run_{i}')} "
+             f"[{_bench_facet(s, 'solver').upper()} · {s.get('method', '?')}] "
+             f"({s.get('n_gpus', '?')} GPU)")
+    if s.get("name"):
+        label = f"{s['name']} — {label}"
+    for key in ("sgd_config", "cp_config", "tt_config", "utt_config"):
+        if s.get(key):
+            label += f" — {s[key]}"
+    if s.get("init"):
+        label += f" — init={s['init']}"
+    return label
+
+
+def _bench_time(session):
+    """POSIX timestamp of a session, or None if it has no readable time."""
+    try:
+        return pd.to_datetime(session["time"]).timestamp()
+    except Exception:
+        return None
+
+
+def _bench_cell(entry):
+    """(text, (rec, sem)) for one combo of one session; (text, None) if no result."""
+    if entry is None:
+        return "n/a", None
+    if entry in _BENCH_FAILED:
+        return entry, None
+    # final_error is exact; SGD sessions with eval_sample log a sampled curve.
+    if entry.get("final_error") is not None:
+        rec = entry["final_error"]
+    else:
+        rec = entry["rec_errors"][-1] if entry.get("rec_errors") else float("nan")
+    sem = (entry["fitness"][-1].get("simlex_all_rho", float("nan"))
+           if entry.get("fitness") else float("nan"))
+    run = entry.get("runtime_ms", 0) // 1000
+    loop = (entry.get("decomp_time_ms") or 0) // 1000
+    solve = (entry.get("solve_time_ms") or 0) // 1000
+    text = f"rec={rec:.4f} sem={sem:+.4f} (run={run}s loop={loop}s solve={solve}s)"
+    return text, (rec, sem)
+
+
+def load_benchmarks(benchmark_path=None):
+    """The sessions in benchmark.json (default ``DATA_DIR/benchmarking/benchmark.json``)."""
+    path = Path(benchmark_path) if benchmark_path else DATA_DIR / "benchmarking" / "benchmark.json"
+    data = json.loads(path.read_text())
+    return data if isinstance(data, list) else [data]
+
+
+def compare_benchmarks(sessions, labels=None):
+    """One row per combo, one column per session. Exactly two sessions also get
+    a delta column (second minus first)."""
+    if labels is None:
+        labels = [_bench_label(i, s) for i, s in enumerate(sessions)]
+    combos = []
+    for s in sessions:
+        for key, val in s.items():
+            is_combo = key not in _BENCH_META_KEYS and (val in _BENCH_FAILED or isinstance(val, dict))
+            if is_combo and key not in combos:
+                combos.append(key)
+
+    rows = []
+    for combo in combos:
+        row = {"combo": combo}
+        vals = []
+        for s, label in zip(sessions, labels):
+            row[label], val = _bench_cell(s.get(combo))
+            vals.append(val)
+        if len(sessions) == 2:
+            if vals[0] is not None and vals[1] is not None:
+                row["delta"] = (f"Δrec={vals[1][0] - vals[0][0]:+.4f} "
+                                f"Δsem={vals[1][1] - vals[0][1]:+.4f}")
+            else:
+                row["delta"] = "Δrec=n/a Δsem=n/a"
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).set_index("combo")
+
+
+def make_benchmark_browser(benchmark_path=None):
+    """Interactive picker for comparing benchmark sessions.
+
+    Tick two or more sessions and press *Compare*. The Solver, Method and GPUs
+    checkboxes and the *after* box (YYYY-MM-DD) narrow the list; a row with
+    nothing ticked, or an empty date, does not filter. Only ticked sessions
+    that are shown get compared. *Delete* removes one shown session from the
+    file after a confirmation, and keeps a ``.bak`` copy of the old file.
+
+    ``benchmark_path`` defaults to ``DATA_DIR/benchmarking/benchmark.json``.
+    Returns the displayed ``VBox``; ``ui.get_table()`` gives the last table.
+    """
+    try:
+        import ipywidgets as widgets
+        from IPython.display import clear_output, display
+    except ImportError as e:  # pragma: no cover - UI-only dependency
+        raise ImportError(
+            "make_benchmark_browser needs ipywidgets (and an IPython/Jupyter kernel). "
+            "Install with `pip install ipywidgets`."
+        ) from e
+
+    path = Path(benchmark_path) if benchmark_path else DATA_DIR / "benchmarking" / "benchmark.json"
+
+    # `checks[i]` is the checkbox of `sessions[i]`; `facet_checks[key]` maps each
+    # value of that field to its filter checkbox.
+    state = {"sessions": [], "labels": [], "checks": [], "table": None}
+    facet_checks = {key: {} for _, key in _BENCH_FACETS}
+    facet_rows = {key: widgets.HBox([], layout=widgets.Layout(flex_flow="row wrap"))
+                  for _, key in _BENCH_FACETS}
+
+    after_box = widgets.Text(value="", description="after", placeholder="YYYY-MM-DD",
+                             style={"description_width": "45px"},
+                             layout=widgets.Layout(width="190px"))
+    refresh_btn = widgets.Button(description="↻ Refresh", button_style="info",
+                                 layout=widgets.Layout(width="110px"))
+    status = widgets.HTML()
+    session_box = widgets.VBox([], layout=widgets.Layout(
+        max_height="300px", overflow_y="auto", border="1px solid #ccc", padding="5px"))
+    compare_btn = widgets.Button(description="Compare selected", button_style="success")
+    table_out = widgets.Output()
+    delete_dd = widgets.Dropdown(description="Run to delete:",
+                                 style={"description_width": "initial"},
+                                 layout=widgets.Layout(width="90%"))
+    delete_btn = widgets.Button(description="Delete run…", button_style="danger")
+    confirm_box = widgets.VBox()
+
+    def _after_ts():
+        """Cutoff timestamp; None for an empty box, False if it can't be parsed."""
+        s = after_box.value.strip()
+        if not s:
+            return None
+        try:
+            return pd.to_datetime(s).timestamp()
+        except Exception:
+            return False
+
+    def _ticked(key):
+        return {v for v, c in facet_checks[key].items() if c.value}
+
+    def _visible():
+        """Indices of the sessions that pass the filters."""
+        cutoff = _after_ts()
+        picked = {key: _ticked(key) for key in facet_checks}
+        keep = []
+        for i, s in enumerate(state["sessions"]):
+            if any(vals and _bench_facet(s, key) not in vals for key, vals in picked.items()):
+                continue
+            if isinstance(cutoff, float):
+                t = _bench_time(s)
+                if t is None or t < cutoff:
+                    continue
+            keep.append(i)
+        return keep
+
+    def _show_list(_change=None):
+        vis = _visible()
+        session_box.children = [state["checks"][i] for i in vis]
+        delete_dd.options = [(state["labels"][i], i) for i in vis]
+        if not path.exists():
+            status.value = f"<span style='color:#c00'>No file at <code>{html.escape(str(path))}</code></span>"
+            return
+        cutoff = _after_ts()
+        if cutoff is False:
+            note = " &nbsp;|&nbsp; <span style='color:#c00'>unparsable 'after' date — ignored</span>"
+        elif cutoff is not None:
+            note = f" &nbsp;|&nbsp; after {_dt.datetime.fromtimestamp(cutoff, _dt.timezone.utc):%Y-%m-%d}"
+        else:
+            note = ""
+        status.value = (f"<b>{len(vis)}</b> of {len(state['sessions'])} session(s) "
+                        f"match the filters{note}")
+
+    def _build_facets():
+        # One checkbox per value seen in the file; ticks survive a refresh.
+        for label, key in _BENCH_FACETS:
+            old = _ticked(key)
+            values = sorted({_bench_facet(s, key) for s in state["sessions"]}, key=_sortkey)
+            checks = {}
+            for v in values:
+                c = widgets.Checkbox(value=(v in old), description=str(v), indent=False,
+                                     layout=widgets.Layout(width="auto", margin="0 12px 0 0"))
+                c.observe(_show_list, "value")
+                checks[v] = c
+            facet_checks[key] = checks
+            facet_rows[key].children = ([widgets.HTML(f"<b>{label}</b>",
+                                                      layout=widgets.Layout(width="70px"))]
+                                        + list(checks.values()))
+
+    def _load(_btn=None):
+        ticked = {lbl for lbl, c in zip(state["labels"], state["checks"]) if c.value}
+        state["sessions"] = load_benchmarks(path) if path.exists() else []
+        state["labels"] = [_bench_label(i, s) for i, s in enumerate(state["sessions"])]
+        state["checks"] = [widgets.Checkbox(value=(lbl in ticked), description=lbl, indent=False,
+                                            layout=widgets.Layout(width="auto"))
+                           for lbl in state["labels"]]
+        confirm_box.children = ()
+        _build_facets()
+        _show_list()
+
+    def _compare(_btn=None):
+        with table_out:
+            clear_output()
+            chosen = [i for i in _visible() if state["checks"][i].value]
+            if len(chosen) < 2:
+                print("Tick at least 2 of the shown sessions to compare.")
+                return
+            df = compare_benchmarks([state["sessions"][i] for i in chosen],
+                                    [state["labels"][i] for i in chosen])
+            state["table"] = df
+            display(df.style.set_properties(**{"text-align": "left"}))
+
+    def _note(msg, color="#2e7d32"):
+        confirm_box.children = (widgets.HTML(f"<span style='color:{color}'>{msg}</span>"),)
+
+    def _do_delete(i):
+        label = state["labels"][i]
+        keep = [s for j, s in enumerate(state["sessions"]) if j != i]
+        try:
+            # Write the file first, so a failed write changes nothing.
+            shutil.copy2(path, path.with_name(path.name + ".bak"))
+            path.write_text(json.dumps(keep, indent=2))
+        except Exception as exc:
+            _note(f"Delete failed, nothing changed: {html.escape(str(exc))}", color="#b00020")
+            return
+        _load()
+        _note(f"Deleted <code>{html.escape(label)}</code>")
+
+    def _ask_delete(_btn):
+        i = delete_dd.value
+        if i is None:
+            _note("No shown run to delete.", color="#b00020")
+            return
+        warning = widgets.HTML(
+            "<b style='color:#b00020'>Delete this run permanently?</b><br>"
+            f"<code>{html.escape(state['labels'][i])}</code><br>"
+            f"<small>{html.escape(str(path))} is rewritten; the current file is "
+            "first copied to <code>.bak</code>.</small>"
+        )
+        yes = widgets.Button(description="Yes, delete", button_style="danger")
+        no = widgets.Button(description="Cancel")
+        yes.on_click(lambda _b, idx=i: _do_delete(idx))
+        no.on_click(lambda _b: setattr(confirm_box, "children", ()))
+        confirm_box.children = (widgets.VBox(
+            [warning, widgets.HBox([yes, no])],
+            layout=widgets.Layout(border="1px solid #b00020", padding="6px", margin="4px 0")),)
+
+    after_box.observe(_show_list, "value")
+    refresh_btn.on_click(_load)
+    compare_btn.on_click(_compare)
+    delete_btn.on_click(_ask_delete)
+
+    _load()
+
+    filters = widgets.VBox(list(facet_rows.values())
+                           + [widgets.HBox([after_box, refresh_btn])])
+    ui = widgets.VBox([
+        widgets.HTML("<h3>Benchmark sessions</h3>"
+                     "<small>Filters are optional: nothing ticked in a row means no filter.</small>"),
+        filters, status, session_box, compare_btn, table_out,
+        widgets.HTML("<h4>Delete a run</h4>"),
+        widgets.HBox([delete_dd, delete_btn]), confirm_box,
+    ])
+    ui.get_table = lambda: state["table"]
     display(ui)
     return ui
 

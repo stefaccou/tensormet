@@ -51,7 +51,7 @@ def make_sgd_model(decomposition: str = "tucker", *, shape, rank, tt_rank=None,
     if decomposition == "tt":
         from tensormet.sgd.sgd_tt import SGDTTModel
         return SGDTTModel(tt_rank=tt_rank, sum_x=sum_x, **common)
-    from tensormet.experimental.uniform_tt.utt_sgd import SGDUTTModel
+    from tensormet.uniform_tt.utt_sgd import SGDUTTModel
     return SGDUTTModel(tt_rank=tt_rank, sum_x=sum_x, **common)
 
 
@@ -86,14 +86,6 @@ def loss_norm_const(divergence: str, sum_x: float, sum_x_sq: float) -> float:
     if divergence == "fr":
         return max(sum_x_sq, _EPS)
     raise ValueError(f"divergence must be 'kl' or 'fr', got {divergence!r}")
-
-
-def make_optimizer(params, name: str, lr: float) -> torch.optim.Optimizer:
-    if name == "adam":
-        return torch.optim.Adam(params, lr=lr)
-    if name == "sgd":
-        return torch.optim.SGD(params, lr=lr, momentum=0.9)
-    raise ValueError(f"optimizer must be 'adam' or 'sgd', got {name!r}")
 
 
 def checkpoint_payload(model, opt, iteration: int) -> dict:
@@ -142,7 +134,6 @@ class SGDTrainer:
         objective: str = "full",
         lr: float = 1e-2,
         batch_size: int = 4096,
-        optimizer: str = "adam",
         parametrization: str = "softplus",
         shared_factors=None,
         init: Union[str, Tuple] = "random",
@@ -154,7 +145,6 @@ class SGDTrainer:
         eval_chunk: Optional[int] = None,
         eval_sample: Optional[int] = None,
         micro_batch: Optional[int] = None,
-        cuda_graph: bool = False,
         resume_payload: Optional[dict] = None,
         decomposition: str = "tucker",
         tt_rank: Optional[int] = None,
@@ -198,13 +188,13 @@ class SGDTrainer:
                             else int(self._eval_values.shape[0]))
 
         self.norm_const = loss_norm_const(divergence, *self._eval_totals)
-        self.opt = make_optimizer(self.model.parameters(), optimizer, lr)
+        self.opt = torch.optim.Adam(self.model.parameters(), lr=lr)
 
         self.stepper = GradStepper(
             self.model, self.indices, self.values, self.batcher,
             scale=self.scale, divergence=self.divergence, masked=self.masked,
             norm_const=self.norm_const, include_zero_term=True,
-            micro_batch=micro_batch, cuda_graph=cuda_graph, eps=epsilon,
+            micro_batch=micro_batch, eps=epsilon,
         )
         self.micro_batch = self.stepper.micro_batch
 
@@ -220,7 +210,6 @@ class SGDTrainer:
         for step in range(iteration * k, (iteration + 1) * k):
             self.stepper.compute_grads(step)
             self.opt.step()
-            self.model.project_()
         if self.regauge_every and (iteration + 1) % self.regauge_every == 0:
             self.model.regauge_()
 

@@ -302,7 +302,6 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--warmup-steps", type=int, dest="warmup_steps", default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--verbose", type=_parse_bool, default=None)
-    parser.add_argument("--return-errors", type=str, dest="return_errors", default=None)
     parser.add_argument("--largedim", type=_parse_bool, default=None)
     parser.add_argument("--checkpoint-saving-steps", type=int, dest="checkpoint_saving_steps", default=None)
     # NEW: Checkpoint resumption flag
@@ -336,15 +335,12 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="SGD only: learning rate (default 1e-2; loss is normalized by "
                              "sum(X) / ||X||^2 so it transfers across datasets).")
     parser.add_argument("--sgd-batch-size", type=int, dest="sgd_batch_size", default=None,
-                        help="SGD only: NNZ entries per optimizer step (default 4096).")
-    parser.add_argument("--sgd-optimizer", type=str, dest="sgd_optimizer", default=None,
-                        choices=["adam", "sgd"],
-                        help="SGD only: torch optimizer (default adam).")
+                        help="SGD only: NNZ entries per optimizer step on EVERY gpu, so the "
+                             "effective batch is n_gpus x batch size (default 4096).")
     parser.add_argument("--sgd-parametrization", type=str, dest="sgd_parametrization", default=None,
-                        choices=["softplus", "clamp", "exp"],
-                        help="SGD only: non-negativity via softplus reparametrization (default), "
-                             "clamp+projection (apples-to-apples with MU's clip), or exp "
-                             "(log-space; recommended for tt/utt, where it keeps Adam's "
+                        choices=["softplus", "exp"],
+                        help="SGD only: non-negativity via softplus reparametrization (default) "
+                             "or exp (log-space; recommended for tt/utt, where it keeps Adam's "
                              "state valid across gauge resets).")
     parser.add_argument("--sgd-regauge-every", type=int, dest="sgd_regauge_every", default=None,
                         help="SGD tt/utt only: iterations between exact gauge resets "
@@ -355,29 +351,12 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
     parser.add_argument("--sgd-warm-start", type=str, dest="sgd_warm_start", default=None,
                         help="SGD only: path to an MU model .pt used as init (warm start; "
                              "optimizer state starts fresh, unlike --resume).")
-    parser.add_argument("--sgd-batch-scope", type=str, dest="sgd_batch_scope", default=None,
-                        choices=["per_device", "global"],
-                        help="SGD multi-GPU: 'per_device' (default) gives EVERY gpu "
-                             "--sgd-batch-size entries, so the effective batch is "
-                             "n_gpus x batch_size; 'global' splits --sgd-batch-size across "
-                             "them (the pre-2026-07 behaviour). Affects the trajectory, so "
-                             "it is part of the resume-compatibility key.")
-    parser.add_argument("--sgd-sync-every", type=int, dest="sgd_sync_every", default=None,
-                        help="SGD multi-GPU: local-SGD cadence — K local Adam steps per gpu, "
-                             "then parameter averaging (default 1 = average every step). "
-                             "Divides the barrier count by K but makes every gpu pay the "
-                             "exact zero-entry term every step; try 8-16 for KL/order 3, "
-                             "leave at 1 when that term dominates. Affects the trajectory.")
     parser.add_argument("--sgd-micro-batch", type=int, dest="sgd_micro_batch", default=None,
                         help="SGD only: entries per forward/backward inside one optimizer "
                              "step (gradients accumulate, so this is exact — memory only). "
                              "Default derives it from the rank, which under the two-group "
                              "contraction is the whole batch up to ~order 4 / rank 200; "
                              "set it explicitly at order 5+ or on a tight-VRAM device.")
-    parser.add_argument("--sgd-cuda-graph", type=_parse_bool, dest="sgd_cuda_graph", default=None,
-                        help="SGD only: capture the fixed-shape step body as a CUDA graph "
-                             "(default false). Worth trying whenever step time is nearly "
-                             "independent of --sgd-batch-size, i.e. dispatch-bound.")
     parser.add_argument("--sgd-comm-backend", type=str, dest="sgd_comm_backend", default=None,
                         choices=["auto", "nccl", "host"],
                         help="SGD multi-GPU: cross-device reduction backend. 'auto' (default) "
@@ -398,18 +377,18 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                              "'tt' (Tucker-TT hybrid: Tucker factors, tensor-train core) "
                              "or 'cp' (EXPERIMENTAL nonnegative CP). Both non-Tucker "
                              "families support --n-gpus > 1 and are objective=full only; "
-                             "'tt' is KL only. 'utt' (EXPERIMENTAL) is 'tt' with one core "
+                             "'tt' is KL only. 'utt' is 'tt' with one core "
                              "shared by every position; it needs all modes in shared_factors.")
     parser.add_argument("--tt-rank", type=int, dest="tt_rank", default=None,
                         help="TT only: bond dimension of the tensor-train core (default 100). "
                              "Part of the artifact name ('TT{tt_rank}b{order}D'), so runs at "
                              "different bonds never share files.")
     parser.add_argument("--svd-power-iter", type=int, dest="svd_power_iter", default=None,
-                        help="init svd_stream only: power iterations of the randomized SVD (default 2). "
+                        help="init svd_stream only: power iterations of the randomized SVD (default 6). "
                              "More iterations sharpen columns whose eigenvalue is clearly above the "
                              "cut-off; cost grows linearly.")
     parser.add_argument("--svd-oversampling", type=int, dest="svd_oversampling", default=None,
-                        help="init svd_stream only: extra sketch columns beyond the rank (default 10). "
+                        help="init svd_stream only: extra sketch columns beyond the rank (default 100). "
                              "More columns fix the last kept columns when the spectrum is flat "
                              "around the rank; cost grows linearly.")
     parser.add_argument("--tt-core-init", type=str, dest="tt_core_init", default=None,
@@ -504,10 +483,10 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                   "shared_factors", "subsample_frac", "max_nnz", "objective",
                   "decomposition", "cp_inner_iters", "cp_scooch_kappa", "tt_rank",
                   "utt_core_power", "svd_power_iter", "svd_oversampling", "tt_core_init",
-                  "binary", "solver", "sgd_lr", "sgd_batch_size", "sgd_optimizer",
+                  "binary", "solver", "sgd_lr", "sgd_batch_size",
                   "sgd_parametrization", "sgd_steps_per_iteration", "sgd_warm_start",
-                  "sgd_regauge_every", "sgd_batch_scope", "sgd_sync_every", "sgd_micro_batch",
-                  "sgd_cuda_graph", "sgd_comm_backend", "sgd_eval_sample"):
+                  "sgd_regauge_every", "sgd_micro_batch",
+                  "sgd_comm_backend", "sgd_eval_sample"):
         v = parsed_dict.get(field, None)
         if v is not None:
             exp_kwargs[field] = v
@@ -531,7 +510,6 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
         "warmup_steps",
         "patience",
         "verbose",
-        "return_errors",
         "largedim",
         "checkpoint_saving_steps",
         "resume",

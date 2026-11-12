@@ -11,6 +11,11 @@ Both MU denominators are sums over ALL tensor entries, and both are closed
 forms here: run the same chain with the factor column sums in place of the
 gathered latents. Nothing in this module ever allocates an R^N object.
 
+Layout: the NNZ passes (``factor_pass``, ``core_pass``, ``error_pass``) hold the
+only copy of each per-batch body; the single-GPU kernels below and the shard
+workers in tt_sharded.py both call them. The closed-form denominators and the
+steps (``factor_den``, ``core_den``, ``apply_*_step``) are shared the same way.
+
 Conventions follow distance.py: CuPy in/out, NNZ streamed through
 ``coo_to_coords`` (free for CoordCOO), ``thread_budget``/``epsilon``/``verbose``
 kwargs, ε-clipping against zero-locking.
@@ -18,7 +23,6 @@ kwargs, ε-clipping against zero-locking.
 from __future__ import annotations
 
 import math
-import os
 
 import numpy as np
 import tensorly as tl
@@ -38,8 +42,7 @@ cp, cpx_sparse = make_lazy_cupy_pair()
 # ---------------------------------------------------------------------------
 
 # Ceiling on the largest single allocation a batch may make.
-MAX_BATCH_ALLOC_BYTES = int(os.environ.get(
-    "TENSORMET_TT_MAX_BATCH_ALLOC_BYTES", 1 << 30))
+MAX_BATCH_ALLOC_BYTES = 1 << 30
 
 # Floor for the OOM back-off.
 MIN_BATCH_NNZ = 256
@@ -173,68 +176,146 @@ def _xhat_floor(tt_cores, factors, shape, epsilon):
 
 
 # ---------------------------------------------------------------------------
-# KL / Poisson multiplicative updates
+# NNZ passes (shared by the single-GPU kernels and the shard workers)
 # ---------------------------------------------------------------------------
 
-def tt_kl_factor_update(vec_tensor, core, factors, mode, shape,
-                        thread_budget=None, epsilon=1e-12, verbose=False,
-                        batch_nnz=None):
-    """KL multiplicative update for factor A^(mode).
+def _batch_chain(cores, factors, idxs, start, end, xf):
+    """Gathered rows, TT environments and the floored x̂ for one batch."""
+    n_modes = len(idxs)
+    mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
+    S = sites(cores, mats, cp)
+    L, R = left_envs(S, cp), right_envs(S, cp)
+    xhat = cp.clip(L[n_modes][:, 0], a_min=xf, a_max=None)
+    return mats, L, R, xhat
 
-        A ← A ⊛ Num ⊘ den
-        Num[i, r] = Σ_{p : i_mode(p) = i} (x_p / x̂_p) · Z_p[r]
-        Z_p[r]    = ∂x̂_p / ∂A[i_mode(p), r]   (chain with site `mode` open)
-        den[r]    = the same chain run on the factor column sums
 
-    The updated columns are ℓ1-normalized and the scale absorbed into TT core
-    `mode`. That is an exact reparametrization, and it is what keeps an N-fold
-    chain product from drifting in scale; it also replaces ``tucker_normalize``,
-    which needs a dense core (the training loop skips it for this family).
+def factor_pass(idxs, vals, cores, factors, group, xf, batch_nnz, verbose=False, desc=None):
+    """Pooled factor numerator (I, R) for the factor tied across ``group``:
 
-    ``core`` is the list of TT cores; core `mode` is updated IN PLACE by the
-    rescale, so the loop's ``core`` variable stays current.
+        Num[i, r] = Σ_{n∈group} Σ_{p : i_n(p) = i} (x_p / x̂_p) · Z⁽ⁿ⁾_p[r]
+        Z⁽ⁿ⁾_p[r] = ∂x̂_p / ∂A[i_n(p), r]      (chain with site n open)
+
+    One NNZ pass for the whole group: the left/right sweeps are built once per
+    batch and reused for every site gradient. A single untied factor is
+    ``group=[mode]``.
     """
-    if verbose:
-        print(f"  [TT-KL] Updating factor {mode}...")
-    tt_cores = core
-    shape = tuple(int(s) for s in shape)
-    n_modes = len(shape)
-    idxs, vals = coo_to_coords(vec_tensor, shape)
-    nnz = int(vals.size)
-    A = factors[mode]
+    group = list(group)
+    num = cp.zeros_like(factors[group[0]])
 
-    S_sum = sites(tt_cores, _colsum_batch(factors, epsilon), cp, skip=mode)
-    den = cp.clip(
-        site_grad(left_envs(S_sum, cp)[mode], tt_cores[mode], right_envs(S_sum, cp)[mode + 1], cp),
+    def _body(start, end):
+        _mats, L, R, xhat = _batch_chain(cores, factors, idxs, start, end, xf)
+        w = cp.minimum(vals[start:end] / xhat, MU_RATIO_MAX)
+        for n in group:
+            Z = site_grad(L[n], cores[n], R[n + 1], cp)
+            _scatter_add(num, idxs[n][start:end], w, Z)
+
+    if int(vals.size):
+        _run_nnz_batches(int(vals.size), batch_nnz, _body, verbose, desc)
+    return num
+
+
+def core_pass(idxs, vals, cores, factors, site, xf, batch_nnz, verbose=False, desc=None):
+    """Numerator of TT core ``site``, a (ρ_k, R_k, ρ_{k+1}) array:
+
+        Num_k[a, r, b] = Σ_p (x_p / x̂_p) · L_k[p, a] · A_k[i_k(p), r] · R_{k+1}[p, b]
+    """
+    num = cp.zeros_like(cores[site])
+
+    def _body(start, end):
+        mats, L, R, xhat = _batch_chain(cores, factors, idxs, start, end, xf)
+        w = cp.minimum(vals[start:end] / xhat, MU_RATIO_MAX)
+        # Σ_p w_p · outer(L_k[p], A_k row, R_{k+1}[p]) as one GEMM.
+        LW = (L[site] * w[:, None])[:, :, None] * mats[site][:, None, :]   # (b, ρ_k, R_k)
+        # [...] so the accumulation stays in place and needs no nonlocal.
+        num[...] += (LW.reshape(end - start, -1).T @ R[site + 1]).reshape(num.shape)
+
+    if int(vals.size):
+        _run_nnz_batches(int(vals.size), batch_nnz, _body, verbose, desc)
+    return num
+
+
+def error_pass(idxs, vals, cores, factors, xf, batch_nnz, epsilon, verbose=False, desc=None):
+    """``(Σ_nnz [x log(x/x̂) − x + x̂], Σ_nnz x̂, Σ_nnz x)`` as 0-d arrays."""
+    n_modes = len(idxs)
+    x_nz = cp.clip(cp.asarray(vals), a_min=epsilon, a_max=None)
+    kl_pos = cp.asarray(0.0, dtype=factors[0].dtype)
+    sum_xhat_nz = cp.asarray(0.0, dtype=factors[0].dtype)
+
+    def _body(start, end):
+        mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
+        # Only the left sweep is needed for x̂.
+        xhat = cp.clip(left_envs(sites(cores, mats, cp), cp)[n_modes][:, 0],
+                       a_min=xf, a_max=None)
+        x_b = x_nz[start:end]
+        # Both reductions before either accumulation, so a retry cannot
+        # double-count the first.
+        pos = cp.sum(x_b * cp.log(x_b / xhat) - x_b + xhat)
+        tot = cp.sum(xhat)
+        kl_pos[...] += pos
+        sum_xhat_nz[...] += tot
+
+    if int(vals.size):
+        _run_nnz_batches(int(vals.size), batch_nnz, _body, verbose, desc)
+    return kl_pos, sum_xhat_nz, cp.sum(x_nz)
+
+
+# ---------------------------------------------------------------------------
+# Denominators (closed form) and the steps themselves
+# ---------------------------------------------------------------------------
+
+def factor_den(cores, factors, group, epsilon):
+    """Σ_all ∂x̂/∂A[i, r] pooled over ``group`` — the same chain run on the
+    factor column sums — as (1, R)."""
+    sums = _colsum_batch(factors, epsilon)
+    den = cp.zeros((1, int(factors[group[0]].shape[1])), dtype=factors[group[0]].dtype)
+    for n in group:
+        S_sum = sites(cores, sums, cp, skip=n)
+        den += site_grad(left_envs(S_sum, cp)[n], cores[n], right_envs(S_sum, cp)[n + 1], cp)
+    return cp.clip(den, a_min=epsilon, a_max=None)
+
+
+def core_den(cores, sums, k, epsilon):
+    """Σ_all ∂x̂/∂C_k[a, r, b] = Ls_k[a] · s_k[r] · Rs_{k+1}[b] (column-sum chain),
+    from the CURRENT cores — the sweep updates sites one after another."""
+    S_sum = sites(cores, sums, cp)
+    Ls, Rs = left_envs(S_sum, cp), right_envs(S_sum, cp)
+    return cp.clip(
+        Ls[k][0][:, None, None] * sums[k][0][None, :, None] * Rs[k + 1][0][None, None, :],
         a_min=epsilon, a_max=None,
-    )  # (1, R_mode)
-    xf = _xhat_floor(tt_cores, factors, shape, epsilon)
+    )
 
-    num = cp.zeros_like(A)
-    if nnz:
-        if batch_nnz is None:
-            batch_nnz = estimate_batch_nnz_tt(tt_cores, factors)
 
-        def _body(start, end):
-            mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
-            S = sites(tt_cores, mats, cp)
-            L, R = left_envs(S, cp), right_envs(S, cp)
-            xhat = cp.clip(L[n_modes][:, 0], a_min=xf, a_max=None)
-            Z = site_grad(L[mode], tt_cores[mode], R[mode + 1], cp)
-            w = cp.minimum(vals[start:end] / xhat, MU_RATIO_MAX)
-            _scatter_add(num, idxs[mode][start:end], w, Z)
+def apply_factor_step(cores, A, num, den, group, epsilon):
+    """A ← A ⊛ (num / den), ℓ1-normalize the columns and absorb the scale into
+    the TT core of EVERY mode in ``group`` (in place). An exact
+    reparametrization: it keeps an N-fold chain product from drifting in scale,
+    and it replaces ``tucker_normalize`` (which needs a dense core).
 
-        _run_nnz_batches(nnz, batch_nnz, _body, verbose, f"  [TT-KL] factor {mode}")
-
-    A_new = cp.clip(A * (num / den), a_min=epsilon, a_max=None)
+    The ratio is undamped by default. It has the right fixed point but not the
+    MM monotonicity guarantee (x̂ is degree-|group| in a tied factor); in
+    practice it converges, whereas a 1/|group| damping shrank the step too far
+    at production rank/scale.
+    """
+    ratio = cp.clip(num, a_min=0.0, a_max=None) / den
+    A_new = cp.clip(A * ratio, a_min=epsilon, a_max=None)
     scale = cp.clip(cp.sum(A_new, axis=0), a_min=epsilon, a_max=None)
-    tt_cores[mode] *= scale[None, :, None]
+    for n in group:
+        cores[n] *= scale[None, :, None]
     return cp.clip(A_new / scale[None, :], a_min=epsilon, a_max=None)
 
 
+def apply_core_step(cores, k, num, den, epsilon):
+    """C_k ← C_k ⊛ (num / den), in place in the ``cores`` list."""
+    cores[k] = cp.clip(cores[k] * (num / den), a_min=epsilon, a_max=None)
+
+
+# ---------------------------------------------------------------------------
+# Single-GPU KL / Poisson multiplicative updates (UpdateRouting contract)
+# ---------------------------------------------------------------------------
+
 def tt_kl_tied_factor_update(vec_tensor, core, factors, group, shape,
                              thread_budget=None, epsilon=1e-12, verbose=False,
-                             batch_nnz=None, power=None):
+                             batch_nnz=None):
     """KL multiplicative update for ONE factor tied across the modes in ``group``.
 
         A ← A ⊛ (Σ_{n∈group} Num_n) ⊘ (Σ_{n∈group} den_n)
@@ -247,68 +328,33 @@ def tt_kl_tied_factor_update(vec_tensor, core, factors, group, shape,
     rule satisfies per leg — which is the cheapest runtime check that this is
     right (see 1_method_development/19_tt_hybrid/).
 
-    Cost is ONE NNZ pass, not |group|: the left/right sweeps are built once per
-    batch and reused for every site gradient. So this is ~|group|× cheaper than
-    the per-mode updates it replaces, not more expensive.
+    ``group=[mode]`` is the untied update of one factor. Cost is ONE NNZ pass,
+    not |group|: the left/right sweeps are built once per batch and reused for
+    every site gradient.
 
     The ℓ1 rescale is applied to EVERY tied mode's core, so the reparametrization
-    stays exact — absorbing it into one core only (as the single-leg kernel must)
-    leaves the other legs uncompensated and multiplies x̂ by s^-(|group|-1).
-
-    ``power`` is the exponent on the pooled ratio; it defaults to 1 (undamped).
-    Pass ``power=1/|group|`` to restore the damped step.
+    stays exact — absorbing it into one core only leaves the other legs
+    uncompensated and multiplies x̂ by s^-(|group|-1). ``core`` is the list of
+    TT cores, updated IN PLACE, so the loop's ``core`` variable stays current.
     """
     if verbose:
-        print(f"  [TT-KL] Updating tied factor group {tuple(group)}...")
-    tt_cores = core
+        print(f"  [TT-KL] Updating factor group {tuple(group)}...")
     shape = tuple(int(s) for s in shape)
-    n_modes = len(shape)
     group = list(group)
     idxs, vals = coo_to_coords(vec_tensor, shape)
-    nnz = int(vals.size)
     A = factors[group[0]]
+    den = factor_den(core, factors, group, epsilon)
+    xf = _xhat_floor(core, factors, shape, epsilon)
+    if batch_nnz is None:
+        batch_nnz = estimate_batch_nnz_tt(core, factors)
+    num = factor_pass(idxs, vals, core, factors, group, xf, batch_nnz, verbose,
+                      f"  [TT-KL] factors {tuple(group)}")
+    return apply_factor_step(core, A, num, den, group, epsilon)
 
-    sums = _colsum_batch(factors, epsilon)
-    den = cp.zeros((1, int(A.shape[1])), dtype=A.dtype)
-    for n in group:
-        S_sum = sites(tt_cores, sums, cp, skip=n)
-        den += site_grad(left_envs(S_sum, cp)[n], tt_cores[n],
-                         right_envs(S_sum, cp)[n + 1], cp)
-    den = cp.clip(den, a_min=epsilon, a_max=None)
-    xf = _xhat_floor(tt_cores, factors, shape, epsilon)
 
-    num = cp.zeros_like(A)
-    if nnz:
-        if batch_nnz is None:
-            batch_nnz = estimate_batch_nnz_tt(tt_cores, factors)
-
-        def _body(start, end):
-            mats = [factors[k][idxs[k][start:end]] for k in range(n_modes)]
-            S = sites(tt_cores, mats, cp)
-            L, R = left_envs(S, cp), right_envs(S, cp)
-            w = cp.minimum(vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=xf, a_max=None),
-                           MU_RATIO_MAX)
-            for n in group:
-                Z = site_grad(L[n], tt_cores[n], R[n + 1], cp)
-                _scatter_add(num, idxs[n][start:end], w, Z)
-
-        _run_nnz_batches(nnz, batch_nnz, _body, verbose,
-                         f"  [TT-KL] tied factors {tuple(group)}")
-
-    # Undamped pooled ratio by default. It has the right fixed point but not the
-    # MM monotonicity guarantee (x̂ is degree-|group| in a tied factor); in
-    # practice it converges, whereas the old 1/|group| damping shrank the step
-    # too far to make progress at production rank/scale. power=1/|group| restores
-    # it. See tucker_tied_factor_update for the full argument.
-    ratio = cp.clip(num, a_min=0.0, a_max=None) / den
-    gamma = 1.0 if power is None else float(power)
-    if gamma != 1.0:
-        ratio = ratio ** gamma
-    A_new = cp.clip(A * ratio, a_min=epsilon, a_max=None)
-    scale = cp.clip(cp.sum(A_new, axis=0), a_min=epsilon, a_max=None)
-    for n in group:
-        tt_cores[n] *= scale[None, :, None]
-    return cp.clip(A_new / scale[None, :], a_min=epsilon, a_max=None)
+def tt_kl_factor_update(vec_tensor, core, factors, mode, shape, **kwargs):
+    """KL update of the untied factor A^(mode): the tied update of ``group=[mode]``."""
+    return tt_kl_tied_factor_update(vec_tensor, core, factors, [mode], shape, **kwargs)
 
 
 def tt_kl_core_update(vec_tensor, shape, core, factors, modes=None,
@@ -327,46 +373,25 @@ def tt_kl_core_update(vec_tensor, shape, core, factors, modes=None,
     """
     if verbose:
         print("  [TT-KL] Updating TT cores...")
-    tt_cores = core
     shape = tuple(int(s) for s in shape)
     n_modes = len(shape)
     if modes is not None and list(modes) != list(range(n_modes)):
         raise NotImplementedError("tt_kl_core_update assumes modes == range(N).")
 
     idxs, vals = coo_to_coords(vec_tensor, shape)
-    nnz = int(vals.size)
-    if nnz == 0:
-        return tt_cores
+    if int(vals.size) == 0:
+        return core
     if batch_nnz is None:
-        batch_nnz = estimate_batch_nnz_tt(tt_cores, factors)
+        batch_nnz = estimate_batch_nnz_tt(core, factors)
 
     sums = _colsum_batch(factors, epsilon)
-    xf = _xhat_floor(tt_cores, factors, shape, epsilon)
+    xf = _xhat_floor(core, factors, shape, epsilon)
     for k in range(n_modes):
-        S_sum = sites(tt_cores, sums, cp)
-        Ls, Rs = left_envs(S_sum, cp), right_envs(S_sum, cp)
-        den = cp.clip(
-            Ls[k][0][:, None, None] * sums[k][0][None, :, None] * Rs[k + 1][0][None, None, :],
-            a_min=epsilon, a_max=None,
-        )
-
-        num = cp.zeros_like(tt_cores[k])
-
-        def _body(start, end, k=k):
-            mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
-            S = sites(tt_cores, mats, cp)
-            L, R = left_envs(S, cp), right_envs(S, cp)
-            w = cp.minimum(vals[start:end] / cp.clip(L[n_modes][:, 0], a_min=xf, a_max=None),
-                           MU_RATIO_MAX)
-            # Σ_p w_p · outer(L_k[p], A_k row, R_{k+1}[p]) as one GEMM.
-            LW = (L[k] * w[:, None])[:, :, None] * mats[k][:, None, :]   # (b, ρ_k, R_k)
-            # [...] so the accumulation stays in place and needs no nonlocal.
-            num[...] += (LW.reshape(end - start, -1).T @ R[k + 1]).reshape(num.shape)
-
-        _run_nnz_batches(nnz, batch_nnz, _body, verbose, f"  [TT-KL] core site {k}")
-
-        tt_cores[k] = cp.clip(tt_cores[k] * (num / den), a_min=epsilon, a_max=None)
-    return tt_cores
+        den = core_den(core, sums, k, epsilon)
+        num = core_pass(idxs, vals, core, factors, k, xf, batch_nnz, verbose,
+                        f"  [TT-KL] core site {k}")
+        apply_core_step(core, k, num, den, epsilon)
+    return core
 
 
 def tt_kl_compute_errors(vec_tensor, shape, core, factors,
@@ -383,42 +408,20 @@ def tt_kl_compute_errors(vec_tensor, shape, core, factors,
     """
     if verbose:
         print("  [TT-KL] Computing KL errors...")
-    tt_cores = core
     shape = tuple(int(s) for s in shape)
-    n_modes = len(shape)
     idxs, vals = coo_to_coords(vec_tensor, shape)
-    nnz = int(vals.size)
 
-    sum_all = tt_sum_all_entries(tt_cores, factors, epsilon=epsilon)
-    if nnz == 0:
+    sum_all = tt_sum_all_entries(core, factors, epsilon=epsilon)
+    if int(vals.size) == 0:
         # rel = D / Σ_nnz x is undefined with no data; nan rather than D/ε.
         return cp.asarray(float("nan"), dtype=sum_all.dtype)
 
-    x_nz = cp.clip(cp.asarray(vals), a_min=epsilon, a_max=None)
-    xf = _xhat_floor(tt_cores, factors, shape, epsilon)
+    xf = _xhat_floor(core, factors, shape, epsilon)
     if batch_nnz is None:
-        batch_nnz = estimate_batch_nnz_tt(tt_cores, factors)
-
-    kl_pos = cp.asarray(0.0, dtype=factors[0].dtype)
-    sum_xhat_nz = cp.asarray(0.0, dtype=factors[0].dtype)
-
-    def _body(start, end):
-        mats = [factors[n][idxs[n][start:end]] for n in range(n_modes)]
-        # Only the left sweep is needed for x̂.
-        xhat = cp.clip(left_envs(sites(tt_cores, mats, cp), cp)[n_modes][:, 0],
-                       a_min=xf, a_max=None)
-        x_b = x_nz[start:end]
-        # Both reductions before either accumulation, so a retry cannot
-        # double-count the first.
-        pos = cp.sum(x_b * cp.log(x_b / xhat) - x_b + xhat)
-        tot = cp.sum(xhat)
-        kl_pos[...] += pos
-        sum_xhat_nz[...] += tot
-
-    _run_nnz_batches(nnz, batch_nnz, _body, verbose, "  [TT-KL] error x̂ pass")
-
-    kl_total = kl_pos + (sum_all - sum_xhat_nz)
-    return kl_total / cp.maximum(cp.sum(x_nz), epsilon)
+        batch_nnz = estimate_batch_nnz_tt(core, factors)
+    kl_pos, sum_xhat_nz, sum_x = error_pass(idxs, vals, core, factors, xf, batch_nnz,
+                                            epsilon, verbose, "  [TT-KL] error x̂ pass")
+    return (kl_pos + (sum_all - sum_xhat_nz)) / cp.maximum(sum_x, epsilon)
 
 
 # ---------------------------------------------------------------------------

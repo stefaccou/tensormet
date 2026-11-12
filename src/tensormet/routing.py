@@ -72,8 +72,8 @@ def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedi
         return get_tt_update_routing_step(divergence=divergence, log_step=log_step)
 
     if decomposition == "utt":
-        # EXPERIMENTAL shared-core TT (experimental/uniform_tt/README.md).
-        from tensormet.experimental.uniform_tt.utt_routing import get_utt_update_routing_step
+        # Shared-core TT (uniform_tt/README.md).
+        from tensormet.uniform_tt.utt_routing import get_utt_update_routing_step
         return get_utt_update_routing_step(divergence=divergence, log_step=log_step,
                                            core_power=utt_core_power)
 
@@ -131,6 +131,41 @@ def get_update_routing_step(divergence: Divergence, dim, log_step: bool, largedi
                 )
 
     raise ValueError(f"Unknown divergence: {divergence!r}. Expected 'kl' or 'fr'.")
+
+def get_sharded_update_routing_step(sst, divergence: Divergence, dim, log_step: bool,
+                                    largedim=False, masked: bool = False) -> UpdateRouting:
+    """Multi-GPU Tucker routing: the largedim kernels, with the NNZ-dependent
+    halves routed through *sst*. The dense small-dim kernels are not sharded, so
+    below the largedim threshold this is the single-GPU routing. The sharded KL
+    core update never returns an error, nor does the FR one (its error is a
+    separate sharded pass). CP / TT / utt / binary have their own sharded
+    routing next to their single-GPU one."""
+    if not needs_largedim(dim, largedim=largedim, masked=masked):
+        return get_update_routing_step(divergence, dim, log_step, largedim=largedim,
+                                       masked=masked)
+    from tensormet.sharded_sparse import (
+        make_sharded_kl_factor_update, make_sharded_fr_factor_update,
+        make_sharded_kl_core_update, make_sharded_fr_core_update,
+        make_sharded_kl_compute_errors, make_sharded_fr_compute_errors,
+    )
+    if divergence == "kl":
+        factor_fn = make_sharded_kl_factor_update(sst)
+        core_fn = make_sharded_kl_core_update(sst)
+        error_fn = make_sharded_kl_compute_errors(sst)
+    elif divergence == "fr":
+        factor_fn = make_sharded_fr_factor_update(sst)
+        core_fn = make_sharded_fr_core_update(sst)
+        error_fn = make_sharded_fr_compute_errors(sst)
+    else:
+        raise ValueError(f"Unknown divergence: {divergence!r}. Expected 'kl' or 'fr'.")
+    return UpdateRouting(
+        factor_update=factor_fn,
+        core_update=core_fn,
+        error_fn=error_fn if log_step else null_compute_errors,
+        core_returns_error=False,
+        tied_factor_update=partial(tucker_tied_factor_update, factor_fn=factor_fn),
+    )
+
 
 def get_log_step(iteration, rec_log_every, rec_check_every):
     log_step = False

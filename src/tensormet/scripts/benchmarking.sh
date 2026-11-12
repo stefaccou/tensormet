@@ -4,9 +4,10 @@
 # ANY variant and appends one session entry to benchmark.json.
 #
 #   benchmarking.sh                 # tt: MU on the Tucker-TT hybrid (the default)
-#   benchmarking.sh utt             # MU on the EXPERIMENTAL shared-core TT
+#   benchmarking.sh utt             # MU on the shared-core TT
 #   benchmarking.sh mu              # MU on the full Tucker core
 #   benchmarking.sh sgd             # torch minibatch solver (Tucker)
+#   benchmarking.sh sgd-tt          # torch minibatch solver (Tucker-TT hybrid)
 #   benchmarking.sh cp              # MU on the EXPERIMENTAL nonnegative CP family
 #   benchmarking.sh --solver utt    # same as the bare word
 #   benchmarking.sh --name "tc off" # free-text session label, shown in the notebook
@@ -24,7 +25,7 @@
 # Every setting below is overridable from the environment (BENCH_*) so wrappers
 # never need to edit the body. List-valued knobs are space-separated strings:
 #
-#   BENCH_SOLVER=tt|utt|mu|sgd|cp  BENCH_N_GPUS=2  BENCH_METHOD=scSoftPlus
+#   BENCH_SOLVER=tt|utt|mu|sgd|sgd-tt|cp  BENCH_N_GPUS=2  BENCH_METHOD=scSoftPlus
 #   BENCH_NAME="tensor cores off"   # session label recorded in benchmark.json
 #   BENCH_DATASETS="a b"    BENCH_RANKS="10 50"
 #   BENCH_DIVERGENCES="kl"  # default; "kl fr" re-enables the FR rows
@@ -32,12 +33,12 @@
 #   BENCH_INIT=random       # init for every variant except sgd (always random)
 #   BENCH_JSON=/path/benchmark.json             BENCH_DRY_RUN=true
 #   BENCH_MAX_SECONDS_PER_DECOMP=3600           # per-run watchdog, 0 disables
-#   (sgd only) BENCH_SGD_LR, BENCH_SGD_BATCH_SIZE, BENCH_SGD_STEPS_PER_ITER,
-#              BENCH_SGD_OPTIMIZER, BENCH_SGD_PARAMETRIZATION,
-#              BENCH_SGD_WARM_START, BENCH_SGD_COMM_BACKEND,
-#              BENCH_LOG_EVERY, BENCH_RUN_VARIANTS
+#   (sgd, sgd-tt) BENCH_SGD_LR, BENCH_SGD_BATCH_SIZE, BENCH_SGD_STEPS_PER_ITER,
+#              BENCH_SGD_PARAMETRIZATION,
+#              BENCH_SGD_WARM_START, BENCH_SGD_COMM_BACKEND, BENCH_LOG_EVERY
+#   (sgd only) BENCH_RUN_VARIANTS
 #   (cp only)  BENCH_CP_INNER_ITERS, BENCH_CP_SCOOCH_KAPPA
-#   (tt, utt)  BENCH_TT_RANK                    # bond dimension, default 100
+#   (tt, utt, sgd-tt) BENCH_TT_RANK             # bond dimension, default 100
 #   (utt only) BENCH_UTT_CORE_POWER             # float or "auto"; unset = 1
 #
 # --- How the solvers differ, and why ------------------------------------------
@@ -45,7 +46,8 @@
 # tucker_tensor.py, see sgd/README.md), so relative to MU the
 # following flags are DROPPED, not merely changed:
 #   --subsample-frac <1  : SGD is already minibatch -> use --sgd-batch-size.
-#   --normalize-factors  : scaling lives in the softplus/clamp parametrization.
+#                          (passed as 1.0, since the config default is 0.025)
+#   --normalize-factors  : scaling lives in the softplus/exp parametrization.
 #   --largedim           : SGD does not use the largedim kernel family.
 #   --max-nnz / svd init : unsupported (warm start instead).
 #
@@ -68,13 +70,19 @@
 # ('TT{tt_rank}b{order}D'), so sessions at different bonds never collide on disk
 # and can be run back to back.
 #
-# UTT (experimental/uniform_tt/README.md) is TT with one core shared by every
+# UTT (uniform_tt/README.md) is TT with one core shared by every
 # position. Same flags as TT (KL only, no --largedim / --normalize-factors), and
 # one more difference: it needs ALL modes tied, so --shared-factors is "all" on
 # every dataset. On the 4-gram set that equals the usual "0-1,1-2,2-3"; on the
 # 3-gram sets it also ties mode 0, which the other variants leave free.
 # Note: at random init UTT can stall in a frequency-only state (flat error);
 # BENCH_INIT=svd_stream avoids that, but then set it for every variant.
+#
+# SGD-TT is the SGD solver on the TT model (sgd/README.md, "TT and utt"). It
+# takes everything from sgd (full data, "__nosub" keys, 20 iterations, random
+# init) plus --decomposition tt and BENCH_TT_RANK, so it diffs row for row
+# against an sgd session. One difference: its parametrization defaults to exp,
+# the one sgd/README.md recommends for TT; sgd keeps softplus.
 #
 # CONSEQUENCE FOR COMPARABILITY: MU's core matrix subsamples NNZ (0.25 / 0.025),
 # so it fits a *smaller tensor* than SGD does. Reconstruction errors across
@@ -122,7 +130,7 @@ DRY_RUN="${BENCH_DRY_RUN:-false}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        tt|utt|mu|sgd|cp) SOLVER="$1"; shift ;;
+        tt|utt|mu|sgd|sgd-tt|cp) SOLVER="$1"; shift ;;
         --solver)   SOLVER="$2"; shift 2 ;;
         --n-gpus)   BENCH_N_GPUS="$2"; shift 2 ;;
         --method)   BENCH_METHOD="$2"; shift 2 ;;
@@ -130,7 +138,7 @@ while [[ $# -gt 0 ]]; do
         --max-seconds) BENCH_MAX_SECONDS_PER_DECOMP="$2"; shift 2 ;;
         --dry-run)  DRY_RUN=true; shift ;;
         -h|--help)
-            sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+            sed -n '3,18p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
             exit 0 ;;
         *)
             echo "ERROR: unknown argument '$1' (see --help)" >&2
@@ -139,15 +147,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$SOLVER" in
-    tt|utt|mu|sgd|cp) ;;
+    tt|utt|mu|sgd|sgd-tt|cp) ;;
     *)
-        echo "ERROR: variant must be tt, utt, mu, sgd or cp, got '$SOLVER'" >&2
+        echo "ERROR: variant must be tt, utt, mu, sgd, sgd-tt or cp, got '$SOLVER'" >&2
         exit 2 ;;
 esac
 
-# TT and UTT share the TT chain machinery.
+# TT and UTT share the MU TT chain machinery (KL only).
 IS_TT_FAMILY=false
 [[ "$SOLVER" == "tt" || "$SOLVER" == "utt" ]] && IS_TT_FAMILY=true
+# sgd and sgd-tt share the SGD settings; sgd-tt only adds the TT model.
+IS_SGD=false
+[[ "$SOLVER" == "sgd" || "$SOLVER" == "sgd-tt" ]] && IS_SGD=true
 
 read -r -a DATASETS    <<< "${BENCH_DATASETS:-fineweb-en fineweb_english_1B 4-gram-raw-fineweb-en_100000000}"
 read -r -a RANKS       <<< "${BENCH_RANKS:-10 50 100}"
@@ -193,8 +204,12 @@ fi
 SGD_LR="${BENCH_SGD_LR:-1e-2}"
 SGD_BATCH_SIZE="${BENCH_SGD_BATCH_SIZE:-4096}"
 SGD_STEPS_PER_ITER="${BENCH_SGD_STEPS_PER_ITER:-100}"
-SGD_OPTIMIZER="${BENCH_SGD_OPTIMIZER:-adam}"              # adam | sgd
-SGD_PARAMETRIZATION="${BENCH_SGD_PARAMETRIZATION:-softplus}"  # softplus | clamp
+# softplus | exp. exp is the recommended one for TT (sgd/README.md).
+if [[ "$SOLVER" == "sgd-tt" ]]; then
+    SGD_PARAMETRIZATION="${BENCH_SGD_PARAMETRIZATION:-exp}"
+else
+    SGD_PARAMETRIZATION="${BENCH_SGD_PARAMETRIZATION:-softplus}"
+fi
 SGD_WARM_START="${BENCH_SGD_WARM_START:-}"   # optional path to an MU model .pt used as init
 # Cross-device collective for the sharded (N_GPUS > 1) path: auto | nccl | host.
 # `auto` probes NCCL and falls back to pinned-host staging if it fails or hangs;
@@ -202,7 +217,16 @@ SGD_WARM_START="${BENCH_SGD_WARM_START:-}"   # optional path to an MU model .pt 
 # NCCL is broken and you need numbers); `nccl` refuses to fall back silently,
 # which is what you want when a benchmark's timings must be NCCL timings.
 SGD_COMM_BACKEND="${BENCH_SGD_COMM_BACKEND:-auto}"
-# Ablation over optimizer / parametrization / lr on one small combo. These use
+# nnz per logged error (--sgd-eval-sample): the in-loop errors use a fixed
+# sample of this size, and one exact error is computed at the end (that is the
+# value recorded). An exact error costs about as much as a whole run of
+# training at order 4, rank 100. 0 = exact at every log step (the old way).
+SGD_EVAL_SAMPLE="${BENCH_SGD_EVAL_SAMPLE:-1000000}"
+if ! [[ "$SGD_EVAL_SAMPLE" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: BENCH_SGD_EVAL_SAMPLE must be a non-negative integer, got '$SGD_EVAL_SAMPLE'" >&2
+    exit 2
+fi
+# Ablation over learning rate / batch size on one small combo. These use
 # suffixed keys, so they appear as extra rows (n/a against MU sessions).
 RUN_VARIANTS="${BENCH_RUN_VARIANTS:-false}"
 
@@ -219,7 +243,7 @@ fi
 # --- UTT knob: core-step exponent (float or "auto"); empty = code default (1).
 UTT_CORE_POWER="${BENCH_UTT_CORE_POWER:-}"
 
-if [[ "$SOLVER" == "sgd" ]]; then
+if [[ "$IS_SGD" == "true" ]]; then
     ITERATIONS="${BENCH_ITERATIONS:-20}"
     # Reconstruction-error cadence (--rec-log-every). Deliberately > 1, unlike
     # MU, because the two solvers spend their time in different places: the exact
@@ -228,13 +252,12 @@ if [[ "$SOLVER" == "sgd" ]]; then
     # the SGD_STEPS_PER_ITER optimizer steps only touch
     # SGD_STEPS_PER_ITER * SGD_BATCH_SIZE entries (409,600 at the defaults), so
     # at --rec-log-every 1 the benchmark would be timing full_relative_error, not
-    # the solver. Keep LOG_EVERY a divisor of ITERATIONS: rec_errors only
-    # receives samples at the log cadence, and the summary/notebook read
-    # rec_errors[-1], so a non-divisor silently reports an intermediate iterate
-    # as the final one.
+    # the solver. (SGD_EVAL_SAMPLE makes these in-loop errors cheap.) Keep
+    # LOG_EVERY a divisor of ITERATIONS: rec_errors only receives samples at the
+    # log cadence, so a non-divisor reports an intermediate iterate as the last.
     LOG_EVERY="${BENCH_LOG_EVERY:-5}"
     SEM_CHECK_EVERY="$ITERATIONS"
-    RUN_PREFIX="bench_sgd_"
+    [[ "$SOLVER" == "sgd-tt" ]] && RUN_PREFIX="bench_sgdtt_" || RUN_PREFIX="bench_sgd_"
 elif [[ "$SOLVER" == "cp" ]]; then
     # Same cadence as MU: one sweep per iteration, so the rows line up 1:1.
     ITERATIONS="${BENCH_ITERATIONS:-4}"
@@ -264,7 +287,7 @@ BENCHMARK_JSON="${BENCH_JSON:-$DATA_DIR/benchmarking/benchmark.json}"
 mkdir -p "$(dirname "$BENCHMARK_JSON")"
 
 if (( N_GPUS > 1 )); then
-    if [[ "$SOLVER" == "sgd" ]]; then
+    if [[ "$IS_SGD" == "true" ]]; then
         echo "WARNING: N_GPUS=$N_GPUS — the sharded SGD path (ShardedSGDTrainer) will be taken;" >&2
         echo "         timings are not comparable to single-GPU runs, and the effective batch" >&2
         echo "         is SGD_BATCH_SIZE per shard." >&2
@@ -274,15 +297,16 @@ if (( N_GPUS > 1 )); then
 fi
 
 [[ -n "$NAME" ]] && echo "benchmark name:   $NAME"
-echo "benchmark config: variant=$SOLVER method=$METHOD dim=$DIM n_gpus=$N_GPUS iterations=$ITERATIONS init=$([[ "$SOLVER" == "sgd" ]] && echo random || echo "$INIT")"
+echo "benchmark config: variant=$SOLVER method=$METHOD dim=$DIM n_gpus=$N_GPUS iterations=$ITERATIONS init=$([[ "$IS_SGD" == "true" ]] && echo random || echo "$INIT")"
 if (( MAX_SECONDS_PER_DECOMP > 0 )); then
     echo "                  per-run limit=${MAX_SECONDS_PER_DECOMP}s (killed and recorded TIMEOUT on expiry)"
 else
     echo "                  per-run limit=off"
 fi
 echo "                  datasets=[${DATASETS[*]}] ranks=[${RANKS[*]}] divergences=[${DIVERGENCES[*]}]"
-if [[ "$SOLVER" == "sgd" ]]; then
-    echo "                  sgd=$SGD_OPTIMIZER/$SGD_PARAMETRIZATION lr=$SGD_LR bs=$SGD_BATCH_SIZE steps/iter=$SGD_STEPS_PER_ITER"
+if [[ "$IS_SGD" == "true" ]]; then
+    echo "                  sgd=adam/$SGD_PARAMETRIZATION lr=$SGD_LR bs=$SGD_BATCH_SIZE steps/iter=$SGD_STEPS_PER_ITER eval_sample=$SGD_EVAL_SAMPLE"
+    [[ "$SOLVER" == "sgd-tt" ]] && echo "                  model=Tucker-TT hybrid, tt_rank=$TT_RANK"
     if (( N_GPUS > 1 )); then
         echo "                  comm_backend=$SGD_COMM_BACKEND (resolved backend is logged per run)"
     fi
@@ -291,7 +315,7 @@ elif [[ "$SOLVER" == "cp" ]]; then
 elif [[ "$SOLVER" == "tt" ]]; then
     echo "                  tt=Tucker-TT hybrid, tt_rank=$TT_RANK (KL only)"
 elif [[ "$SOLVER" == "utt" ]]; then
-    echo "                  utt=EXPERIMENTAL shared-core TT, tt_rank=$TT_RANK core_power=${UTT_CORE_POWER:-1} (KL only, all modes tied)"
+    echo "                  utt=shared-core TT, tt_rank=$TT_RANK core_power=${UTT_CORE_POWER:-1} (KL only, all modes tied)"
 fi
 echo "                  results -> $BENCHMARK_JSON"
 
@@ -351,6 +375,7 @@ if fitness_files:
 decomp_time_ms = None
 solve_time_ms = None
 iter_seconds = []
+final_error = None  # exact final error (SGD with --sgd-eval-sample logs a sampled curve)
 timing_error = None
 if not timing_files:
     timing_error = f"no {run_name}_*_timing.json in {decomp_dir}"
@@ -365,6 +390,7 @@ else:
         if solve_seconds is not None:
             solve_time_ms = int(float(solve_seconds) * 1000)
         iter_seconds = timing.get('iter_seconds') or []
+        final_error = timing.get('final_error')
         if solve_time_ms is None:
             timing_error = f"{timing_files[0]} has no solve_seconds (stale tensormet install?)"
     except Exception as exc:
@@ -379,6 +405,7 @@ results[key] = {
     "solve_time_ms": solve_time_ms,
     "iter_seconds": iter_seconds,
     "timing_error": timing_error,
+    "final_error": final_error,
     "rec_errors": rec_errors,
     "fitness": fitness
 }
@@ -443,12 +470,12 @@ _dataset_shape() {
     [[ "$SOLVER" == "utt" ]] && SHARED_FACTORS="all"
 }
 
-# _build_args <dataset> <rank> <div> <subsample> <optimizer> <param> <lr> <batch>
+# _build_args <dataset> <rank> <div> <subsample> <param> <lr> <batch>
 # Fills the global NNT_ARGS array: shared flags first, then the solver-specific
 # tail. Only the tail differs between MU and SGD.
 _build_args() {
     local dataset="$1" rank="$2" div="$3" subsample="$4"
-    local optimizer="$5" parametrization="$6" lr="$7" batch="$8"
+    local parametrization="$5" lr="$6" batch="$7"
 
     NNT_ARGS=(
         --dataset "$dataset"
@@ -463,7 +490,6 @@ _build_args() {
         --checkpoint-saving-steps 0
         --max-cpu-frac 0.8
         --sem-error-type all
-        --return-errors full
         --rec-log-every "$LOG_EVERY"
         --sem-check-every "$SEM_CHECK_EVERY"
         --shared-factors "$SHARED_FACTORS"
@@ -472,18 +498,22 @@ _build_args() {
         --random-state 1
     )
 
-    if [[ "$SOLVER" == "sgd" ]]; then
+    if [[ "$IS_SGD" == "true" ]]; then
+        # --subsample-frac 1.0 is explicit: the config default is 0.025 (since
+        # 2026-09-15), and SGD refuses anything below 1.
         NNT_ARGS+=(
             --solver sgd
             --objective full
+            --subsample-frac 1.0
             --init random
             --sgd-lr "$lr"
             --sgd-batch-size "$batch"
-            --sgd-optimizer "$optimizer"
             --sgd-parametrization "$parametrization"
             --sgd-steps-per-iteration "$SGD_STEPS_PER_ITER"
             --sgd-comm-backend "$SGD_COMM_BACKEND"
         )
+        (( SGD_EVAL_SAMPLE > 0 )) && NNT_ARGS+=(--sgd-eval-sample "$SGD_EVAL_SAMPLE")
+        [[ "$SOLVER" == "sgd-tt" ]] && NNT_ARGS+=(--decomposition tt --tt-rank "$TT_RANK")
         [[ -n "$SGD_WARM_START" ]] && NNT_ARGS+=(--sgd-warm-start "$SGD_WARM_START")
     elif [[ "$SOLVER" == "cp" ]]; then
         # No --largedim / --normalize-factors: see the header note.
@@ -513,18 +543,18 @@ _build_args() {
         )
     fi
 
-    # Same init for every variant; sgd sets its own (random) above.
-    [[ "$SOLVER" != "sgd" ]] && NNT_ARGS+=(--init "$INIT")
+    # Same init for every variant; sgd and sgd-tt set their own (random) above.
+    [[ "$IS_SGD" != "true" ]] && NNT_ARGS+=(--init "$INIT")
 }
 
-# _run_one <key> <dataset> <rank> <div> [subsample] [optimizer] [param] [lr] [batch]
+# _run_one <key> <dataset> <rank> <div> [subsample] [param] [lr] [batch]
 # Trailing SGD knobs default to the script-level config; the ablation loop
 # overrides them per variant.
 _run_one() {
     local key="$1" dataset="$2" rank="$3" div="$4"
     local subsample_override="${5:-}"
-    local optimizer="${6:-$SGD_OPTIMIZER}" parametrization="${7:-$SGD_PARAMETRIZATION}"
-    local lr="${8:-$SGD_LR}" batch="${9:-$SGD_BATCH_SIZE}"
+    local parametrization="${6:-$SGD_PARAMETRIZATION}"
+    local lr="${7:-$SGD_LR}" batch="${8:-$SGD_BATCH_SIZE}"
     local decomp_dir="$DATA_DIR/tensors/$dataset/decomposition"
 
     _dataset_shape "$dataset"
@@ -532,10 +562,10 @@ _run_one() {
     RUN_NAME="${RUN_PREFIX}${key}"
 
     _build_args "$dataset" "$rank" "$div" "$SUBSAMPLE" \
-        "$optimizer" "$parametrization" "$lr" "$batch"
+        "$parametrization" "$lr" "$batch"
 
-    if [[ "$SOLVER" == "sgd" ]]; then
-        echo -e "\n\n\n>>> [$key] (solver=sgd opt=$optimizer param=$parametrization lr=$lr bs=$batch)"
+    if [[ "$IS_SGD" == "true" ]]; then
+        echo -e "\n\n\n>>> [$key] (solver=$SOLVER param=$parametrization lr=$lr bs=$batch)"
     elif [[ "$SOLVER" == "cp" ]]; then
         echo -e "\n\n\n>>> [$key] (solver=cp subsample=$SUBSAMPLE inner_iters=$CP_INNER_ITERS)"
     elif [[ "$IS_TT_FAMILY" == "true" ]]; then
@@ -582,7 +612,7 @@ _run_one() {
 for dataset in "${DATASETS[@]}"; do
     for rank in "${RANKS[@]}"; do
         for div in "${DIVERGENCES[@]}"; do
-            if [[ "$SOLVER" == "sgd" ]]; then
+            if [[ "$IS_SGD" == "true" ]]; then
                 _run_one "${dataset}__rank${rank}__${div}__nosub" "$dataset" "$rank" "$div"
             else
                 _run_one "${dataset}__rank${rank}__${div}" "$dataset" "$rank" "$div"
@@ -605,7 +635,7 @@ _extra_configs=(
     "4-gram-raw-bos-eos-fineweb-en_1B|50|fr|0.0025|ss0.0025"
 )
 
-if [[ "$SOLVER" != "sgd" && "$RUN_EXTRA" == "true" ]]; then
+if [[ "$IS_SGD" != "true" && "$RUN_EXTRA" == "true" ]]; then
     for config in "${_extra_configs[@]}"; do
         IFS='|' read -r dataset rank div subsample suffix <<< "$config"
         # Only the enabled divergences (this also keeps fr away from TT/UTT).
@@ -616,21 +646,19 @@ if [[ "$SOLVER" != "sgd" && "$RUN_EXTRA" == "true" ]]; then
 fi
 
 
-# --- SGD: optimizer / parametrization / lr ablation (SGD-only rows) ----------
-# dataset|rank|div|optimizer|parametrization|lr|batch|suffix
+# --- SGD: parametrization / lr / batch ablation (SGD-only rows) ---------------
+# dataset|rank|div|parametrization|lr|batch|suffix
 _variant_configs=(
-    "fineweb-en|10|kl|sgd|softplus|1e-2|4096|plainsgd"
-    "fineweb-en|10|kl|adam|clamp|1e-2|4096|clamp"
-    "fineweb-en|10|kl|adam|softplus|1e-3|4096|lr1e-3"
-    "fineweb-en|10|kl|adam|softplus|1e-2|16384|bs16k"
+    "fineweb-en|10|kl|softplus|1e-3|4096|lr1e-3"
+    "fineweb-en|10|kl|softplus|1e-2|16384|bs16k"
 )
 
 if [[ "$SOLVER" == "sgd" && "$RUN_VARIANTS" == "true" ]]; then
     for config in "${_variant_configs[@]}"; do
-        IFS='|' read -r dataset rank div optimizer parametrization lr batch suffix <<< "$config"
+        IFS='|' read -r dataset rank div parametrization lr batch suffix <<< "$config"
         _run_one "${dataset}__rank${rank}__${div}__nosub__${suffix}" \
             "$dataset" "$rank" "$div" "" \
-            "$optimizer" "$parametrization" "$lr" "$batch"
+            "$parametrization" "$lr" "$batch"
     done
 fi
 
@@ -669,7 +697,10 @@ for key, val in results.items():
     if val in ('CRASH', 'TIMEOUT'):
         print(f'  {key:<65} {val}')
     else:
-        final_rec = val['rec_errors'][-1] if val['rec_errors'] else float('nan')
+        if val.get('final_error') is not None:
+            final_rec = val['final_error']
+        else:
+            final_rec = val['rec_errors'][-1] if val['rec_errors'] else float('nan')
         final_sem = val['fitness'][-1].get('simlex_all_rho', float('nan')) if val['fitness'] else float('nan')
 
         total_str = fmt(val['runtime_ms'])
@@ -689,7 +720,7 @@ PYEOF
 
 # Append results to benchmark.json (one file for both solvers, tagged by session)
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-SGD_META="$(printf '%s|%s|%s|%s|%s' "$SGD_OPTIMIZER" "$SGD_PARAMETRIZATION" "$SGD_LR" "$SGD_BATCH_SIZE" "$SGD_STEPS_PER_ITER")"
+SGD_META="$(printf '%s|%s|%s|%s|%s' "$SGD_PARAMETRIZATION" "$SGD_LR" "$SGD_BATCH_SIZE" "$SGD_STEPS_PER_ITER" "$SGD_EVAL_SAMPLE")"
 CP_META="$(printf '%s|%s' "$CP_INNER_ITERS" "$CP_SCOOCH_KAPPA")"
 python3 - "$TIMESTAMP" "$N_GPUS" "$TMPJSON" "$BENCHMARK_JSON" "$SOLVER" "$METHOD" "$SGD_META" "$NAME" "$CP_META" "$TT_RANK" "${UTT_CORE_POWER:-1}" "$INIT" <<'PYEOF'
 import json, sys
@@ -712,11 +743,15 @@ entry = {
 if name:
     entry["name"] = name
 # Older sessions carry no 'init' key; they all ran random.
-if solver != "sgd" and init != "random":
+if solver not in ("sgd", "sgd-tt") and init != "random":
     entry["init"] = init
-if solver == "sgd":
-    optimizer, parametrization, lr, batch_size, steps = sgd_meta.split("|")
-    entry["sgd_config"] = f"{optimizer}/{parametrization} lr={lr} bs={batch_size} steps/iter={steps}"
+if solver in ("sgd", "sgd-tt"):
+    parametrization, lr, batch_size, steps, eval_sample = sgd_meta.split("|")
+    entry["sgd_config"] = f"adam/{parametrization} lr={lr} bs={batch_size} steps/iter={steps}"
+    if eval_sample != "0":
+        entry["sgd_config"] += f" eval_sample={eval_sample}"
+if solver == "sgd-tt":
+    entry["tt_config"] = f"tt_rank={tt_rank}"
 elif solver == "cp":
     inner_iters, scooch_kappa = cp_meta.split("|")
     entry["cp_config"] = f"inner_iters={inner_iters} scooch_kappa={scooch_kappa}"

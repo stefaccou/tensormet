@@ -69,7 +69,7 @@ core keeps working at orders where it fits.
 | file                   | contents |
 |------------------------|----------|
 | `tt_chain.py`          | the chain algebra: site matrices, left/right environments, `site_grad`, `contract`, `to_dense_core`, `bond_dims`. Backend-generic (`xp` = cupy / numpy / torch) — only two-operand einsums, which all three spell alike |
-| `tt_ops.py`            | KL MU kernels: factor update, pooled tied-factor update, sequential core sweep, error, init |
+| `tt_ops.py`            | KL MU kernels: the NNZ passes (`factor_pass`, `core_pass`, `error_pass`, one body each), closed-form denominators and steps, then the pooled tied-factor update (an untied factor is `group=[mode]`), core sweep, error, init |
 | `tt_sharded.py`        | multi-GPU (`n_gpus > 1`) counterparts of those kernels: per-shard NNZ workers + their orchestrators |
 | `tt_routing.py`        | `get_tt_update_routing_step` / `get_sharded_tt_update_routing_step` — builds the `UpdateRouting` the Tucker loop consumes |
 | `tt_decomposition.py`  | `TuckerTTDecomposition`, the eval/inspection wrapper — a `TuckerDecomposition` subclass that overrides only the core contractions |
@@ -191,9 +191,9 @@ artifact filenames are unchanged. Where this family touches the package:
    `TuckerTTDecomposition` for `"tt"`, and `_fixed_role_matrix` is the hook
    `get_top_combinations` overrides
 7. `launch.py` — container-aware final save + notify text
-8. `sharded_sparse.py` — `ShardedSparseTensor.tt_factor_update` /
-   `tt_tied_factor_update` / `tt_core_update` / `tt_compute_errors`, four lazy
-   delegates alongside the CP ones (nothing else in that module knows about TT)
+8. `sharded_sparse.py` — nothing: `tt_sharded.py` reads the shards, devices, subsample
+   window and thread pool off the `ShardedSparseTensor` directly (the four `tt_*`
+   delegates were removed 2026-11-12)
 9. `inspect_tucker.py` — `_TT_STEM_RE`, `_tt_rank_from_stem`, and `"tt"` from
    `_decomp_from_stem`, so the run browser labels TT runs with their bond
 

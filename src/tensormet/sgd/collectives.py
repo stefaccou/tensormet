@@ -12,7 +12,6 @@ Backends
 ``HostReduce``         Pinned host staging; fallback when NCCL or peer access
                        is missing. Costs ``(G-1) x buffer`` pinned bytes,
                        allocated once per ``(numel, dtype)``.
-``SingleDevice``       No-op, for G == 1.
 """
 from __future__ import annotations
 
@@ -37,19 +36,6 @@ class Collective:
     def all_reduce(self, tensors: Sequence[torch.Tensor]) -> None:
         """``tensors[g]`` lives on ``devices[g]``; all become the sum."""
         raise NotImplementedError
-
-
-class SingleDevice(Collective):
-    """G == 1: the reduction is a no-op."""
-
-    def __init__(self, device: torch.device):
-        self.devices = [torch.device(device)]
-
-    def all_reduce(self, tensors: Sequence[torch.Tensor]) -> None:
-        return
-
-    def __repr__(self) -> str:
-        return f"SingleDevice({self.devices[0]})"
 
 
 class NcclSingleProcess(Collective):
@@ -218,7 +204,7 @@ def make_collective(
     ``backend``:
       ``"auto"``  NCCL when it is available, the devices have a full
                   peer-access mesh, *and* a probe all-reduce actually succeeds;
-                  ``HostReduce`` otherwise; ``SingleDevice`` for G == 1.
+                  ``HostReduce`` otherwise.
       ``"nccl"``  force NCCL (raises if unavailable or if the probe fails — a
                   silent fall back to the slow path would quietly explain away
                   a bad benchmark).
@@ -229,8 +215,8 @@ def make_collective(
         raise ValueError(
             f"sgd_comm_backend must be 'auto', 'nccl' or 'host'; got {backend!r}"
         )
-    if len(devs) == 1:
-        return SingleDevice(devs[0])
+    if len(devs) < 2:
+        raise ValueError("a collective needs >= 2 devices; one device needs no reduction.")
     if any(d.type != "cuda" for d in devs):
         raise ValueError(f"multi-device collectives need CUDA devices; got {devs}")
 
@@ -265,7 +251,6 @@ def make_collective(
 
 __all__ = [
     "Collective",
-    "SingleDevice",
     "NcclSingleProcess",
     "HostReduce",
     "make_collective",

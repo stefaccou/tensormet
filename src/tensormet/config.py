@@ -21,23 +21,6 @@ def _as_dim_tuple(dim) -> tuple:
     return tuple(dim)
 
 
-def _sgd_trajectory_depends_on_n_gpus(exp) -> bool:
-    """True when an SGD run's update sequence is a function of ``n_gpus``.
-
-    The multi-GPU SGD defaults make it so: ``sgd_batch_scope="per_device"``
-    scales the effective batch with the device count, and ``sgd_sync_every > 1``
-    averages parameters across whatever devices exist. Either one means a
-    checkpoint written at G devices does not continue the same trajectory at
-    G'. Under the old settings (``"global"`` scope, sync every step) it does,
-    and MU never depended on this at all — hence the narrow predicate rather
-    than putting ``n_gpus`` in the key unconditionally.
-    """
-    if getattr(exp, "solver", "mu") != "sgd":
-        return False
-    return (getattr(exp, "sgd_batch_scope", "per_device") != "global"
-            or int(getattr(exp, "sgd_sync_every", 1)) > 1)
-
-
 def parse_ngram_order(type_str: str) -> Optional[int]:
     """Parse a single n-gram type string like '3gram', '3-gram' → n (int).
 
@@ -117,7 +100,6 @@ class TrainingConfig:
     warmup_steps: int = 1
     patience: int = 5
     verbose: bool = True
-    return_errors: str = "full"
     largedim: bool = False
     checkpoint_saving_steps: int = 0
     resume: bool = False
@@ -189,11 +171,11 @@ class ExperimentConfig:
     cp_scooch_kappa: float = 0.0
     # TT only: uniform bond dimension, capped per cut by the exact TT rank.
     tt_rank: int = 100
-    # UTT only (EXPERIMENTAL shared-core TT): exponent of the core MU step;
+    # UTT only (shared-core TT): exponent of the core MU step;
     # None = 1 (undamped), "auto" = backtracking in [1/order, 1].
     # Not part of the stem or the resume check.
     utt_core_power: Optional[Union[float, str]] = None
-    # init="svd_stream" only (EXPERIMENTAL): power iterations and extra sketch columns
+    # init="svd_stream" only: power iterations and extra sketch columns
     # of the randomized SVD; None = 2 and 10. Part of the init cache key, not of the stem.
     svd_power_iter: Optional[int] = None
     svd_oversampling: Optional[int] = None
@@ -207,18 +189,12 @@ class ExperimentConfig:
     solver: str = "mu"
     # SGD-only knobs. One loop iteration = sgd_steps_per_iteration steps.
     sgd_lr: float = 1e-2
-    sgd_batch_size: int = 4096
-    sgd_optimizer: str = "adam"            # "adam" | "sgd"
-    sgd_parametrization: str = "softplus"  # "softplus" | "clamp" | "exp"
+    sgd_batch_size: int = 4096             # entries per step, on every GPU
+    sgd_parametrization: str = "softplus"  # "softplus" | "exp"
     sgd_steps_per_iteration: int = 100
     sgd_warm_start: Optional[str] = None   # MU model .pt used as init (not resume)
     sgd_regauge_every: int = 1             # TT/utt: iterations between gauge resets; 0 = off
-    # Multi-GPU SGD knobs (see sgd/README.md). Only batch_scope and sync_every
-    # change the trajectory, and hence resume compatibility.
-    sgd_batch_scope: str = "per_device"    # "per_device" | "global"
-    sgd_sync_every: int = 1                # local steps between parameter averages
     sgd_micro_batch: Optional[int] = None  # entries per fwd/bwd; None = rank-derived
-    sgd_cuda_graph: bool = False           # capture the step body as a CUDA graph
     sgd_comm_backend: str = "auto"         # "auto" | "nccl" | "host"
     sgd_eval_sample: Optional[int] = None  # fixed nnz subset per logged error; None = exact
 
@@ -403,6 +379,8 @@ class RunConfig:
                     old_exp.get("init") == self.exp.init and
                     old_exp.get("tt_core_init", "random") ==
                     getattr(self.exp, "tt_core_init", "random") and
+                    old_exp.get("utt_core_power") ==
+                    getattr(self.exp, "utt_core_power", None) and
                     int(old_exp.get("random_state", 1)) == int(self.exp.random_state) and
                     _canonical_shared_factors(old_exp.get("shared_factors")) ==
                     _canonical_shared_factors(self.exp.shared_factors) and
@@ -428,8 +406,6 @@ class RunConfig:
                     float(getattr(self.exp, "sgd_lr", 1e-2)) and
                     int(old_exp.get("sgd_batch_size", 4096)) ==
                     int(getattr(self.exp, "sgd_batch_size", 4096)) and
-                    old_exp.get("sgd_optimizer", "adam") ==
-                    getattr(self.exp, "sgd_optimizer", "adam") and
                     old_exp.get("sgd_parametrization", "softplus") ==
                     getattr(self.exp, "sgd_parametrization", "softplus") and
                     int(old_exp.get("sgd_steps_per_iteration", 100)) ==
@@ -439,27 +415,17 @@ class RunConfig:
                     # TT/utt gauge resets change the raw parameters Adam sees.
                     int(old_exp.get("sgd_regauge_every", 1)) ==
                     int(getattr(self.exp, "sgd_regauge_every", 1)) and
-                    # Multi-GPU SGD trajectory knobs. Only these two change the
-                    # sequence of parameter updates; sgd_micro_batch,
-                    # sgd_cuda_graph and sgd_comm_backend are memory/dispatch
-                    # transformations that leave the mathematics alone, and
+                    # sgd_micro_batch and sgd_comm_backend are memory/dispatch
+                    # choices that leave the mathematics alone, and
                     # sgd_eval_sample only changes what gets *measured* (like
                     # rec_check_every, which is also not in the identity), so
                     # they are deliberately NOT part of the identity — you may
                     # change any of them on resume.
-                    old_exp.get("sgd_batch_scope", "per_device") ==
-                    getattr(self.exp, "sgd_batch_scope", "per_device") and
-                    int(old_exp.get("sgd_sync_every", 1)) ==
-                    int(getattr(self.exp, "sgd_sync_every", 1)) and
-                    # ...and n_gpus itself, but ONLY when the SGD trajectory
-                    # actually depends on it: with per-device batching the
-                    # effective batch is n_gpus x sgd_batch_size, and with local
-                    # steps the averaging cadence is per-device. Under
-                    # batch_scope="global" + sync_every=1 the old "resume across
-                    # any n_gpus" promise still holds, and MU (which has always
-                    # tolerated an n_gpus change) is untouched.
+                    # n_gpus matters for SGD: every GPU samples sgd_batch_size
+                    # entries, so the effective batch is n_gpus x sgd_batch_size.
+                    # MU has always tolerated an n_gpus change.
                     (int(old_train.get("n_gpus", 1)) == int(self.train.n_gpus)
-                     if _sgd_trajectory_depends_on_n_gpus(self.exp) else True)
+                     if getattr(self.exp, "solver", "mu") == "sgd" else True)
             )
 
             print(old_exp.get("dataset"), self.exp.dataset, "\t",

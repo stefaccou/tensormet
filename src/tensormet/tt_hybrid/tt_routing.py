@@ -4,16 +4,19 @@ tt_routing.py — UpdateRouting construction for the Tucker-TT hybrid.
 EXPERIMENTAL. Maps the TT kernels onto the ``UpdateRouting`` contract the
 Tucker training loop already consumes:
 
-    factor_update      → TT factor MU kernel
-    core_update        → sequential MU sweep over the TT cores
-    error_fn           → TT KL error / null_compute_errors
-    core_returns_error → always False (there is no fused FR variant here)
+    factor_update       → the tied update with ``group=[mode]``
+    tied_factor_update  → pooled TT factor MU kernel
+    core_update         → sequential MU sweep over the TT cores
+    error_fn            → TT KL error / null_compute_errors
+    core_returns_error  → always False (there is no fused FR variant here)
 
 The hybrid has a single NNZ-streaming kernel family, so Tucker's
 dense-vs-largedim split (``needs_largedim``) does not apply. Imported lazily
 from ``tensormet.routing`` only when a run asks for ``decomposition == "tt"``.
 """
 from __future__ import annotations
+
+from functools import partial
 
 from tensormet.distance import null_compute_errors
 from tensormet.routing import Divergence, UpdateRouting
@@ -23,14 +26,18 @@ from tensormet.tt_hybrid.tt_ops import (
 )
 
 
-def get_tt_update_routing_step(divergence: Divergence, log_step: bool) -> UpdateRouting:
-    """Return the Tucker-TT update functions for one training step."""
+def _require_kl(divergence):
     if divergence != "kl":
         raise NotImplementedError(
             f"decomposition='tt' implements the KL/Poisson divergence only; got "
             f"{divergence!r}. The Frobenius denominator needs a doubled (Gram-weighted) "
             f"chain — see README.md, 'Not implemented'."
         )
+
+
+def get_tt_update_routing_step(divergence: Divergence, log_step: bool) -> UpdateRouting:
+    """Return the Tucker-TT update functions for one training step."""
+    _require_kl(divergence)
     return UpdateRouting(
         factor_update=tt_kl_factor_update,
         core_update=tt_kl_core_update,
@@ -52,55 +59,22 @@ def get_sharded_tt_update_routing_step(sst, divergence: Divergence,
     per-site MU over the NNZ (see tt_sharded.py). The cores are still mutated on
     the primary, so ``core`` stays the loop's live list either way.
     """
-    if divergence != "kl":
-        raise NotImplementedError(
-            f"decomposition='tt' implements the KL/Poisson divergence only; got "
-            f"{divergence!r}. The Frobenius denominator needs a doubled (Gram-weighted) "
-            f"chain — see README.md, 'Not implemented'."
-        )
+    _require_kl(divergence)
+    from tensormet.tt_hybrid.tt_sharded import (
+        sharded_tt_core_update, sharded_tt_kl_error, sharded_tt_tied_factor_update,
+    )
 
-    def _factor_update(vec_tensor, core, factors, mode, shape,
-                       thread_budget=None, epsilon=1e-12, verbose=False,
-                       batch_nnz=None):
-        return sst.tt_factor_update(
-            core=core, factors=factors, mode=mode, shape=shape,
-            thread_budget=thread_budget, epsilon=epsilon, verbose=verbose,
-            batch_nnz=batch_nnz,
-        )
+    tied = partial(sharded_tt_tied_factor_update, sst)
 
-    def _tied_factor_update(vec_tensor, core, factors, group, shape,
-                            thread_budget=None, epsilon=1e-12, verbose=False,
-                            batch_nnz=None):
-        return sst.tt_tied_factor_update(
-            core=core, factors=factors, group=group, shape=shape,
-            thread_budget=thread_budget, epsilon=epsilon, verbose=verbose,
-            batch_nnz=batch_nnz,
-        )
-
-    def _core_update(vec_tensor, shape, core, factors, modes=None,
-                     thread_budget=None, epsilon=1e-12, verbose=False,
-                     batch_nnz=None):
-        return sst.tt_core_update(
-            shape=shape, core=core, factors=factors, modes=modes,
-            thread_budget=thread_budget, epsilon=epsilon, verbose=verbose,
-            batch_nnz=batch_nnz,
-        )
-
-    def _error_fn(vec_tensor, shape, core, factors,
-                  thread_budget=None, epsilon=1e-12, verbose=False,
-                  batch_nnz=None):
-        return sst.tt_compute_errors(
-            shape=shape, core=core, factors=factors,
-            thread_budget=thread_budget, epsilon=epsilon, verbose=verbose,
-            batch_nnz=batch_nnz,
-        )
+    def factor_update(core, factors, mode, shape, **kwargs):
+        return tied(core=core, factors=factors, group=[mode], shape=shape, **kwargs)
 
     return UpdateRouting(
-        factor_update=_factor_update,
-        core_update=_core_update,
-        error_fn=_error_fn if log_step else null_compute_errors,
+        factor_update=factor_update,
+        core_update=partial(sharded_tt_core_update, sst),
+        error_fn=partial(sharded_tt_kl_error, sst) if log_step else null_compute_errors,
         core_returns_error=False,
-        tied_factor_update=_tied_factor_update,
+        tied_factor_update=tied,
     )
 
 

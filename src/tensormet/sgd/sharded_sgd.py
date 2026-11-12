@@ -9,11 +9,10 @@ Each device holds a contiguous NNZ shard with its own ``EntryBatcher``, a full
 model replica, optimizer and ``GradStepper``; device 0's is ``self.master`` /
 ``self.opt`` and is what gets checkpointed.
 
-Per step (``sync_every == 1``): each device backprops its sampled loss (the
-exact zero-entry term only on device 0), one all-reduce sums the gradients,
-and every device steps on the same sum, so replicas stay bit-identical.
-With ``sync_every == K > 1``: K local steps (each device adds the full
-zero-entry term), then parameter averaging. See sgd/README.md.
+Per step: each device backprops its sampled loss (the exact zero-entry term
+only on device 0), one all-reduce sums the gradients, and every device steps on
+the same sum, so replicas stay bit-identical. Every device samples
+``batch_size`` entries per step. See sgd/README.md.
 """
 from __future__ import annotations
 
@@ -32,7 +31,6 @@ from tensormet.sgd.sgd_trainer import (
     checkpoint_payload,
     coalesced_input,
     loss_norm_const,
-    make_optimizer,
     make_sgd_model,
 )
 from tensormet.sgd.sgd_tucker import (
@@ -60,7 +58,6 @@ class ShardedSGDTrainer:
         objective: str = "full",
         lr: float = 1e-2,
         batch_size: int = 4096,
-        optimizer: str = "adam",
         parametrization: str = "softplus",
         shared_factors=None,
         init: Union[str, Tuple] = "random",
@@ -70,10 +67,7 @@ class ShardedSGDTrainer:
         dtype: torch.dtype = torch.float32,
         eval_chunk: Optional[int] = None,
         eval_sample: Optional[int] = None,
-        batch_scope: str = "per_device",
-        sync_every: int = 1,
         micro_batch: Optional[int] = None,
-        cuda_graph: bool = False,
         comm_backend: str = "auto",
         resume_payload: Optional[dict] = None,
         decomposition: str = "tucker",
@@ -83,15 +77,8 @@ class ShardedSGDTrainer:
         self.steps_per_iteration = check_common_args(objective, steps_per_iteration)
         if divergence not in ("kl", "fr"):
             raise ValueError(f"divergence must be 'kl' or 'fr', got {divergence!r}")
-        if batch_scope not in ("per_device", "global"):
-            raise ValueError(
-                "batch_scope must be 'per_device' (batch_size entries on EVERY "
-                f"device) or 'global' (batch_size split across them); got {batch_scope!r}"
-            )
         self.divergence = divergence
         self.masked = objective == "masked"
-        self.batch_scope = batch_scope
-        self.sync_every = max(1, int(sync_every))
         # Blocks between gauge resets (0 = never); a no-op for Tucker.
         self.regauge_every = max(0, int(regauge_every))
 
@@ -126,19 +113,14 @@ class ShardedSGDTrainer:
         ]
         self.master = self._models[0]
         self.replicas = self._models[1:]
-        # Before anything runs a matmul or a backward concurrently, including
-        # the CUDA-graph capture below.
+        # Before anything runs a matmul or a backward concurrently.
         self._warm_up_devices(dtype)
 
         # Contiguous NNZ shards, one per device, with per-shard batchers seeded
-        # like sharded_sparse (base * 1000 + shard).
+        # like sharded_sparse (base * 1000 + shard). G devices sample
+        # G x batch_size entries per step.
         bounds = np.linspace(0, self.nnz, n_shards + 1, dtype=np.int64)
-        if batch_scope == "per_device":
-            # G devices sample G x batch_size entries per step.
-            shard_batch = int(batch_size)
-        else:
-            shard_batch = max(1, int(batch_size) // n_shards)
-        self.shard_batch = shard_batch
+        self.shard_batch = int(batch_size)
         self.shard_indices: List[torch.Tensor] = []
         self.shard_values: List[torch.Tensor] = []
         self.batchers: List[EntryBatcher] = []
@@ -149,26 +131,18 @@ class ShardedSGDTrainer:
             self.shard_indices.append(indices_all[:, lo:hi].to(dev))
             self.shard_values.append(values_all[lo:hi].to(dev))
             nnz_g = hi - lo
-            batcher = EntryBatcher(nnz_g, shard_batch,
+            batcher = EntryBatcher(nnz_g, self.shard_batch,
                                    seed=int(random_state) * 1000 + g, device=dev)
             self.batchers.append(batcher)
-            if self.sync_every > 1:
-                # Local SGD: each device optimizes the FULL objective alone (scaled
-                # to the global nnz, with the zero-entry term); parameter
-                # averaging combines the devices.
-                scale = self.nnz / batcher.batch_size
-                include_zero = True
-            else:
-                # Gradients are summed every step: each device carries its own
-                # shard's nnz term and exactly one device carries the zero term.
-                scale = nnz_g / batcher.batch_size
-                include_zero = g == 0
+            # Gradients are summed every step: each device carries its own
+            # shard's nnz term and exactly one device carries the zero term.
+            scale = nnz_g / batcher.batch_size
             self.scales.append(scale)
             self.steppers.append(GradStepper(
                 self._models[g], self.shard_indices[g], self.shard_values[g],
                 batcher, scale=scale, divergence=divergence, masked=self.masked,
-                norm_const=self.norm_const, include_zero_term=include_zero,
-                micro_batch=micro_batch, cuda_graph=cuda_graph, eps=epsilon,
+                norm_const=self.norm_const, include_zero_term=g == 0,
+                micro_batch=micro_batch, eps=epsilon,
             ))
         self.micro_batch = self.steppers[0].micro_batch
 
@@ -193,7 +167,7 @@ class ShardedSGDTrainer:
         self.eval_sample = (None if all(s == 1.0 for s in self.eval_scales)
                             else sum(int(v.shape[0]) for v in self.eval_values))
 
-        self._opts = [make_optimizer(m.parameters(), optimizer, lr) for m in self._models]
+        self._opts = [torch.optim.Adam(m.parameters(), lr=lr) for m in self._models]
         self.opt = self._opts[0]
 
         # Printed, because 'auto' can fall back to HostReduce, which changes
@@ -216,10 +190,6 @@ class ShardedSGDTrainer:
         # as this object. A pool per step recycles thread IDs in Python 3.13 and
         # leaves stale cuBLAS handles (as documented in sharded_sparse).
         self._pool = ThreadPoolExecutor(max_workers=n_shards)
-
-        # One flat parameter vector per device for the sync_every averaging and
-        # the drift check; allocated on first use.
-        self._param_bufs: Optional[List[torch.Tensor]] = None
 
         if resume_payload is not None:
             self.load_payload(resume_payload)
@@ -284,25 +254,7 @@ class ShardedSGDTrainer:
                 for src, dst in pairs:
                     dst.copy_(src, non_blocking=True)
 
-    def _ensure_param_bufs(self) -> List[torch.Tensor]:
-        if self._param_bufs is None:
-            self._param_bufs = [s.new_param_buffer() for s in self.steppers]
-        return self._param_bufs
-
-    def _pack_params(self, g: int) -> None:
-        self.steppers[g].pack_params_(self._param_bufs[g])
-
-    def _unpack_scaled(self, g: int, factor: float) -> None:
-        self._param_bufs[g].mul_(factor)
-        self.steppers[g].unpack_params_(self._param_bufs[g])
-
-    def _average_params(self) -> None:
-        """all-reduce the parameters and divide by G (local-SGD averaging)."""
-        bufs = self._ensure_param_bufs()
-        self._fan_out(self._pack_params)
-        self.collective.all_reduce(bufs)
-        self._fan_out(self._unpack_scaled, 1.0 / len(self.devices))
-
+    @torch.no_grad()
     def _check_replica_drift(self) -> None:
         """Raise unless every device holds bit-identical parameters.
 
@@ -310,22 +262,18 @@ class ShardedSGDTrainer:
         they stay identical; this makes a violation loud. Exact comparison, at
         the log-step cadence.
         """
-        bufs = self._ensure_param_bufs()
-        self._fan_out(self._pack_params)
-        ref = bufs[0]
-        scratch = torch.empty_like(ref)
-        for g in range(1, len(self.devices)):
-            scratch.copy_(bufs[g])
-            if not torch.equal(ref, scratch):
-                n_bad = int((ref != scratch).sum())
-                raise RuntimeError(
-                    f"SGD replica drift: {n_bad} of {ref.numel()} parameters "
-                    f"differ between {self.devices[0]} and {self.devices[g]}. "
-                    "The replicas must stay bit-identical for the redundant "
-                    "optimizer step to be valid — this is a bug in the "
-                    "collective or a non-deterministic optimizer kernel, not "
-                    "a tuning issue."
-                )
+        replica_params = [dict(rep.named_parameters()) for rep in self.replicas]
+        for name, ref in self.master.named_parameters():
+            for g, params in enumerate(replica_params, start=1):
+                if not torch.equal(ref, params[name].to(ref.device)):
+                    raise RuntimeError(
+                        f"SGD replica drift: parameter {name!r} differs between "
+                        f"{self.devices[0]} and {self.devices[g]}. "
+                        "The replicas must stay bit-identical for the redundant "
+                        "optimizer step to be valid — this is a bug in the "
+                        "collective or a non-deterministic optimizer kernel, not "
+                        "a tuning issue."
+                    )
 
     # --- one loop iteration ---------------------------------------------------
 
@@ -334,38 +282,16 @@ class ShardedSGDTrainer:
 
     def _apply_step(self, g: int) -> None:
         self._opts[g].step()
-        self._models[g].project_()
 
     def _regauge(self, g: int) -> None:
         self._models[g].regauge_()
 
-    def _local_steps(self, g: int, first: int, n_steps: int) -> None:
-        stepper, opt, model = self.steppers[g], self._opts[g], self._models[g]
-        for step in range(first, first + n_steps):
-            stepper.compute_grads(step)
-            opt.step()
-            model.project_()
-
     def run_block(self, iteration: int, log_step: bool) -> Optional[float]:
         k = self.steps_per_iteration
-        first = iteration * k
-        end = first + k
-
-        if self.sync_every <= 1:
-            for step in range(first, end):
-                self._fan_out(self._grads_for, step)
-                self.collective.all_reduce([s.flat_grad for s in self.steppers])
-                self._fan_out(self._apply_step)
-        else:
-            # The sync cadence is clipped at the block boundary, so parameters
-            # are averaged before every eval and checkpoint. Pick
-            # steps_per_iteration as a multiple of sync_every.
-            step = first
-            while step < end:
-                n = min(self.sync_every, end - step)
-                self._fan_out(self._local_steps, step, n)
-                self._average_params()
-                step += n
+        for step in range(iteration * k, (iteration + 1) * k):
+            self._fan_out(self._grads_for, step)
+            self.collective.all_reduce([s.flat_grad for s in self.steppers])
+            self._fan_out(self._apply_step)
 
         # Replicas are identical here and the reset is deterministic, so they
         # stay identical after it.

@@ -418,7 +418,9 @@ def launch_nnt_decomposition(cfg):
         # distinct from total process runtime. solve_seconds is the summed
         # iteration time (updates + error kernels), decomp_seconds the full loop
         # (adds in-loop semantic evaluation), and runtime_seconds also includes
-        # data loading and sparse conversion.
+        # data loading and sparse conversion. final_error is exact even when SGD
+        # logged its curve on a sample (--sgd-eval-sample).
+        _final_error = tucker_decomp_info.get("final_error")
         with open(paths["timing_json"], "w") as f:
             json.dump(
                 {
@@ -426,6 +428,7 @@ def launch_nnt_decomposition(cfg):
                     "solve_seconds": tucker_decomp_info.get("solve_seconds"),
                     "iter_seconds": tucker_decomp_info.get("iter_seconds"),
                     "runtime_seconds": round(end_time - start_time, 2),
+                    "final_error": float(_final_error) if _final_error is not None else None,
                 },
                 f,
                 indent=2,

@@ -459,3 +459,46 @@ def ensure_vocab(vocab, sample, roles):
         ]
         clean_sample.append(tuple(cleaned))
     return clean_sample
+
+# SimLex-999 part-of-speech for the tensor's role names (first role per POS wins).
+SIMLEX_POS_MAP = {
+    "root": "V", "verb": "V",
+    "nsubj": "N", "obj": "N", "subject": "N", "object": "N",
+}
+SIMLEX_PATH = DATA_DIR / "corpora" / "SimLex-999.txt"
+
+
+def simlex_vectors(decomp, roles) -> dict:
+    """``{"N": {word: unit vector}, "V": ..., "A": ...}`` from a decomposition's
+    factors, as ``evaluate_simlex`` takes them.
+
+    A role whose name maps to a POS (``SIMLEX_POS_MAP``) supplies that POS's
+    vectors. Positional / n-gram models name no such role and share one vocab
+    across modes, so any role then supplies the vectors of every empty POS.
+    """
+    def role_vectors(i, role):
+        key = voc_index(role)
+        if key not in decomp.vocab:
+            return None
+        mat = decomp.factors[i].detach().cpu().numpy()
+        mat = mat / np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-12)
+        return {w: mat[idx] for w, idx in decomp.vocab[key].items()}
+
+    vecs_by_pos = {"N": {}, "V": {}, "A": {}}
+    for i, role in enumerate(roles):
+        pos = SIMLEX_POS_MAP.get(role)
+        if pos is None or vecs_by_pos[pos]:
+            continue
+        vectors = role_vectors(i, role)
+        if vectors is not None:
+            vecs_by_pos[pos] = vectors
+    empty = [p for p, v in vecs_by_pos.items() if not v]
+    if empty:
+        for i, role in enumerate(roles):
+            vectors = role_vectors(i, role)
+            if vectors is None:
+                continue
+            for pos in empty:
+                vecs_by_pos[pos] = vectors
+            break
+    return vecs_by_pos

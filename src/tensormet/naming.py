@@ -95,7 +95,7 @@ def _order_tag(order: int, decomposition: str = "tucker", solver: str = "mu",
     bond dimension fixes the TT core shapes, so runs differing only in it are
     different models."""
     if decomposition in ("tt", "utt"):
-        # 'utt' (EXPERIMENTAL shared-core TT) carries its bond the same way.
+        # 'utt' (shared-core TT) carries its bond the same way.
         if tt_rank is None:
             raise ValueError(f"decomposition={decomposition!r} needs tt_rank to build a filename")
         base = f"{_DECOMPOSITION_TAG[decomposition]}{int(tt_rank)}b{order}D"
