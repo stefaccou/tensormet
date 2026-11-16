@@ -7,7 +7,7 @@ Project utilities for tensor repo.
 requires-python = ">=3.9"
 dependencies = [
     "beautifulsoup4",  # experimental/parse_master_metaphor_list.py scrapes the MML index
-    "cupy",
+    "cupy-cuda12x",
     "datasets",
     "matplotlib",
     "numpy",

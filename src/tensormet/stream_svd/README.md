@@ -30,13 +30,13 @@ Untied modes get one $G$ each ($T = \{n\}$). The eigenvectors $U$ and singular v
 
 ## 4. How: never form $G$
 
-**Randomized subspace iteration.** Only products $G\Omega$ with a thin $\Omega \in \mathbb{R}^{V\times p}$, where $p = k + o$ (oversampling $o$, `--svd-oversampling`, default 10), are needed:
+**Randomized subspace iteration.** Only products $G\Omega$ with a thin $\Omega \in \mathbb{R}^{V\times p}$, where $p = k + o$ (oversampling $o$, `--svd-oversampling`, default 100), are needed:
 
 $$
 Y_0 = G\Omega,\qquad Y_{j+1} = G\,\operatorname{orth}(Y_j)\;\;(j < q),\qquad Q = \operatorname{orth}(Y_q),\qquad B = Q^\top G Q .
 $$
 
-The top-$k$ eigenpairs of the small $p\times p$ matrix $B$ give $U = Q V_B$ and $s = \sqrt{\lambda(B)}$. That is $q+2$ products in all; the default $q = 2$ (`--svd-power-iter`) gives 4. Each product with $G = AA^\top$ counts as one SVD power iteration. The relative residual $\lVert G u_j - \lambda_j u_j\rVert / \lambda_j$ of every column comes free from $W = GQ$; it is printed and stored in the cache.
+The top-$k$ eigenpairs of the small $p\times p$ matrix $B$ give $U = Q V_B$ and $s = \sqrt{\lambda(B)}$. That is $q+2$ products in all; the default $q = 6$ (`--svd-power-iter`) gives 8. Each product with $G = AA^\top$ counts as one SVD power iteration. The relative residual $\lVert G u_j - \lambda_j u_j\rVert / \lambda_j$ of every column comes free from $W = GQ$; it is printed and stored in the cache.
 
 **Contexts.** A *context* of an entry, for mode $n$, is the n-gram with position $n$ left out, i.e. a column $c$ of $A_{(n)}$. Writing $a_c$ for that column,
 
@@ -46,7 +46,7 @@ $$
 
 Sorting the non-zeros by context makes each $a_c$ a contiguous slice. The product is then two sparse–dense products per chunk of contexts: $Z = A_c^\top\Omega$, then $Y \mathrel{+}= A_c Z$. It uses the existing `build_batch_csr_T` and `spmm_T`, with no atomics and no dense $V\times V$ or $V\times V^{N-1}$ object. Cost per product is $\mathcal{O}(|T|\cdot \text{nnz}\cdot p)$.
 
-**Sort key.** The key ravels (context, row) into an int64. When the product of the dimensions exceeds $2^{63}$ (e.g. 6-grams), the running key is first replaced by its rank among the distinct values. Ranks keep the order, so the result is identical.
+**Sort key.** The key ravels (context, row) into an int64. When the product of the dimensions exceeds $2^{63}$ (6-grams, or 4-grams at $V = 131$k), the running key is first replaced by its rank among the distinct values. Ranks keep the order, so the result is identical.
 
 ## 5. Accuracy vs. speed
 
@@ -59,7 +59,9 @@ $$
 
 The second identity lets us measure $\rho$ on real data without ever having $G$: compare $\sum s_i^2$ between the default and a run with many passes.
 
-Roughly, the error shrinks like $(\lambda_{p+1}/\lambda_k)^{q}$, so a flat spectrum (small gap) needs more passes. Each extra pass costs one more streamed product, about 25% more time.
+Roughly, the error shrinks like $(\lambda_{p+1}/\lambda_k)^{q}$, so a flat spectrum (small gap) needs more passes. Each extra pass costs one more streamed product, $1/(q+2)$ of the total (12% at the default).
+
+**Single-precision floor.** $G$ squares the condition number and the products are summed in fp32, so the residual of column $j$ cannot fall below about $6\times10^{-8}\,\lambda_1/\lambda_j$. A column with $s_j < 0.01\,s_1$ therefore never prints as converged ($< 10^{-3}$), whatever $q$; columns with $s_j < 3\times10^{-4}\,s_1$ are noise.
 
 ## 6. Multi-GPU
 
@@ -107,7 +109,7 @@ On one 24 GB GPU the 4-gram case streams (about 6 cells per mode). On two GPUs i
   $$
 
   has entry $(r_1,\dots,r_N)$ depending only on columns $r_1,\dots,r_N$. A smaller core is therefore the leading sub-block of a stored larger one.
-- **Safety**: a (nnz, $\sum x$) fingerprint triggers a recompute if the tensor changed. Writes are atomic.
+- **Safety**: a (nnz, $\sum x$, shape) fingerprint triggers a recompute if the tensor changed. Writes are atomic. The fingerprint does not see a reordered vocabulary: if the word order of a tensor changes, delete its `init_cache` files by hand.
 - **Other decompositions**: CP, TT and UTT ask for no core (`with_core=False`), so none is built.
 
 ## 9. Test results so far
@@ -119,7 +121,7 @@ Notebook: `0_tests/2026-10-28-svd_stream_init.ipynb` (ampere, GPUs 1–2), on a 
 | streamed $G\Omega$ vs dense, per mode and pooled, 600–1800 chunks | rel. error $\le 2\times10^{-6}$ ✔ |
 | compacted sort key vs int64 key | identical ✔ |
 | old default sketch ($q=2$), mode 0 (decaying spectrum) | $\rho = 0.978$ |
-| default sketch, mode 1 (flat, noise-only spectrum) | $\rho = 0.950$, below the 0.95 test threshold ✘ |
+| same sketch, mode 1 (flat, noise-only spectrum) | $\rho = 0.950$, below the 0.95 test threshold ✘ |
 | first real-data run (4-gram, $V=10$k, nnz $3.5\times10^8$) | out of memory in the sort ✘ → fixed by sorting in cells (§7) |
 
 The mode-1 result is the speed/accuracy trade-off on a test tensor whose planted core only decays along mode 0. The test now sweeps $q$, prints the spectral gap, and requires $\rho \ge 0.999$ at $q = 30$, which is the correctness check.
@@ -141,7 +143,7 @@ GPU 0 peaks at 21.2 GB on 2 GPUs: it holds the tensor, its cells and the hash sc
 ## 10. Open questions
 
 1. ~~Does the notebook pass after the memory fix?~~ Yes.
-2. ~~Share of the $q=8$ energy captured at $q=2$?~~ 0.9886; default kept.
+2. ~~Share of the $q=8$ energy captured at $q=2$?~~ 0.9886 at the old default; the default is now `q6o100`.
 3. ~~Time and peak memory, 1 vs 2 GPUs?~~ 34 s / 20.5 s (§9).
 4. Does it help training? Short runs with `random` vs `svd_stream`; compare KL curves and dev scores.
    `svd_loose` can't be a baseline at 4-gram/10k. Largedim runs use `CoordCOO`, which the CPU SVD path rejects. Even block-encoded, each ARPACK step forms `A.T @ x`, a dense vector of $V^{N-1}=10^{12}$ floats (~8 TB). It only works up to about 3-grams, which is where to cross-check `svd_stream` against it.
@@ -150,4 +152,5 @@ GPU 0 peaks at 21.2 GB on 2 GPUs: it holds the tensor, its cells and the hash sc
 
 - `stream_svd.py`: algorithm, cells, multi-GPU, entry point `initialize_svd_stream`.
 - `init_cache.py`: cache.
-- Core hooks: one branch in `sparse_ops.initialize_nonnegative_tucker`, and a `set_run_context(...)` call in `tucker_tensor.py` just before the init dispatch.
+- Core hooks: one branch in `sparse_ops.initialize_nonnegative_tucker`, and a `set_run_context(...)` call in `solvers.py` just before the init dispatch.
+- Test knobs (module globals of `stream_svd.py`): `_MIN_CELLS`, `_FORCE_STREAM`, `_FORCE_COMPACT`.

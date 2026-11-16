@@ -67,9 +67,11 @@ _MAX_CHUNK_NNZ = 2 ** 30
 _INT64_MAX = 2 ** 63 - 1
 _INT32_MAX = 2 ** 31 - 1
 
-# Test knobs: force more cells per GPU / force streaming.
+# Test knobs: force more cells per GPU / force streaming / force the
+# rank-compacted sort key.
 _MIN_CELLS = 1
 _FORCE_STREAM = False
+_FORCE_COMPACT = False
 
 
 def sketch_tag(power_iter: int, oversampling: int) -> str:
@@ -86,7 +88,7 @@ def _resolve_sketch(power_iter=None, oversampling=None):
 
 
 # ---------------------------------------------------------------------------
-# Run context (set by tucker_tensor before the init dispatch)
+# Run context (set by solvers.py before the init dispatch)
 # ---------------------------------------------------------------------------
 _RUN_CONTEXT: Optional[dict] = None
 
@@ -132,19 +134,20 @@ class ContextGrouping:
         return int(self.offsets.size) - 1
 
 
-def _sort_key(others, other_dims, rows, V, force_compact=False):
+def _sort_key(others, other_dims, rows, V):
     """int64 key ordering entries by (context, row).
 
     Ravels the coordinates directly while the product fits int64; past that
-    (e.g. 6-grams), the running key is first replaced by its rank among the
-    distinct values. Ranks keep the order, so both routes sort identically.
+    (6-grams, or 4-grams at V = 131k), the running key is first replaced by its
+    rank among the distinct values. Ranks keep the order, so both routes sort
+    identically.
     """
     cols = list(others) + [rows]
     dims = list(other_dims) + [V]
     key = cols[0].astype(cp.int64)
     bound = int(dims[0])
     for c, d in zip(cols[1:], dims[1:]):
-        if force_compact or bound * int(d) > _INT64_MAX:
+        if _FORCE_COMPACT or bound * int(d) > _INT64_MAX:
             key = cp.unique(key, return_inverse=True)[1].reshape(-1).astype(cp.int64)
             bound = int(key.max()) + 1 if key.size else 1
         key = key * int(d) + c.astype(cp.int64)
@@ -152,13 +155,13 @@ def _sort_key(others, other_dims, rows, V, force_compact=False):
     return key
 
 
-def group_by_context(others, other_dims, rows, vals, V, force_compact=False) -> ContextGrouping:
+def group_by_context(others, other_dims, rows, vals, V) -> ContextGrouping:
     """Sort one cell's entries into a ContextGrouping (on the current device)."""
     n = int(rows.size)
     off_dtype = cp.int32 if n <= _INT32_MAX else cp.int64
     if n == 0:
         return ContextGrouping(cp.zeros(0, cp.int32), vals[:0], cp.zeros(1, off_dtype))
-    key = _sort_key(others, other_dims, rows, V, force_compact=force_compact)
+    key = _sort_key(others, other_dims, rows, V)
     order = cp.argsort(key)
     key = key[order]
     rows_s = rows[order].astype(cp.int32, copy=False)
@@ -327,14 +330,14 @@ def _upload(src) -> _Source:
                    cp.asarray(src["vals"]), cp.asarray(src["ids"]), src["targets"])
 
 
-def _iter_groupings(src: _Source, other_dims, V, force_compact=False):
+def _iter_groupings(src: _Source, other_dims, V):
     """Yield one ContextGrouping per target cell, sorting one cell at a time."""
     for t in src.targets:
         idx = cp.flatnonzero(src.ids == t)
         if idx.size == 0:
             continue
         g = group_by_context([o[idx] for o in src.others], other_dims, src.rows[idx],
-                             src.vals[idx], V, force_compact=force_compact)
+                             src.vals[idx], V)
         del idx
         yield g
 
@@ -360,7 +363,7 @@ class _ModeLayout:
     """One mode's groupings, kept resident: ``groupings[k]`` is the list of
     cell groupings on device k."""
 
-    def __init__(self, idxs, vals, shape, mode, device_ids, home, pool, force_compact=False):
+    def __init__(self, idxs, vals, shape, mode, device_ids, home, pool):
         sources, other_dims, self.n_cells = _prepare_sources(idxs, vals, shape, mode, device_ids, home)
         V = int(shape[mode])
 
@@ -368,7 +371,7 @@ class _ModeLayout:
             with cp.cuda.Device(device_ids[k]):
                 src = _upload(sources[k])
                 sources[k] = None
-                gs = list(_iter_groupings(src, other_dims, V, force_compact))
+                gs = list(_iter_groupings(src, other_dims, V))
                 del src
                 return gs
 
@@ -498,10 +501,9 @@ class _Progress:
 
 
 def compute_group_basis(idxs, vals, shape, group, k, device_ids, home, pool,
-                        seed, force_compact=False, verbose=True,
-                        power_iter=None, oversampling=None, return_residuals=False):
-    """(U, s) for one group of modes, on the home device; (U, s, r) with
-    ``return_residuals`` (r: relative residual per column, see top_k_eig)."""
+                        seed, verbose=True, power_iter=None, oversampling=None):
+    """(U, s, r) for one group of modes, on the home device
+    (r: relative residual per column, see top_k_eig)."""
     q, o = _resolve_sketch(power_iter, oversampling)
     V = int(shape[group[0]])
     dtype = vals.dtype
@@ -513,8 +515,7 @@ def compute_group_basis(idxs, vals, shape, group, k, device_ids, home, pool,
     if _resident_fits(int(vals.size), len(group), len(shape), int(dtype.itemsize), device_ids):
         resident = []
         for mode in group:
-            resident.append(_ModeLayout(idxs, vals, shape, mode, device_ids, home, pool,
-                                        force_compact=force_compact))
+            resident.append(_ModeLayout(idxs, vals, shape, mode, device_ids, home, pool))
             _free_pools(device_ids)     # drop the build's cached temporaries
         # Plan once all are in place, so chunk sizes see the memory that is left.
         for lay in resident:
@@ -568,7 +569,7 @@ def compute_group_basis(idxs, vals, shape, group, k, device_ids, home, pool,
                         sources[kd] = None
                         om = local_omega(did)
                         Yk = cp.zeros((V, om.shape[1]), dtype=om.dtype)
-                        for g in _iter_groupings(src, other_dims, V, force_compact):
+                        for g in _iter_groupings(src, other_dims, V):
                             plan_chunks(g, p, int(_CHUNK_FRACTION * _gpu_free_bytes()))
                             Yk += gram_apply_local([g], om, V, on_chunk=cell_tick)
                             del g
@@ -586,7 +587,7 @@ def compute_group_basis(idxs, vals, shape, group, k, device_ids, home, pool,
             else:
                 Y += x
         if host:
-            Y += cp.asarray(np.add.reduce(host))
+            Y += cp.asarray(sum(host))
         progress.end_application()
         return Y
 
@@ -599,7 +600,7 @@ def compute_group_basis(idxs, vals, shape, group, k, device_ids, home, pool,
         print(f"[svd_stream] modes {group}: basis k={U.shape[1]} in "
               f"{time.perf_counter() - t0:.1f}s ({n_apps} Gram applications, p={p})")
         print(f"[svd_stream] modes {group}: {residual_summary(r)}")
-    return (U, s, r) if return_residuals else (U, s)
+    return U, s, r
 
 
 def _free_pools(device_ids) -> None:
@@ -629,7 +630,7 @@ def _forecast(cache, group, k, V, q, o) -> Optional[str]:
 
 def initialize_svd_stream(sparse_tensor, shape, rank, modes, random_state, with_core=True,
                           *, cfg=None, tied_groups=None, device_ids=None, use_cache=None,
-                          power_iter=None, oversampling=None, force_compact=False, verbose=True):
+                          power_iter=None, oversampling=None, verbose=True):
     """Tucker-style init ``(core | None, factors)`` from the streamed SVD.
 
     Keyword arguments override the run context from ``set_run_context``.
@@ -690,8 +691,7 @@ def initialize_svd_stream(sparse_tensor, shape, rank, modes, random_state, with_
                     t0 = time.perf_counter()
                     U, s, r = compute_group_basis(idxs, vals, shape, g, k, device_ids, home, pool,
                                                   seed=int(random_state or 0) + g[0],
-                                                  force_compact=force_compact, verbose=verbose,
-                                                  power_iter=q, oversampling=o, return_residuals=True)
+                                                  verbose=verbose, power_iter=q, oversampling=o)
                     token = (cache.save_basis(g, cp.asnumpy(U), cp.asnumpy(s), fp,
                                               time.perf_counter() - t0, residuals=r)
                              if cache is not None else None)

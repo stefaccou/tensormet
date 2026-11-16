@@ -110,6 +110,10 @@ class CoordCOO:
         with cp.cuda.Device(device_id):
             return CoordCOO(cp.asarray(coords_np), cp.asarray(data_np), self.shape)
 
+    def to_host(self) -> "CoordCOO":
+        """The same tensor backed by NumPy arrays; ``to_device`` brings it back."""
+        return CoordCOO(cp.asnumpy(self.coords), cp.asnumpy(self.data), self.shape)
+
     def __repr__(self) -> str:
         return (f"CoordCOO(shape={self.shape}, nnz={self.nnz}, "
                 f"coord_dtype={self.coords.dtype}, dtype={self.data.dtype})")
@@ -803,7 +807,8 @@ def _nndsvd_factors(U: np.ndarray, s: np.ndarray) -> np.ndarray:
     to a non-negative factor matrix.
 
     For each column j, selects the positive or negative part of U[:, j] based on
-    which has larger norm, then scales so that column norm equals sqrt(s[j]).
+    which has larger norm, then scales so that column norm equals
+    sqrt(s[j] * norm of that part). The other part becomes exact zeros.
     """
     u_pos = np.maximum(U, 0.0)
     u_neg = np.maximum(-U, 0.0)

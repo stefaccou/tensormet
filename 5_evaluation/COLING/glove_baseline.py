@@ -47,8 +47,9 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 
-from tensormet.similarity import evaluate_simlex, load_simlex
-from tensormet.tucker_tensor import _SIMLEX_PATH, _SIMLEX_POS_MAP, TuckerDecomposition
+from tensormet.similarity import (SIMLEX_PATH as _SIMLEX_PATH, SIMLEX_POS_MAP as _SIMLEX_POS_MAP,
+                                  evaluate_simlex, load_simlex)
+from tensormet.tucker_tensor import TuckerDecomposition
 from tensormet.utils import to_np
 
 

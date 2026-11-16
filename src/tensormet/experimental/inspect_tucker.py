@@ -675,14 +675,15 @@ _MN_STEM_RE = re.compile(r"_(\d+)mn(?=_|$)")
 # "..._CP3D_..." marks the experimental CP family, "..._TT100b3D_..." the
 # Tucker-TT hybrid at bond 100 (see naming._order_tag); Tucker stems carry the
 # bare "..._3D_..." tag instead.
-_DECOMP_STEM_RE = re.compile(r"_CP\d+D(?=_|$)")
-_TT_STEM_RE = re.compile(r"_TT(\d+)b\d+D(?=_|$)")
+_DECOMP_STEM_RE = re.compile(r"_(?:SGD)?CP\d+D(?=_|$)")
+_TT_STEM_RE = re.compile(r"_(?:SGD)?TT(\d+)b\d+D(?=_|$)")
 # "..._UTT50b3D_...": the shared-core TT (uniform_tt) at bond 50.
-_UTT_STEM_RE = re.compile(r"_UTT(\d+)b\d+D(?=_|$)")
+_UTT_STEM_RE = re.compile(r"_(?:SGD)?UTT(\d+)b\d+D(?=_|$)")
 
 # "..._SGD3D_..." marks the SGD solver (naming._order_tag with
-# solver="sgd"); MU stems carry no solver tag.
-_SOLVER_STEM_RE = re.compile(r"_SGD(?:CP)?\d+D(?=_|$)")
+# solver="sgd"); it prefixes the family tag ("SGDTT100b4D", "SGDUTT100b4D").
+# MU stems carry no solver tag.
+_SOLVER_STEM_RE = re.compile(r"_SGD(?:CP|U?TT\d+b)?\d+D(?=_|$)")
 
 
 def _ss_from_stem(stem):
@@ -833,6 +834,7 @@ def _discover_one(dataset, data_dir):
             "name": name, "divergence": insp.divergence, "method": insp.method,
             "order": insp.order, "dim": dim, "rank": rank0,
             "subsample_frac": ss, "max_nnz": mn, "iters": iters, "decomposition": decomposition,
+            "solver": solver,
             "tt_rank": int(tt_rank or 0),  # 0 = not TT (keeps the facet sortable)
             "has_log": log_path.exists() and log_path.stat().st_size > 0,
             "mtime": cfg_path.stat().st_mtime,
@@ -872,6 +874,8 @@ _LABEL_FIELDS = [
     ("dataset", lambda i: i.dataset),
     ("name", lambda i: i.name or "(unnamed)"),
     ("decomp", lambda i: getattr(i, "decomposition", "tucker")),
+    # empty for MU runs, like the bond below
+    ("solver", lambda i: "sgd" if getattr(i, "solver", "mu") == "sgd" else ""),
     # empty for non-TT runs; _diff_labels drops empty fields
     ("bond", lambda i: f"b{i.tt_rank}" if getattr(i, "tt_rank", None) else ""),
     ("method", lambda i: i.method),
@@ -916,8 +920,9 @@ def _chain_key(rec):
     sort into clean, contiguous segments.
     """
     insp = rec["ref"].insp
+    # solver: an SGD run is never a resume segment of an MU run (separate stems)
     return (rec["dataset"], rec["name"], rec["decomposition"], rec.get("tt_rank", 0),
-            rec["divergence"], rec["method"],
+            rec.get("solver", "mu"), rec["divergence"], rec["method"],
             rec["order"], rec["dim"], rec["rank"], rec["subsample_frac"], rec.get("max_nnz", 0),
             frozenset(insp.shared_factors or ()))
 
@@ -1071,6 +1076,8 @@ def make_run_browser(dataset="fineweb-en", data_dir=DATA_DIR,
         decomp = "" if rec["decomposition"] == "tucker" else f'[{rec["decomposition"].upper()}] '
         if rec.get("tt_rank"):
             decomp = f'[{rec["decomposition"].upper()} b={rec["tt_rank"]}] '
+        if rec.get("solver") == "sgd":
+            decomp = f"[SGD] {decomp}"
         mn = f' mn{rec["max_nnz"]}' if rec.get("max_nnz") else ""
         return (f'{decomp}[{rec["dataset"]}] {rec["name"]} | {rec["divergence"]}/{rec["method"]} | '
                 f'{rec["dim"]}d r{rec["rank"]} ss{rec["subsample_frac"]}{mn} '

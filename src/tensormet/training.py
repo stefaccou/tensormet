@@ -7,7 +7,7 @@ training.py — the decomposition training loop, in reading order:
     semantic_check / reconstruction_check
                           the two patience tracks, best-state bookkeeping
     save_checkpoint, graceful_interrupt
-    train                 the loop itself
+    train, run_loop       build the solver; the loop itself
 
 What differs between MU and SGD is behind ``solvers`` (step / views / snapshot /
 checkpoint), what differs between Tucker, TT, utt and CP is in ``families``.
@@ -501,18 +501,24 @@ def sem_primary_key_of(ev):
 
 def train(tensor, cfg, thread_budget, vocab=None, sample_sentences=None):
     check_run_config(cfg, tensor)
+    if cfg.train.checkpoint_saving_steps:
+        os.makedirs(cfg.artifact_paths()["checkpoint_dir"], exist_ok=True)
+    resume = cfg.get_resume_state()
+    rank, modes = resolve_rank(tuple(tensor.shape), cfg)
+    solver = make_solver(tensor, cfg, get_family(cfg), rank, modes, thread_budget, resume)
+    try:
+        return run_loop(solver, cfg, rank, resume, thread_budget, vocab, sample_sentences)
+    finally:
+        solver.close()  # a tensor parked in host RAM goes back on the GPU
+
+
+def run_loop(solver, cfg, rank, resume, thread_budget, vocab, sample_sentences):
     e, tc, ev = cfg.exp, cfg.train, cfg.eval
     paths = cfg.artifact_paths()
     # Under HPC mode `paths` resolve to node-local $TMPDIR; periodic checkpoints
     # are mirrored to the canonical GPFS paths so a walltime kill stays resumable.
     mirror_paths = cfg.artifact_paths(staged=False) if tc.hpc else None
-    if tc.checkpoint_saving_steps:
-        os.makedirs(paths["checkpoint_dir"], exist_ok=True)
-
-    resume = cfg.get_resume_state()
     start_iteration = resume.get("start_iteration", 0)
-    rank, modes = resolve_rank(tuple(tensor.shape), cfg)
-    solver = make_solver(tensor, cfg, get_family(cfg), rank, modes, thread_budget, resume)
 
     run = Run(cfg=cfg, solver=solver, thread_budget=thread_budget, paths=paths,
               mirror_paths=mirror_paths, sem_primary_key=sem_primary_key_of(ev),

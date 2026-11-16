@@ -21,6 +21,7 @@ decomposition family is in families.py.
 """
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 
@@ -38,6 +39,10 @@ from tensormet.stochastic_sparse import CooSubsampler
 from tensormet.utils import make_lazy_cupy_pair, nontrivial_linked_groups
 
 cp, cpx_sparse = make_lazy_cupy_pair()
+
+# Multi-GPU MU runs keep the full tensor in host RAM while the shards train
+# (MUSolver.close puts it back). TENSORMET_PARK_FULL_TENSOR=0 keeps it on GPU 0.
+PARK_FULL_TENSOR = os.environ.get("TENSORMET_PARK_FULL_TENSOR", "1") not in ("0", "false", "False")
 
 
 def _as_host(x):
@@ -98,7 +103,7 @@ def effective_subsample_frac(cfg, nnz, announce=False):
 
 
 def _set_svd_stream_context(cfg, tensor, modes):
-    """Experimental streamed GPU SVD: pooled per tied group, all GPUs, cached."""
+    """Streamed GPU SVD init: pooled per tied group, all GPUs, cached."""
     from tensormet.stream_svd import set_run_context
     set_run_context(cfg, tied_groups=nontrivial_linked_groups(tensor.shared_factors,
                                                               num_factors=len(modes)),
@@ -183,6 +188,30 @@ class MUSolver:
         self.batch_nnz = None
         self._core_hints, self._error_hints = {}, {}
         self._build_hints()
+
+        # The sharded kernels never read the full tensor, so GPU 0 only needs
+        # its shard. Small-dim Tucker is the exception: it runs the single-GPU
+        # kernels on the full tensor.
+        shards_used = self.sst is not None and bool(
+            e.binary or e.decomposition != "tucker" or self.largedim_selected)
+        self._parked = PARK_FULL_TENSOR and shards_used and isinstance(data, CoordCOO)
+        if self._parked:
+            freed = (data.coords.nbytes + data.data.nbytes) / 2**30
+            tensor.tensor = data.to_host()
+            print(f"full tensor parked in host RAM ({freed:.2f} GB freed on GPU 0)")
+
+    def close(self):
+        """Put a parked tensor back on the primary GPU. Never raises: the
+        trained model is returned right after."""
+        if not self._parked:
+            return
+        try:
+            self.free_cache()
+            self.tensor.tensor = self.tensor.tensor.to_device(0)
+            self._parked = False
+        except Exception as err:
+            print(f"Warning: could not move the tensor back to GPU 0 ({err}); "
+                  f"it stays in host RAM (tensor.tensor.to_device(0) restores it).")
 
     # --- setup helpers ---
 
@@ -454,6 +483,9 @@ class SGDSolver:
 
     def size_batches(self):
         """The trainer sizes its own batches."""
+
+    def close(self):
+        """Nothing to restore: SGD trains on the torch tensor as loaded."""
 
     def step(self, iteration, log_step):
         # On log steps the trainer returns the exact full-NNZ relative error, with
