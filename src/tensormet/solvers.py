@@ -109,7 +109,8 @@ def _set_svd_stream_context(cfg, tensor, modes):
                                                               num_factors=len(modes)),
                     device_ids=list(range(cfg.train.n_gpus)),
                     power_iter=cfg.exp.svd_power_iter,
-                    oversampling=cfg.exp.svd_oversampling)
+                    oversampling=cfg.exp.svd_oversampling,
+                    fill=cfg.exp.svd_fill)
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +461,7 @@ class SGDSolver:
                 epsilon=e.epsilon, core_init=e.tt_core_init,
                 device_ids=list(range(self.n_gpus)))
 
+        from tensormet.experimental.sgd_schedule import schedule_settings
         kwargs = dict(
             rank=rank, divergence=e.divergence, objective=e.objective,
             lr=e.sgd_lr, batch_size=e.sgd_batch_size, parametrization=e.sgd_parametrization,
@@ -467,7 +469,7 @@ class SGDSolver:
             steps_per_iteration=e.sgd_steps_per_iteration, epsilon=e.epsilon,
             micro_batch=e.sgd_micro_batch, eval_sample=e.sgd_eval_sample,
             resume_payload=payload, decomposition=e.decomposition, tt_rank=e.tt_rank,
-            regauge_every=e.sgd_regauge_every,
+            regauge_every=e.sgd_regauge_every, lr_schedule=schedule_settings(e),
         )
         # Construction is the last silent stretch before the loop announces
         # itself, and on the sharded path it is where the collective gets
@@ -527,15 +529,8 @@ class SGDSolver:
             torch.cuda.empty_cache()
 
     def final_error(self, rec_errors):
-        """With --sgd-eval-sample the logged curve is a subsampled estimate; pay
-        for one exact pass at the end so the reported final_error is exact.
-        (Like rec_errors[-1], it describes the trainer's current state, which is
-        not necessarily the best-semantics model returned.)"""
-        if getattr(self.trainer, "eval_sample", None):
-            exact = self.trainer.final_relative_error()
-            print(f"Exact final reconstruction error: {exact:.6f} "
-                  f"(logged curve used --sgd-eval-sample {self.trainer.eval_sample})")
-            return exact
+        """The last logged error: on the fixed --sgd-eval-sample subset when that
+        is set (no extra exact pass), else exact."""
         return rec_errors[-1] if len(rec_errors) > 0 else None
 
     def describe(self):

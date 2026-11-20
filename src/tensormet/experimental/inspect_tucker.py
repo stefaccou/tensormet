@@ -2107,10 +2107,12 @@ def make_run_ranker(dataset="fineweb-en", data_dir=DATA_DIR,
 #
 # benchmark.json (written by scripts/benchmarking.sh) is a list of sessions. A
 # session holds metadata keys plus one entry per combo: a result dict, or
-# "CRASH" / "TIMEOUT".
+# "CRASH" / "TIMEOUT". Sessions from before the benchmark folder
+# ($DATA/tensors/benchmarking) are in benchmark_old.json.
 
 _BENCH_META_KEYS = {"time", "n_gpus", "solver", "method", "sgd_config", "cp_config",
-                    "tt_config", "utt_config", "init", "name"}
+                    "tt_config", "utt_config", "init", "name",
+                    "protocol", "folder", "entries"}
 _BENCH_FAILED = ("CRASH", "TIMEOUT")
 # Session fields the browser can filter on.
 _BENCH_FACETS = [("Solver", "solver"), ("Method", "method"), ("GPUs", "n_gpus")]
@@ -2151,7 +2153,7 @@ def _bench_cell(entry):
         return "n/a", None
     if entry in _BENCH_FAILED:
         return entry, None
-    # final_error is exact; SGD sessions with eval_sample log a sampled curve.
+    # final_error is the run's last logged error (SGD with eval_sample: on that sample).
     if entry.get("final_error") is not None:
         rec = entry["final_error"]
     else:
@@ -2165,18 +2167,39 @@ def _bench_cell(entry):
     return text, (rec, sem)
 
 
-def load_benchmarks(benchmark_path=None):
-    """The sessions in benchmark.json (default ``DATA_DIR/benchmarking/benchmark.json``)."""
-    path = Path(benchmark_path) if benchmark_path else DATA_DIR / "benchmarking" / "benchmark.json"
-    data = json.loads(path.read_text())
+def _bench_path(benchmark_path=None, old=False):
+    if benchmark_path:
+        return Path(benchmark_path)
+    return DATA_DIR / "benchmarking" / ("benchmark_old.json" if old else "benchmark.json")
+
+
+def load_benchmarks(benchmark_path=None, old=False):
+    """The sessions in benchmark.json (default ``DATA_DIR/benchmarking/benchmark.json``;
+    ``old=True``: benchmark_old.json, the sessions from before the benchmark folder)."""
+    data = json.loads(_bench_path(benchmark_path, old).read_text())
     return data if isinstance(data, list) else [data]
+
+
+def _bench_entry_changes(sessions, labels):
+    """Entries whose settings or tensor differ between the given sessions."""
+    notes = []
+    names = sorted({e for s in sessions for e in (s.get("entries") or {})})
+    for e in names:
+        seen = {s["entries"][e]: lbl for s, lbl in zip(sessions, labels) if e in (s.get("entries") or {})}
+        if len(seen) > 1:
+            notes.append(f"WARNING: entry {e} differs between sessions: "
+                         + "; ".join(f"{meta} ({lbl})" for meta, lbl in seen.items()))
+    return notes
 
 
 def compare_benchmarks(sessions, labels=None):
     """One row per combo, one column per session. Exactly two sessions also get
-    a delta column (second minus first)."""
+    a delta column (second minus first). Prints a warning for every entry whose
+    settings or tensor changed between the sessions."""
     if labels is None:
         labels = [_bench_label(i, s) for i, s in enumerate(sessions)]
+    for note in _bench_entry_changes(sessions, labels):
+        print(note)
     combos = []
     for s in sessions:
         for key, val in s.items():
@@ -2203,7 +2226,7 @@ def compare_benchmarks(sessions, labels=None):
     return pd.DataFrame(rows).set_index("combo")
 
 
-def make_benchmark_browser(benchmark_path=None):
+def make_benchmark_browser(benchmark_path=None, old=False):
     """Interactive picker for comparing benchmark sessions.
 
     Tick two or more sessions and press *Compare*. The Solver, Method and GPUs
@@ -2212,7 +2235,8 @@ def make_benchmark_browser(benchmark_path=None):
     that are shown get compared. *Delete* removes one shown session from the
     file after a confirmation, and keeps a ``.bak`` copy of the old file.
 
-    ``benchmark_path`` defaults to ``DATA_DIR/benchmarking/benchmark.json``.
+    ``benchmark_path`` defaults to ``DATA_DIR/benchmarking/benchmark.json``;
+    ``old=True`` opens benchmark_old.json instead.
     Returns the displayed ``VBox``; ``ui.get_table()`` gives the last table.
     """
     try:
@@ -2224,7 +2248,7 @@ def make_benchmark_browser(benchmark_path=None):
             "Install with `pip install ipywidgets`."
         ) from e
 
-    path = Path(benchmark_path) if benchmark_path else DATA_DIR / "benchmarking" / "benchmark.json"
+    path = _bench_path(benchmark_path, old)
 
     # `checks[i]` is the checkbox of `sessions[i]`; `facet_checks[key]` maps each
     # value of that field to its filter checkbox.
@@ -2378,7 +2402,7 @@ def make_benchmark_browser(benchmark_path=None):
     filters = widgets.VBox(list(facet_rows.values())
                            + [widgets.HBox([after_box, refresh_btn])])
     ui = widgets.VBox([
-        widgets.HTML("<h3>Benchmark sessions</h3>"
+        widgets.HTML(f"<h3>Benchmark sessions{' (old, before the benchmark folder)' if old else ''}</h3>"
                      "<small>Filters are optional: nothing ticked in a row means no filter.</small>"),
         filters, status, session_box, compare_btn, table_out,
         widgets.HTML("<h4>Delete a run</h4>"),

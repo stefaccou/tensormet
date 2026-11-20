@@ -287,7 +287,10 @@ def launch_nnt_decomposition(cfg):
 
 
 
-    vector_path = os.path.join(DATA_DIR, "vectors", cfg.exp.dataset)
+    # Benchmark entries carry their own eval sample (scripts/add_benchmark_entry.py).
+    vector_path = os.path.join(DATA_DIR, "tensors", cfg.exp.dataset, "eval_sentences")
+    if not os.path.isdir(vector_path):
+        vector_path = os.path.join(DATA_DIR, "vectors", cfg.exp.dataset)
     print(f"[{time.strftime('%H:%M:%S')}] loading eval sentences from {vector_path}...",
           flush=True)
     sentence_sample = load_eval_sentences_cached_parquet(vector_path=vector_path,
@@ -419,8 +422,8 @@ def launch_nnt_decomposition(cfg):
         # distinct from total process runtime. solve_seconds is the summed
         # iteration time (updates + error kernels), decomp_seconds the full loop
         # (adds in-loop semantic evaluation), and runtime_seconds also includes
-        # data loading and sparse conversion. final_error is exact even when SGD
-        # logged its curve on a sample (--sgd-eval-sample).
+        # data loading and sparse conversion. final_error is the last logged error
+        # (for SGD with --sgd-eval-sample: on that fixed sample, not exact).
         _final_error = tucker_decomp_info.get("final_error")
         with open(paths["timing_json"], "w") as f:
             json.dump(

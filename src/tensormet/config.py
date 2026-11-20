@@ -178,6 +178,10 @@ class ExperimentConfig:
     # Part of the init cache key, not of the stem.
     svd_power_iter: Optional[int] = None
     svd_oversampling: Optional[int] = None
+    # init="svd_stream" only: NNDSVD zeros start at svd_fill x the column mean (0 = exact zeros).
+    svd_fill: float = 0.0
+    # init="svd_stream" only (EXPERIMENTAL): "none" | "ica" | "ica_rows", experimental/svd_rotation.py.
+    svd_rotate: str = "none"
     # tt/utt only (EXPERIMENTAL): "random" | "markov" (cores built from the data,
     # experimental/tt_markov_init.py). Part of the resume check, not of the stem.
     tt_core_init: str = "random"
@@ -195,7 +199,15 @@ class ExperimentConfig:
     sgd_regauge_every: int = 1             # TT/utt: iterations between gauge resets; 0 = off
     sgd_micro_batch: Optional[int] = None  # entries per fwd/bwd; None = rank-derived
     sgd_comm_backend: str = "auto"         # "auto" | "nccl" | "host"
-    sgd_eval_sample: Optional[int] = None  # fixed nnz subset per logged error; None = exact
+    sgd_eval_sample: Optional[int] = None  # fixed nnz subset for every error, final included; None = exact
+    # SGD lr schedule, WSD in absolute iterations (EXPERIMENTAL, experimental/sgd_schedule.py).
+    # Defaults: constant lr. Resume needs the same lr history up to the checkpoint.
+    sgd_lr_warmup: int = 0                    # linear warm-up iterations
+    sgd_lr_decay_start: Optional[int] = None  # iteration where the cool-down starts; None = none
+    sgd_lr_decay_iters: int = 0               # cool-down length in iterations
+    sgd_lr_min: float = 0.0                   # lr after the cool-down
+    sgd_lr_decay_shape: str = "cosine"        # "cosine" | "linear"
+    sgd_lr_decay_every: int = 1               # cool-down lr held for blocks of this many iterations
 
     def __post_init__(self):
         object.__setattr__(self, "shared_factors", resolve_shared_factors(self.shared_factors, self.order))
@@ -378,6 +390,10 @@ class RunConfig:
                     old_exp.get("init") == self.exp.init and
                     old_exp.get("tt_core_init", "random") ==
                     getattr(self.exp, "tt_core_init", "random") and
+                    float(old_exp.get("svd_fill") or 0.0) ==
+                    float(getattr(self.exp, "svd_fill", 0.0)) and
+                    (old_exp.get("svd_rotate") or "none") ==
+                    getattr(self.exp, "svd_rotate", "none") and
                     old_exp.get("utt_core_power") ==
                     getattr(self.exp, "utt_core_power", None) and
                     int(old_exp.get("random_state", 1)) == int(self.exp.random_state) and
@@ -414,6 +430,8 @@ class RunConfig:
                     # TT/utt gauge resets change the raw parameters Adam sees.
                     int(old_exp.get("sgd_regauge_every", 1)) ==
                     int(getattr(self.exp, "sgd_regauge_every", 1)) and
+                    # The lr schedule is checked below, once the checkpoint is known:
+                    # it may differ only after the checkpoint (same_lr_history).
                     # sgd_micro_batch and sgd_comm_backend are memory/dispatch
                     # choices that leave the mathematics alone, and
                     # sgd_eval_sample only changes what gets *measured* (like
@@ -450,6 +468,11 @@ class RunConfig:
                     iterations = [int(p.stem) for p in pt_files if p.stem.isdigit()]
                     if iterations:
                         max_i = max(iterations)
+                        from tensormet.experimental.sgd_schedule import same_lr_history
+                        if not same_lr_history(old_exp, self.exp, max_i):
+                            print(f"{config_path.name}: its lr schedule differs within its "
+                                  f"{max_i} iterations; not resuming from it.")
+                            continue
                         # We want the run that progressed the furthest
                         if max_i > latest_iter:
                             print(candidate_ckpt_dir, "gives new best with", max_i)
