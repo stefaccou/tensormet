@@ -10,6 +10,8 @@ The key holds only what changes the result: the populated tensor, the group,
 the sketch settings (power iterations q, oversampling o: "q6o100") and the
 random state (it seeds the sketch). Rank, decomposition, n_iter, subsampling
 and n_gpus are not part of it. Newer files also hold the per-column residuals.
+The core is built from the factors after ``--svd-fill``, so a non-zero fill
+has its own core files ("core_fill1_r..."); the basis files are shared.
 """
 from __future__ import annotations
 
@@ -53,19 +55,20 @@ def _read_meta(npz) -> dict:
 class InitCache:
     """Basis and core files for one populated tensor and one sketch setting."""
 
-    def __init__(self, directory, tensor_stem: str, sketch_tag: str):
+    def __init__(self, directory, tensor_stem: str, sketch_tag: str, fill: float = 0.0):
         self.directory = Path(directory)
         self.prefix = f"svdstream_{tensor_stem}"
         self.sketch_tag = sketch_tag
+        self.core_tag = f"core_fill{float(fill):g}" if fill else "core"
 
     @classmethod
-    def from_config(cls, cfg, sketch_tag: str) -> "InitCache":
+    def from_config(cls, cfg, sketch_tag: str, fill: float = 0.0) -> "InitCache":
         from tensormet.naming import populated_filename
         stem = populated_filename(cfg.exp.method, cfg.exp.order, cfg.exp.dim,
                                   shared_factors=cfg.exp.shared_factors)
         stem = stem[:-3] if stem.endswith(".pt") else stem
         # Canonical (GPFS) location, also under HPC staging, so later jobs find it.
-        return cls(Path(cfg.output_dir(staged=False)) / CACHE_DIRNAME, stem, sketch_tag)
+        return cls(Path(cfg.output_dir(staged=False)) / CACHE_DIRNAME, stem, sketch_tag, fill)
 
     # --- basis -----------------------------------------------------------
     def basis_path(self, group: Sequence[int]) -> Path:
@@ -126,12 +129,12 @@ class InitCache:
     # --- core ------------------------------------------------------------
     def _core_glob(self, groups) -> str:
         tag = "_".join(_group_tag(g) for g in groups)
-        return f"{self.prefix}_{tag}_{self.sketch_tag}_core_r*.npz"
+        return f"{self.prefix}_{tag}_{self.sketch_tag}_{self.core_tag}_r*.npz"
 
     def core_path(self, groups, ranks) -> Path:
         tag = "_".join(_group_tag(g) for g in groups)
         r = "-".join(str(int(x)) for x in ranks)
-        return self.directory / f"{self.prefix}_{tag}_{self.sketch_tag}_core_r{r}.npz"
+        return self.directory / f"{self.prefix}_{tag}_{self.sketch_tag}_{self.core_tag}_r{r}.npz"
 
     def load_core(self, groups, ranks, tokens: List[str], fp: dict) -> Optional[np.ndarray]:
         """Leading sub-block of the smallest stored core that covers ``ranks``

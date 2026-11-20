@@ -28,6 +28,8 @@ $$
 
 Untied modes get one $G$ each ($T = \{n\}$). The eigenvectors $U$ and singular values $s_i = \sqrt{\lambda_i}$ then go through NNDSVD, unchanged from the other inits. NNDSVD keeps the larger of the positive and negative part of each column of $U$ and rescales it with $s_i$, which gives a non-negative factor $F$.
 
+The other part becomes exact zeros, about half of every column after the first. MU multiplies, so those entries stay at the $10^{-30}$ floor: on the 11-05 sweep 99.6% were still near zero after 50 iterations (`22_initialisation/2026-11-13-nndsvd_zero_support.ipynb`). `--svd-fill c` starts them at $c\,\bar F_{:,j}$ (the column mean) instead; $c = 1$ is NNDSVDa. The core is built from the filled $F$.
+
 ## 4. How: never form $G$
 
 **Randomized subspace iteration.** Only products $G\Omega$ with a thin $\Omega \in \mathbb{R}^{V\times p}$, where $p = k + o$ (oversampling $o$, `--svd-oversampling`, default 100), are needed:

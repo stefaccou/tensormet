@@ -6,7 +6,8 @@ the top-k eigenvectors of
 
     G = Σ_{n∈T} A_n A_nᵀ        (V × V; A_n = mode-n unfolding)
 
-found by randomized subspace iteration. G is never formed: G·Ω streams the
+found by randomized subspace iteration (``--svd-fill`` optionally fills the
+NNDSVD zeros, see ``fill_zeros``). G is never formed: G·Ω streams the
 NNZ grouped by *context* (the n-gram with position n left out), two sparse
 products per chunk of whole contexts.
 
@@ -94,7 +95,7 @@ _RUN_CONTEXT: Optional[dict] = None
 
 
 def set_run_context(cfg=None, *, tied_groups=None, device_ids=None, use_cache=True,
-                    power_iter=None, oversampling=None):
+                    power_iter=None, oversampling=None, fill=0.0):
     """Hand run-level settings to the next ``initialize_svd_stream`` call.
 
     The init is reached through ``initialize_nonnegative_tucker`` from every
@@ -104,7 +105,7 @@ def set_run_context(cfg=None, *, tied_groups=None, device_ids=None, use_cache=Tr
     global _RUN_CONTEXT
     _RUN_CONTEXT = {"cfg": cfg, "tied_groups": tied_groups,
                     "device_ids": device_ids, "use_cache": use_cache,
-                    "power_iter": power_iter, "oversampling": oversampling}
+                    "power_iter": power_iter, "oversampling": oversampling, "fill": fill}
 
 
 def _pop_run_context() -> dict:
@@ -628,13 +629,25 @@ def _forecast(cache, group, k, V, q, o) -> Optional[str]:
     return None
 
 
+def fill_zeros(F, fill):
+    """NNDSVDa-style: the exact zeros of NNDSVD become ``fill`` x their column's
+    mean, so MU can still grow them (a multiplicative update cannot grow a zero).
+    Per column, so rank truncation stays exact. ``fill`` 0 = plain NNDSVD."""
+    if not fill:
+        return F
+    return cp.where(F == 0, fill * F.mean(axis=0, keepdims=True), F)
+
+
 def initialize_svd_stream(sparse_tensor, shape, rank, modes, random_state, with_core=True,
                           *, cfg=None, tied_groups=None, device_ids=None, use_cache=None,
-                          power_iter=None, oversampling=None, verbose=True):
+                          power_iter=None, oversampling=None, fill=None, rotate=None,
+                          verbose=True):
     """Tucker-style init ``(core | None, factors)`` from the streamed SVD.
 
     Keyword arguments override the run context from ``set_run_context``.
-    Without either: per-mode bases on the tensor's GPU, no cache, default sketch.
+    Without either: per-mode bases on the tensor's GPU, no cache, default sketch,
+    no fill. ``rotate`` (default: cfg.exp.svd_rotate) is EXPERIMENTAL, see
+    experimental/svd_rotation.py.
     """
     ctx = _pop_run_context()
     cfg = cfg if cfg is not None else ctx.get("cfg")
@@ -644,6 +657,14 @@ def initialize_svd_stream(sparse_tensor, shape, rank, modes, random_state, with_
         use_cache = ctx.get("use_cache", True)
     q, o = _resolve_sketch(power_iter if power_iter is not None else ctx.get("power_iter"),
                            oversampling if oversampling is not None else ctx.get("oversampling"))
+    fill = float(fill if fill is not None else ctx.get("fill", 0.0) or 0.0)
+    if fill < 0:
+        raise ValueError(f"svd_stream: fill must be >= 0; got {fill}")
+    rotation = None
+    rotate = rotate or getattr(getattr(cfg, "exp", None), "svd_rotate", None) or "none"
+    if rotate != "none":
+        from tensormet.experimental import svd_rotation as rotation
+        rotation.check(rotate, fill)
 
     shape = tuple(int(s) for s in shape)
     modes = [int(m) for m in modes]
@@ -666,7 +687,9 @@ def initialize_svd_stream(sparse_tensor, shape, rank, modes, random_state, with_
         fp = fingerprint(int(vals.size), float(cp.sum(vals, dtype=cp.float64)), shape)
     # The seed drives the sketch, so each random_state gets its own cache files.
     seed_tag = f"{sketch_tag(q, o)}_rs{int(random_state or 0)}"
-    cache = InitCache.from_config(cfg, seed_tag) if (cfg is not None and use_cache) else None
+    cache = InitCache.from_config(cfg, seed_tag, fill) if (cfg is not None and use_cache) else None
+    if rotation is not None and cache is not None:
+        cache.core_tag = rotation.core_tag(rotate, rank)
 
     pool = ThreadPoolExecutor(max_workers=len(device_ids)) if len(device_ids) > 1 else None
     if pool is not None:
@@ -695,7 +718,10 @@ def initialize_svd_stream(sparse_tensor, shape, rank, modes, random_state, with_
                     token = (cache.save_basis(g, cp.asnumpy(U), cp.asnumpy(s), fp,
                                               time.perf_counter() - t0, residuals=r)
                              if cache is not None else None)
-                F = _nndsvd_factors_gpu(U, s)
+                if rotation is not None:
+                    F = rotation.rotated_factor(U, s, rotate, f"modes {g}: ", verbose)
+                else:
+                    F = fill_zeros(_nndsvd_factors_gpu(U, s), fill)
                 del U, s
             for m in g:
                 factors[modes.index(m)] = F
