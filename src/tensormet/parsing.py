@@ -348,6 +348,25 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                              "the chain product inside fp32 range. Affects the trajectory.")
     parser.add_argument("--sgd-steps-per-iteration", type=int, dest="sgd_steps_per_iteration", default=None,
                         help="SGD only: optimizer steps per loop iteration (default 100).")
+    # WSD lr schedule (EXPERIMENTAL, experimental/sgd_schedule.py), in absolute iterations.
+    parser.add_argument("--sgd-lr-warmup", type=int, dest="sgd_lr_warmup", default=None,
+                        help="SGD only: iterations of linear lr warm-up (default 0).")
+    parser.add_argument("--sgd-lr-decay-start", type=int, dest="sgd_lr_decay_start", default=None,
+                        help="SGD only: iteration where the lr cool-down (cosine or linear) "
+                             "starts (default: none, constant lr). Absolute, so resuming to "
+                             "more iterations keeps the schedule.")
+    parser.add_argument("--sgd-lr-decay-iters", type=int, dest="sgd_lr_decay_iters", default=None,
+                        help="SGD only: length of the cool-down in iterations; the lr then "
+                             "stays at --sgd-lr-min.")
+    parser.add_argument("--sgd-lr-min", type=float, dest="sgd_lr_min", default=None,
+                        help="SGD only: lr at the end of the cool-down (default 0).")
+    parser.add_argument("--sgd-lr-decay-shape", type=str, dest="sgd_lr_decay_shape", default=None,
+                        choices=["cosine", "linear"],
+                        help="SGD only: shape of the cool-down (default cosine).")
+    parser.add_argument("--sgd-lr-decay-every", type=int, dest="sgd_lr_decay_every", default=None,
+                        help="SGD only: hold the cool-down lr for blocks of K iterations, a "
+                             "staircase (default 1). To end at --sgd-lr-min over N iterations "
+                             "from 0, use --sgd-lr-decay-iters N - K.")
     parser.add_argument("--sgd-warm-start", type=str, dest="sgd_warm_start", default=None,
                         help="SGD only: path to an MU model .pt used as init (warm start; "
                              "optimizer state starts fresh, unlike --resume).")
@@ -363,12 +382,13 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                              "picks single-process NCCL when it is available and the devices "
                              "have a full peer-access mesh, else pinned-host staging.")
     parser.add_argument("--sgd-eval-sample", type=int, dest="sgd_eval_sample", default=None,
-                        help="SGD only: nnz evaluated per logged reconstruction error. "
+                        help="SGD only: nnz evaluated per reconstruction error. "
                              "Default (unset) evaluates every nnz exactly, which costs the "
                              "same per entry as a training step and on a large tensor is "
                              "several times a whole block's compute. Setting it (e.g. 1000000) "
-                             "evaluates a fixed random subset instead — unbiased, and the "
-                             "final reported error is still exact.")
+                             "evaluates a fixed random subset instead, for every error "
+                             "including the final reported one (unbiased estimates; leave it "
+                             "unset to compare with MU's exact errors).")
 
     # 'cp' is still EXPERIMENTAL (reviews/CP_IMPLEMENTATION_PLAN.md); 'tt' is not.
     parser.add_argument("--decomposition", type=str, default=None,
@@ -391,6 +411,15 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                         help="init svd_stream only: extra sketch columns beyond the rank (default 100). "
                              "More columns fix the last kept columns when the spectrum is flat "
                              "around the rank; cost grows linearly.")
+    parser.add_argument("--svd-fill", type=float, dest="svd_fill", default=None,
+                        help="init svd_stream only: NNDSVD sets about half of each factor column "
+                             "to exactly 0, which MU can never grow back. A value > 0 starts those "
+                             "entries at that multiple of the column mean instead (1 = NNDSVDa). "
+                             "Default 0 (plain NNDSVD).")
+    parser.add_argument("--svd-rotate", type=str, dest="svd_rotate", default=None,
+                        choices=["none", "ica", "ica_rows"],
+                        help="init svd_stream only (EXPERIMENTAL, experimental/svd_rotation.py): "
+                             "ICA rotation of the SVD basis, then |.|, instead of NNDSVD.")
     parser.add_argument("--tt-core-init", type=str, dest="tt_core_init", default=None,
                         choices=["random", "markov"],
                         help="tt/utt only (EXPERIMENTAL): how the TT cores start. 'random' "
@@ -482,11 +511,14 @@ def parse_run_config(argv: Optional[List[str]] = None) -> RunConfig:
                   "random_state", "epsilon", "init", "normalize_factors",
                   "shared_factors", "subsample_frac", "max_nnz", "objective",
                   "decomposition", "cp_inner_iters", "cp_scooch_kappa", "tt_rank",
-                  "utt_core_power", "svd_power_iter", "svd_oversampling", "tt_core_init",
+                  "utt_core_power", "svd_power_iter", "svd_oversampling", "svd_fill",
+                  "svd_rotate", "tt_core_init",
                   "binary", "solver", "sgd_lr", "sgd_batch_size",
                   "sgd_parametrization", "sgd_steps_per_iteration", "sgd_warm_start",
                   "sgd_regauge_every", "sgd_micro_batch",
-                  "sgd_comm_backend", "sgd_eval_sample"):
+                  "sgd_comm_backend", "sgd_eval_sample",
+                  "sgd_lr_warmup", "sgd_lr_decay_start", "sgd_lr_decay_iters", "sgd_lr_min",
+                  "sgd_lr_decay_shape", "sgd_lr_decay_every"):
         v = parsed_dict.get(field, None)
         if v is not None:
             exp_kwargs[field] = v

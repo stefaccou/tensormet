@@ -54,6 +54,12 @@ def check_run_config(cfg, tensor):
     if e.tt_core_init != "random" and e.decomposition not in ("tt", "utt"):
         raise ValueError(f"--tt-core-init {e.tt_core_init} needs decomposition 'tt' or "
                          f"'utt'; got {e.decomposition!r}")
+    if e.svd_fill < 0 or (e.svd_fill and e.init != "svd_stream"):
+        raise ValueError(f"--svd-fill {e.svd_fill} needs a value >= 0 and --init svd_stream; "
+                         f"got init {e.init!r}")
+    if e.svd_rotate != "none" and (e.init != "svd_stream" or e.svd_fill):
+        raise ValueError(f"--svd-rotate {e.svd_rotate} needs --init svd_stream and no --svd-fill "
+                         f"(it leaves no zeros); got init {e.init!r}, svd_fill {e.svd_fill}")
     if e.decomposition not in ("tucker", "cp", "tt", "utt"):
         raise ValueError(
             f"cfg.exp.decomposition must be 'tucker', 'cp', 'tt' or 'utt'; got {e.decomposition!r}")
@@ -65,6 +71,8 @@ def check_run_config(cfg, tensor):
     if e.binary:
         from tensormet.experimental.binary import check_binary
         check_binary(cfg)
+    from tensormet.experimental.sgd_schedule import check_schedule
+    check_schedule(e)
     if e.objective not in ("full", "masked"):
         raise ValueError(f"cfg.exp.objective must be 'full' or 'masked', got {e.objective!r}")
     masked = e.objective == "masked"

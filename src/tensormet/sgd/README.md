@@ -90,7 +90,7 @@ parametrization were removed on 2026-11-12.
 |---|---|---|---|
 | `--sgd-micro-batch` | rank-derived | no | Entries per forward/backward inside one step; gradients accumulate. Exact, memory-only. Rarely binding since the two-group contraction — see below. |
 | `--sgd-comm-backend` | `auto` | no | `auto` / `nccl` / `host`. |
-| `--sgd-eval-sample` | unset (exact) | no* | nnz per logged error. See "Eval cost" below. |
+| `--sgd-eval-sample` | unset (exact) | no* | nnz per error, final error included. See "Eval cost" below. |
 
 \* Not in the resume key, but it changes the logged curve and therefore when
 `tol`/`patience` fire — same status as `--rec-check-every`.
@@ -115,8 +115,12 @@ rescaling the nnz half to full-tensor scale while the zero-entry half stays
 exact — unbiased for the KL numerator and for the squared FR numerator. Fixed
 rather than redrawn per eval on purpose: `tol`/`patience` compare *successive*
 errors, and a moving subset would inject sampling noise into exactly that
-difference. The final reported `final_error` is always computed exactly, over
-all nnz, once at the end of the run.
+difference. The reported `final_error` is the last logged error, so it is also
+on the subset: an estimate of the exact error, the same subset for every run
+with the same seed, tensor and GPU count (fine for comparing such runs). Leave
+the flag unset when the number must be exact, e.g. to compare with MU.
+(Since 2026-11-17; before, a run with the flag paid one exact pass at the end.
+The standalone `sgd_non_negative_tucker` still reports an exact `final_error`.)
 
 **The two-group contraction is what makes order 4 runnable.**
 `predict_entries` splits the modes into two groups, forms the row-wise
@@ -210,6 +214,32 @@ than the whole job.
 Also: `experimental/submit.py` gained
 `TIER2_H100_DUAL` (2 GPUs) and `TIER2_H100_QUAD` (whole node, 4 GPUs) — both
 still `tasks_per_node=1`, since the sharding happens inside one process.
+
+## Learning-rate schedule (EXPERIMENTAL)
+
+`--sgd-lr-warmup W --sgd-lr-decay-start S --sgd-lr-decay-iters D --sgd-lr-min m`: the WSD
+(warmup-stable-decay) schedule.
+- Linear warm-up over W iterations, constant `--sgd-lr`, cosine cool-down from iteration S
+  over D iterations to m, then m. Iteration S itself still runs at the full lr; m is reached
+  at S + D. Without these flags the lr stays constant.
+- `--sgd-lr-decay-shape linear` makes the cool-down linear instead of cosine.
+  `--sgd-lr-decay-every K` holds its lr for blocks of K iterations (a staircase). With
+  S = 0 and D = N − K, an N-iteration run decays over the whole run and spends its last
+  K iterations at m. Example: `--sgd-lr-decay-shape linear --sgd-lr-decay-start 0
+  --sgd-lr-decay-iters 950 --sgd-lr-decay-every 50 --sgd-lr-min 1e-6 --iterations 1000`.
+- In absolute iterations, so resuming to more `--iterations` keeps the schedule.
+- Resume accepts a schedule that differs only after the checkpoint. A cool-down can
+  therefore branch off a constant-lr run: e.g. resume a 150-iteration run with
+  `--sgd-lr-decay-start 150 --sgd-lr-decay-iters 100 --sgd-lr-min 0.01 --iterations 250`.
+- The schedule is not part of the run name. Give fresh runs with different schedules
+  their own `--name`. A cool-down branch has to keep the name of the run it resumes,
+  because resume finds checkpoints by name.
+
+Code: `experimental/sgd_schedule.py`, a torch `LambdaLR` per replica optimizer, stepped at
+the end of every iteration. The hooks are in `SGDTrainer.__init__`/`run_block`,
+`SGDSolver.__init__`, the parser, `check_run_config` and `get_resume_state`. Why it exists:
+`1_method_development/25_noise_sources/2026-11-17-sgd_noise.ipynb`; a constant lr 0.1 leaves
+TT SGD in a noise ball that costs fit, SimLex and reproducibility.
 
 ## Checkpoint / resume semantics
 

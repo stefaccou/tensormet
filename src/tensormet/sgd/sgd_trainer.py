@@ -165,6 +165,7 @@ class SGDTrainer:
         decomposition: str = "tucker",
         tt_rank: Optional[int] = None,
         regauge_every: int = 1,
+        lr_schedule: Optional[dict] = None,
     ):
         self.steps_per_iteration = check_common_args(objective, steps_per_iteration)
         if divergence not in ("kl", "fr"):
@@ -294,6 +295,14 @@ class SGDTrainer:
         else:
             self._broadcast_params()
 
+        # lr schedule (EXPERIMENTAL, experimental/sgd_schedule.py; None = constant lr). A pure
+        # function of the iteration, so it is rebuilt at the resume iteration, not checkpointed.
+        self._schedulers = []
+        if lr_schedule is not None:
+            from tensormet.experimental.sgd_schedule import make_lr_schedulers
+            start = int(resume_payload["iteration"]) if resume_payload is not None else 0
+            self._schedulers = make_lr_schedulers(self._opts, lr, lr_schedule, start)
+
     # --- the surface a one-device caller expects -------------------------------
 
     @property
@@ -418,6 +427,8 @@ class SGDTrainer:
         # stay identical after it.
         if self.regauge_every and (iteration + 1) % self.regauge_every == 0:
             self._fan_out(self._regauge)
+        for scheduler in self._schedulers:   # the lr of the next iteration, on every replica
+            scheduler.step()
 
         if not log_step:
             return None

@@ -214,7 +214,7 @@ def load_eval_sentences_cached(
 
     st = vector_path.stat()
     cache_name = (
-        f"eval_sentences__dataset={dataset}"
+        f"eval_sentences__dataset={str(dataset).replace('/', '+')}"
         f"__roles={','.join(roles)}"
         f"__n={n_samples}"
         f"__seed={seed}"
@@ -294,7 +294,7 @@ def load_eval_sentences_cached_parquet(
         files = [vector_path]
 
     cache_name = (
-        f"eval_sentences__dataset={dataset}"
+        f"eval_sentences__dataset={str(dataset).replace('/', '+')}"
         f"__roles={','.join(roles)}"
         f"__n={n_samples}"
         f"__seed={seed}"
